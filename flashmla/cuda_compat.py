@@ -2,14 +2,11 @@
 """
 FlashMLA PPU-original → CUDA-Compatible Transformation Script.
 
-Transforms FlashMLA from ppu-original compilation back to
-nvcc wrapper / CUDAExtension compilation.
+Refactored with lookup-table approach for maintainability.
+Transforms FlashMLA from ppu-original compilation back to CUDA-compatible source trees.
 
 Usage:
-    python mla_compat.py [TARGET_DIR] [--dry-run] [--verbose]
-
-Run from the FlashMLA root directory, or pass it as TARGET_DIR.
-Fully self-contained — no git, no subprocess, no external dependencies.
+    python cuda_compat.py [TARGET_DIR] [--dry-run] [--verbose]
 """
 
 import argparse
@@ -17,634 +14,375 @@ import os
 import re
 import sys
 import time
-from datetime import datetime
+from typing import List, Tuple, Dict
+
 # =============================================================================
-# Reverse replacement maps (hggc/PPU → cuda/SM) — applied as regex word-boundary
+# Lookup tables — organized by category.
+# Within each category, longer/more-specific patterns MUST come first
+# to avoid partial matches on shorter substrings.
 # =============================================================================
 
-REVERSE_REPLACEMENTS = [
-    # --- Runtime API (longer patterns first) ---
-    (r'\bhggcOccupancyMaxActiveBlocksPerMultiprocessor\b', 'cudaOccupancyMaxActiveBlocksPerMultiprocessor'),
-    (r'\bhggcFuncAttributeMaxDynamicSharedMemorySize\b', 'cudaFuncAttributeMaxDynamicSharedMemorySize'),
-    (r'\bhggcFuncAttributes\b', 'cudaFuncAttributes'),
-    (r'\bhggcFuncAttribute\b', 'cudaFuncAttribute'),
-    (r'\bhggcTriggerProgrammaticLaunchCompletion\b', 'cudaTriggerProgrammaticLaunchCompletion'),
-    (r'\bhggcGridDependencySynchronize\b', 'cudaGridDependencySynchronize'),
-    (r'\bhggcDeviceGetAttribute\b', 'cudaDeviceGetAttribute'),
-    (r'\bhggcDevAttrMaxSharedMemoryPerMultiprocessor\b', 'cudaDevAttrMaxSharedMemoryPerMultiprocessor'),
-    (r'\bhggcDevAttrMaxSharedMemoryPerBlockOptin\b', 'cudaDevAttrMaxSharedMemoryPerBlockOptin'),
-    (r'\bhggcDevAttrMultiProcessorCount\b', 'cudaDevAttrMultiProcessorCount'),
-    (r'\bhggcDevAttrComputeCapabilityMajor\b', 'cudaDevAttrComputeCapabilityMajor'),
-    (r'\bhggcDevAttrComputeCapabilityMinor\b', 'cudaDevAttrComputeCapabilityMinor'),
-    (r'\bhggcOccupancyMaxActiveBlocksPerMultiprocessor\b', 'cudaOccupancyMaxActiveBlocksPerMultiprocessor'),
-    (r'\bhggcGetFuncBySymbol\b', 'cudaGetFuncBySymbol'),
-    (r'\bhggcFuncSetAttribute\b', 'cudaFuncSetAttribute'),
-    (r'\bhggcFuncGetAttributes\b', 'cudaFuncGetAttributes'),
-    (r'\bhggcGetErrorString\b', 'cudaGetErrorString'),
-    (r'\bhggcGetLastError\b', 'cudaGetLastError'),
-    (r'\bhggcGetDevice\b', 'cudaGetDevice'),
-    (r'\bhggcLaunchKernelExAD\b', 'cuLaunchKernelExAD'),
-    (r'\bhggcLaunchKernelExC\b', 'cudaLaunchKernelEx'),
-    (r'\bhggcLaunchKernelEx\b', 'cudaLaunchKernelEx'),
+INCLUDE_REPLACEMENTS: List[Tuple[str, str]] = [
+    ('<hggc_runtime.h>', '<cuda_runtime.h>'),
+    ('<hggc_fp16.h>', '<cuda_fp16.h>'),
+    ('<hggc_bf16.h>', '<cuda_bf16.h>'),
+    ('<hggc_pipeline.h>', '<cuda_pipeline.h>'),
+    ('<hggc_awbarrier.h>', '<cuda_awbarrier.h>'),
+    ('<hggc_ad.h>', '"cuda_ad.h"'),
+    ('"hggc_runtime.h"', '"cuda_runtime.h"'),
+    ('<hgtx3/hgToolsExt.h>', '<nvtx3/nvToolsExt.h>'),
+]
 
-    # --- Launch config types ---
-    (r'\bhggcLaunchAttributeProgrammaticStreamSerialization\b', 'cudaLaunchAttributeProgrammaticStreamSerialization'),
-    (r'\bhggcLaunchConfig_t\b', 'cudaLaunchConfig_t'),
-    (r'\bhggcLaunchAttribute\b', 'cudaLaunchAttribute'),
-    (r'\bhggcLaunchKernel\b', 'cudaLaunchKernel'),
+ENUM_REPLACEMENTS: List[Tuple[str, str]] = [
+    # Longer compound names first (may embed type/function prefixes)
+    ('hggcLaunchAttributeProgrammaticStreamSerialization', 'cudaLaunchAttributeProgrammaticStreamSerialization'),
+    ('hggcFuncAttributeMaxDynamicSharedMemorySize', 'cudaFuncAttributeMaxDynamicSharedMemorySize'),
+    ('hggcOccupancyMaxActiveBlocksPerMultiprocessor', 'cudaOccupancyMaxActiveBlocksPerMultiprocessor'),
+    ('hggcOccupancyDisableCachingOverride', 'cudaOccupancyDisableCachingOverride'),
+    ('hggcDevAttrMaxSharedMemoryPerMultiprocessor', 'cudaDevAttrMaxSharedMemoryPerMultiprocessor'),
+    ('hggcDevAttrMaxSharedMemoryPerBlockOptin', 'cudaDevAttrMaxSharedMemoryPerBlockOptin'),
+    ('hggcDevAttrMultiProcessorCount', 'cudaDevAttrMultiProcessorCount'),
+    ('hggcDevAttrComputeCapabilityMajor', 'cudaDevAttrComputeCapabilityMajor'),
+    ('hggcDevAttrComputeCapabilityMinor', 'cudaDevAttrComputeCapabilityMinor'),
+    ('hggcStreamCaptureModeRelaxed', 'cudaStreamCaptureModeRelaxed'),
+    ('hggcStreamCaptureModeNone', 'cudaStreamCaptureStatusNone'),
+    ('hggcStreamCaptureStatusNone', 'cudaStreamCaptureStatusNone'),
+    ('hggcStreamNonBlocking', 'cudaStreamNonBlocking'),
+    ('hggcStreamDefault', 'cudaStreamDefault'),
+    ('hggcMemcpyDeviceToHost', 'cudaMemcpyDeviceToHost'),
+    ('hggcMemcpyDeviceToDevice', 'cudaMemcpyDeviceToDevice'),
+    ('hggcMemcpyHostToDevice', 'cudaMemcpyHostToDevice'),
+    ('hggcMemcpyHostToHost', 'cudaMemcpyHostToHost'),
+    ('hggcErrorUnknown', 'cudaErrorUnknown'),
+    ('HGGC_SUCCESS', 'CUDA_SUCCESS'),
+    ('HGAD_LAUNCH_ATTRIBUTE_IGNORE', 'CUAD_LAUNCH_ATTRIBUTE_IGNORE'),
+    # Short patterns last
+    ('hggcSuccess', 'cudaSuccess'),
+    ('hggcError', 'cudaError'),
+]
 
-    # --- Stream capture / sync API ---
-    (r'\bhggcStreamCaptureModeRelaxed\b', 'cudaStreamCaptureModeRelaxed'),
-    (r'\bhggcStreamCaptureModeNone\b', 'cudaStreamCaptureStatusNone'),
-    (r'\bhggcStreamCaptureStatusNone\b', 'cudaStreamCaptureStatusNone'),
-    (r'\bhggcStreamCaptureStatus\b', 'cudaStreamCaptureStatus'),
-    (r'\bhggcStreamCaptureMode\b', 'cudaStreamCaptureMode'),
-    (r'\bhggcStreamIsCapturing\b', 'cudaStreamIsCapturing'),
-    (r'\bhggcStreamCreateWithFlags\b', 'cudaStreamCreateWithFlags'),
-    (r'\bhggcStreamDestroy\b', 'cudaStreamDestroy'),
-    (r'\bhggcStreamSynchronize\b', 'cudaStreamSynchronize'),
-    (r'\bhggcThreadExchangeStreamCaptureMode\b', 'cudaThreadExchangeStreamCaptureMode'),
-    (r'\bhggcStreamNonBlocking\b', 'cudaStreamNonBlocking'),
-    (r'\bhggcStreamDefault\b', 'cudaStreamDefault'),
-    (r'\bhggcStream_t\b', 'cudaStream_t'),
+TYPE_REPLACEMENTS: List[Tuple[str, str]] = [
+    ('hggcLaunchConfig_t', 'cudaLaunchConfig_t'),
+    ('hggcLaunchAttribute', 'cudaLaunchAttribute'),
+    ('hggcStream_t', 'cudaStream_t'),
+    ('hggcFunction_t', 'cudaFunction_t'),
+    ('hggcError_t', 'cudaError_t'),
+    ('hggcDataType_t', 'cudaDataType_t'),
+    ('hggcEvent_t', 'cudaEvent_t'),
+    ('hggcFuncAttributes', 'cudaFuncAttributes'),
+    ('hggcFuncAttribute', 'cudaFuncAttribute'),
+    ('hggcMemcpyKind', 'cudaMemcpyKind'),
+    ('hggcStreamCaptureStatus', 'cudaStreamCaptureStatus'),
+    ('hggcStreamCaptureMode', 'cudaStreamCaptureMode'),
+    ('HGlaunchAttributeAD', 'CUlaunchAttributeAD'),
+    ('HGlaunchConfigAD', 'CUlaunchConfigAD'),
+    ('HGfunction', 'CUfunction'),
+    ('HGresult', 'CUresult'),
+]
 
-    # --- Memory API ---
-    (r'\bhggcMemcpyDeviceToHost\b', 'cudaMemcpyDeviceToHost'),
-    (r'\bhggcMemcpyDeviceToDevice\b', 'cudaMemcpyDeviceToDevice'),
-    (r'\bhggcMemcpyHostToDevice\b', 'cudaMemcpyHostToDevice'),
-    (r'\bhggcMemcpyHostToHost\b', 'cudaMemcpyHostToHost'),
-    (r'\bhggcMemcpyKind\b', 'cudaMemcpyKind'),
-    (r'\bhggcMemcpyAsync\b', 'cudaMemcpyAsync'),
-    (r'\bhggcMemcpy\b', 'cudaMemcpy'),
-    (r'\bhggcMemsetAsync\b', 'cudaMemsetAsync'),
-    (r'\bhggcMalloc\b', 'cudaMalloc'),
-    (r'\bhggcFree\b', 'cudaFree'),
-    (r'\bhggcMemGetInfo\b', 'cudaMemGetInfo'),
-    (r'\bhggcDeviceSynchronize\b', 'cudaDeviceSynchronize'),
-    (r'\bhggcSetDevice\b', 'cudaSetDevice'),
-    (r'\bhggcGetDeviceProperties\b', 'cudaGetDeviceProperties'),
-    (r'\bhggcGetErrorName\b', 'cudaGetErrorName'),
-    (r'\bhggcPeekAtLastError\b', 'cudaPeekAtLastError'),
-    (r'\bhggcErrorUnknown\b', 'cudaErrorUnknown'),
-    (r'\bhggcOccupancyMaxPotentialBlockSize\b', 'cudaOccupancyMaxPotentialBlockSize'),
-    (r'\bhggcOccupancyDisableCachingOverride\b', 'cudaOccupancyDisableCachingOverride'),
+# FP8 / bfloat16 type names require word-boundary matching so that e.g.
+# __ppu_bfloat162 does not also match inside __ppu_bfloat162_raw.
+WORD_BOUNDARY_REPLACEMENTS: List[Tuple[str, str]] = [
+    ('__hg_fp8_e8m0', '__nv_fp8_e8m0'),
+    ('__hg_fp8x4_e4m3', '__nv_fp8x4_e4m3'),
+    ('__ppu_bfloat162', '__nv_bfloat162'),
+    ('__ppu_bfloat16_raw', '__nv_bfloat16_raw'),
+    ('__ppu_bfloat16', '__nv_bfloat16'),
+]
 
-    # --- Runtime types ---
-    (r'\bhggcFunction_t\b', 'cudaFunction_t'),
-    (r'\bhggcError_t\b', 'cudaError_t'),
-    (r'\bhggcError\b', 'cudaError'),
-    (r'\bhggcSuccess\b', 'cudaSuccess'),
-    (r'\bhggcDataType_t\b', 'cudaDataType_t'),
-    (r'\bhggcEvent_t\b', 'cudaEvent_t'),
-    (r'\bhggcEventCreate\b', 'cudaEventCreate'),
-    (r'\bhggcEventDestroy\b', 'cudaEventDestroy'),
-    (r'\bhggcEventElapsedTime\b', 'cudaEventElapsedTime'),
-    (r'\bhggcEventRecord\b', 'cudaEventRecord'),
-    (r'\bhggcEventSynchronize\b', 'cudaEventSynchronize'),
+FUNC_REPLACEMENTS: List[Tuple[str, str]] = [
+    ('hggcOccupancyMaxPotentialBlockSize', 'cudaOccupancyMaxPotentialBlockSize'),
+    ('hggcTriggerProgrammaticLaunchCompletion', 'cudaTriggerProgrammaticLaunchCompletion'),
+    ('hggcGridDependencySynchronize', 'cudaGridDependencySynchronize'),
+    ('hggcDeviceGetAttribute', 'cudaDeviceGetAttribute'),
+    ('hggcGetDeviceProperties', 'cudaGetDeviceProperties'),
+    ('hggcGetFuncBySymbol', 'cudaGetFuncBySymbol'),
+    ('hggcFuncSetAttribute', 'cudaFuncSetAttribute'),
+    ('hggcFuncGetAttributes', 'cudaFuncGetAttributes'),
+    ('hggcGetErrorString', 'cudaGetErrorString'),
+    ('hggcGetLastError', 'cudaGetLastError'),
+    ('hggcGetErrorName', 'cudaGetErrorName'),
+    ('hggcPeekAtLastError', 'cudaPeekAtLastError'),
+    ('hggcGetDevice', 'cudaGetDevice'),
+    ('hggcLaunchKernelExAD', 'cuLaunchKernelExAD'),
+    ('hggcLaunchKernelExC', 'cudaLaunchKernelEx'),
+    ('hggcLaunchKernelEx', 'cudaLaunchKernelEx'),
+    ('hggcLaunchKernel', 'cudaLaunchKernel'),
+    ('hggcThreadExchangeStreamCaptureMode', 'cudaThreadExchangeStreamCaptureMode'),
+    ('hggcStreamCreateWithFlags', 'cudaStreamCreateWithFlags'),
+    ('hggcStreamIsCapturing', 'cudaStreamIsCapturing'),
+    ('hggcStreamSynchronize', 'cudaStreamSynchronize'),
+    ('hggcStreamDestroy', 'cudaStreamDestroy'),
+    ('hggcMemcpyAsync', 'cudaMemcpyAsync'),
+    ('hggcMemsetAsync', 'cudaMemsetAsync'),
+    ('hggcDeviceSynchronize', 'cudaDeviceSynchronize'),
+    ('hggcSetDevice', 'cudaSetDevice'),
+    ('hggcMemGetInfo', 'cudaMemGetInfo'),
+    ('hggcMalloc', 'cudaMalloc'),
+    ('hggcFree', 'cudaFree'),
+    ('hggcMemcpy', 'cudaMemcpy'),
+    ('hggcEventElapsedTime', 'cudaEventElapsedTime'),
+    ('hggcEventSynchronize', 'cudaEventSynchronize'),
+    ('hggcEventCreate', 'cudaEventCreate'),
+    ('hggcEventDestroy', 'cudaEventDestroy'),
+    ('hggcEventRecord', 'cudaEventRecord'),
+    ('hgLaunchKernelExAD', 'cuLaunchKernelExAD'),
+    ('hgGetErrorName', 'cuGetErrorName'),
+    ('hgGetErrorString', 'cuGetErrorString'),
+]
 
-    # --- Driver API types ---
-    (r'\bHGlaunchAttributeAD\b', 'CUlaunchAttributeAD'),
-    (r'\bHGlaunchConfigAD\b', 'CUlaunchConfigAD'),
-    (r'\bHGAD_LAUNCH_ATTRIBUTE_IGNORE\b', 'CUAD_LAUNCH_ATTRIBUTE_IGNORE'),
-    (r'\bHGfunction\b', 'CUfunction'),
-    (r'\bHGresult\b', 'CUresult'),
-    (r'\bHGGC_SUCCESS\b', 'CUDA_SUCCESS'),
-    (r'\bhgLaunchKernelExAD\b', 'cuLaunchKernelExAD'),
-    (r'\bhgGetErrorName\b', 'cuGetErrorName'),
-    (r'\bhgGetErrorString\b', 'cuGetErrorString'),
+MACRO_REPLACEMENTS: List[Tuple[str, str]] = [
+    ('__HGGC_ARCH__', '__CUDA_ARCH__'),
+]
 
-    # --- Headers ---
-    (r'<hggc_runtime\.h>', '<cuda_runtime.h>'),
-    (r'"hggc_runtime\.h"', '"cuda_runtime.h"'),
-    (r'<hggc_fp16\.h>', '<cuda_fp16.h>'),
-    (r'<hggc_bf16\.h>', '<cuda_bf16.h>'),
-    (r'<hggc_pipeline\.h>', '<cuda_pipeline.h>'),
-    (r'<hggc_awbarrier\.h>', '<cuda_awbarrier.h>'),
-    (r'<hggc_ad\.h>', '"cuda_ad.h"'),
+NVTX_REPLACEMENTS: List[Tuple[str, str]] = [
+    ('hgtxEventAttributes_t', 'nvtxEventAttributes_t'),
+    ('hgtxDomainHandle_t', 'nvtxDomainHandle_t'),
+    ('hgtxDomainCreateA', 'nvtxDomainCreateA'),
+    ('hgtxDomainDestroy', 'nvtxDomainDestroy'),
+    ('hgtxDomainRangePushEx', 'nvtxDomainRangePushEx'),
+    ('hgtxDomainRangePop', 'nvtxDomainRangePop'),
+    ('HGTX_MESSAGE_TYPE_ASCII', 'NVTX_MESSAGE_TYPE_ASCII'),
+    ('HGTX_VERSION', 'NVTX_VERSION'),
+    ('use_hgtx_', 'use_nvtx_'),
+]
 
-    # --- NVTX / HGTX ---
-    (r'<hgtx3/hgToolsExt\.h>', '<nvtx3/nvToolsExt.h>'),
-    (r'\bhgtxEventAttributes_t\b', 'nvtxEventAttributes_t'),
-    (r'\bhgtxDomainHandle_t\b', 'nvtxDomainHandle_t'),
-    (r'\bhgtxDomainCreateA\b', 'nvtxDomainCreateA'),
-    (r'\bhgtxDomainDestroy\b', 'nvtxDomainDestroy'),
-    (r'\bhgtxDomainRangePushEx\b', 'nvtxDomainRangePushEx'),
-    (r'\bhgtxDomainRangePop\b', 'nvtxDomainRangePop'),
-    (r'\buse_hgtx_\b', 'use_nvtx_'),
-    (r'\bHGTX_VERSION\b', 'NVTX_VERSION'),
-    (r'\bHGTX_MESSAGE_TYPE_ASCII\b', 'NVTX_MESSAGE_TYPE_ASCII'),
-
-    # --- Architecture macro ---
-    (r'__HGGC_ARCH__', '__CUDA_ARCH__'),
-
-    # --- FP8 types ---
-    (r'\b__hg_fp8_e8m0\b', '__nv_fp8_e8m0'),
-    (r'\b__hg_fp8x4_e4m3\b', '__nv_fp8x4_e4m3'),
-    (r'\b__ppu_bfloat162\b', '__nv_bfloat162'),
-    (r'\b__ppu_bfloat16_raw\b', '__nv_bfloat16_raw'),
-    (r'\b__ppu_bfloat16\b', '__nv_bfloat16'),
-
-    # Note: __HGGCCC__ is NOT converted — ppu_dev uses __HGGCCC__ for AIU launch guards.
-    # In cuda-compat mode (nvcc), __HGGCCC__ is defined by PPU SDK's nvcc wrapper.
+# Processing order: includ → enum → type → func → macro → nvtx
+ALL_CATEGORY_REPLACEMENTS = [
+    INCLUDE_REPLACEMENTS,
+    ENUM_REPLACEMENTS,
+    TYPE_REPLACEMENTS,
+    FUNC_REPLACEMENTS,
+    MACRO_REPLACEMENTS,
+    NVTX_REPLACEMENTS,
 ]
 
 # Arch value reversals: applied only on lines containing __CUDA_ARCH__
-# PPU __HGGC_ARCH__ >= 100 maps to __CUDA_ARCH__ >= 800 for sm_80 features (MMA)
-# and __CUDA_ARCH__ >= 750 for sm_75 features (LDSM). The context-aware fix
-# for LDSM is handled in apply_reverse_arch_values().
-REVERSE_ARCH_VALUES = [
+ARCH_VALUE_REPLACEMENTS = [
     ('>= 100', '>= 800'),
     ('== 100', '== 800'),
     ('== 150', '== 890'),
 ]
 
-
-def apply_reverse_replacements(content):
-    """Apply all reverse replacement regexes."""
-    for pattern, replacement in REVERSE_REPLACEMENTS:
-        content = re.sub(pattern, replacement, content)
-    return content
-
-
-def apply_reverse_arch_values(content):
-    """Replace arch values only on lines containing __CUDA_ARCH__.
-    
-    Special case: lines followed by LDSM/SmemCopyAtom use >= 750 (sm_75),
-    not >= 800 (sm_80). This matches ppu_dev's conditional structure.
-    """
-    lines = content.split('\n')
-    new_lines = []
-    for i, line in enumerate(lines):
-        if '__CUDA_ARCH__' in line:
-            for old, new in REVERSE_ARCH_VALUES:
-                line = line.replace(old, new)
-            # Fix: LDSM section uses >= 750, not >= 800
-            # Check next line for LDSM or SmemCopyAtom keywords
-            next_line = lines[i + 1] if i + 1 < len(lines) else ''
-            if 'LDSM' in next_line or 'SmemCopyAtom' in next_line:
-                line = line.replace('>= 800', '>= 750')
-        new_lines.append(line)
-    return '\n'.join(new_lines)
-
-
 # =============================================================================
-# Structural file restorations (no git needed)
+# Regex-based replacements: (pattern, replacement, file_glob)
+# file_glob is matched against filepath via endswith()
 # =============================================================================
 
-def restore_flash_h(dry_run=False, verbose=False):
-    """Restore csrc/flash.h: remove #ifdef __HGGCCC__ blocks, restore cuda types."""
-    fp = 'csrc/flash.h'
-    if not os.path.isfile(fp):
-        return False
-    content = open(fp).read()
-    if 'hggcStream_t' not in content and '__HGGCCC__' not in content:
-        return False
+REGEX_REPLACEMENTS: List[Tuple[str, str, str]] = [
+    # combine.cuh: strip (const void*) and (void**)& casts from cudaLaunchKernelEx args
+    (r'cudaLaunchKernelEx\(([^,]+),\s*\(const void\*\)([^,]+),\s*\(void\*\*\)&([^)]+)\)',
+     r'cudaLaunchKernelEx(\1, \2, \3)', 'combine.cuh'),
 
-    if dry_run:
-        if verbose:
-            print(f"    [dry-run] {fp}")
-        return True
+    # C10_CUDA_CHECK wrapping for cudaFuncSetAttribute (single-line)
+    (r'^([ \t]+)cudaFuncSetAttribute\(([^)]+)\);',
+     r'\1C10_CUDA_CHECK(cudaFuncSetAttribute(\2));', 'splitkv_mla.cuh'),
+    (r'^([ \t]+)cudaFuncSetAttribute\(([^)]+)\);',
+     r'\1C10_CUDA_CHECK(cudaFuncSetAttribute(\2));', 'splitkv_mla_kernel.cuh'),
+    (r'^([ \t]+)cudaFuncSetAttribute\(([^)]+)\);',
+     r'\1C10_CUDA_CHECK(cudaFuncSetAttribute(\2));', 'sparse_prefill_wg.cuh'),
 
-    # 1a. Replace the #ifdef __HGGCCC__ include block at top (old format)
-    old_include = re.compile(
-        r'#ifdef __HGGCCC__\n.*?#endif\n',
-        re.DOTALL)
-    content = old_include.sub('#include <ATen/cuda/CUDAContext.h>\n', content, count=1)
+    # C10_CUDA_CHECK wrapping (multi-line)
+    (r'([ \t]+)cudaFuncSetAttribute\(\n([ \t]+)(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size)\);',
+     r'\1C10_CUDA_CHECK(cudaFuncSetAttribute(\n\2\3));', 'splitkv_mla.cuh'),
+    (r'([ \t]+)cudaFuncSetAttribute\(\n([ \t]+)(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size)\);',
+     r'\1C10_CUDA_CHECK(cudaFuncSetAttribute(\n\2\3));', 'splitkv_mla_kernel.cuh'),
+    (r'([ \t]+)cudaFuncSetAttribute\(\n([ \t]+)(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size)\);',
+     r'\1C10_CUDA_CHECK(cudaFuncSetAttribute(\n\2\3));', 'sparse_prefill_wg.cuh'),
 
-    # 1b. Replace direct hggc_runtime.h + typedef (ppu original format)
-    content = re.sub(
-        r'#include <hggc_runtime\.h>\n.*?typedef struct HGstream_st\* hggcStream_t;\n',
-        '#include <ATen/cuda/CUDAContext.h>\n',
-        content, flags=re.DOTALL)
+    # SM detection for splitkv_mla_kernel
+    (r'            int sm_count = get_num_sm\(get_current_device\(\)\);\s*\n'
+     r'            if \(sm_count == 64\) sm_count = 20;',
+     r'            auto dprops = at::cuda::getCurrentDeviceProperties();\n'
+     r'\n'
+     r'            int sm_count = dprops->multiProcessorCount;\n'
+     r'            if (std::string(dprops->name).find("810E") != std::string::npos) {\n'
+     r'                sm_count = 20;\n'
+     r'            }',
+     'splitkv_mla_kernel.cuh'),
 
-    # 2a. Remove #ifdef __HGGCCC__ in is_sm89_or_newer(), keep only the #else branch
-    old_func = re.compile(
-        r'static bool is_sm89_or_newer\(\)\{\n'
-        r'#ifdef __HGGCCC__\n'
-        r'.*?'
-        r'#else\n'
-        r'(.*?)'
-        r'#endif\n'
-        r'\}',
-        re.DOTALL)
-    content = old_func.sub(
-        r'static bool is_sm89_or_newer(){\n\1}',
-        content)
+    # SM detection for sparse_prefill_wg
+    (r'        int sm_count = get_num_sm\(get_current_device\(\)\);\s*\n'
+     r'            if \(sm_count == 64\) sm_count = 20;',
+     r'        auto dprops = at::cuda::getCurrentDeviceProperties();\n'
+     r'\n'
+     r'            int sm_count = dprops->multiProcessorCount;\n'
+     r'            if (std::string(dprops->name).find("810E") != std::string::npos) {\n'
+     r'                sm_count = 20;\n'
+     r'            }',
+     'sparse_prefill_wg.cuh'),
 
-    # 2b. Replace direct hggc API in is_sm89_or_newer() (ppu-original format)
-    content = re.sub(
-        r'static bool is_sm89_or_newer\(\)\{\n'
-        r'    int device = 0;\n'
-        r'    hggcGetDevice\(&device\);\n'
-        r'    int major = 0, minor = 0;\n'
-        r'    hggcDeviceGetAttribute\(&major, hggcDevAttrComputeCapabilityMajor, device\);\n'
-        r'    hggcDeviceGetAttribute\(&minor, hggcDevAttrComputeCapabilityMinor, device\);\n'
-        r'    return \(major > 8\) \|\| \(major == 8 && minor >= 9\);\n'
-        r'\}',
-        'static bool is_sm89_or_newer(){\n'
-        '    auto dprops = at::cuda::getCurrentDeviceProperties();\n'
-        '    return (dprops->major > 8) || (dprops->major == 8 && dprops->minor >= 9);\n'
-        '}',
-        content)
+    # SM detection for splitkv_mla.h
+    (r'    \{\n'
+     r'        auto \[cap_major, cap_minor\] = get_compute_capability\(get_current_device\(\)\);\s*\n'
+     r'        if \(cap_major < 8 \|\| \(cap_major == 8 && cap_minor < 9\)\)\s*\n'
+     r'            warp_interleave = false;\s*\n'
+     r'    \}',
+     r'    auto dprops = at::cuda::getCurrentDeviceProperties();\n'
+     r'    if (std::string(dprops->name).find("610") != std::string::npos)\n'
+     r'        warp_interleave = false;',
+     'splitkv_mla.h'),
 
-    # 3. Bulk replace remaining hggc types
-    content = apply_reverse_replacements(content)
-    content = apply_reverse_arch_values(content)
+    # SM detection for utils.h
+    (r'            int sm_count = get_num_sm\(get_current_device\(\)\);\s*\n'
+     r'            if \(sm_count == 64\) sm_count = 20;',
+     r'            auto dprops = at::cuda::getCurrentDeviceProperties();\n'
+     r'            int sm_count = dprops->multiProcessorCount == 64 ? 20 : dprops->multiProcessorCount;',
+     'utils.h'),
 
-    open(fp, 'w').write(content)
-    return True
+    # kernel_traits.h: remove extra SmemCopyAtomQ/K fallback
+    (r'(using SmemCopyAtomTransposed = Copy_Atom<DefaultCopy, elem_type>;\n)'
+     r'    using SmemCopyAtomQ = SmemCopyAtom;\n'
+     r'    using SmemCopyAtomK = SmemCopyAtom;\n',
+     r'\1', 'kernel_traits.h'),
+]
 
+# =============================================================================
+# File-specific replacements: {relative_path: [(old, new), ...]}
+# Applied BEFORE category tables so they can override general patterns.
+# =============================================================================
 
-def restore_hardware_info_h(dry_run=False, verbose=False):
-    """Restore csrc/hardware_info.h to original cuda-compat version."""
-    fp = 'csrc/hardware_info.h'
-    if not os.path.isfile(fp):
-        return False
-    content = open(fp).read()
-    if 'hggc' not in content and '__HGGCCC__' not in content:
-        return False
+FILE_SPECIFIC_REPLACEMENTS: Dict[str, List[Tuple[str, str]]] = {
 
-    if dry_run:
-        if verbose:
-            print(f"    [dry-run] {fp}")
-        return True
+    # --- kerutils host/host.h ---
+    'csrc/kerutils/include/kerutils/host/host.h': [
+        (
+            '#include <hggc_runtime.h>',
+            '#include <cuda_runtime_api.h>\n#include <ATen/cuda/CUDAContext.h>'
+        ),
+        (
+            'static inline bool is_sm89_or_newer() {\n'
+            '    int device = 0;\n'
+            '    hggcGetDevice(&device);\n'
+            '    int major = 0, minor = 0;\n'
+            '    hggcDeviceGetAttribute(&major, hggcDevAttrComputeCapabilityMajor, device);\n'
+            '    hggcDeviceGetAttribute(&minor, hggcDevAttrComputeCapabilityMinor, device);\n'
+            '    return (major > 8) || (major == 8 && minor >= 9);\n'
+            '}',
+            'static inline bool is_sm89_or_newer() {\n'
+            '    auto dprops = at::cuda::getCurrentDeviceProperties();\n'
+            '    return (dprops->major > 8) || (dprops->major == 8 && dprops->minor >= 9);\n'
+            '}'
+        ),
+    ],
 
-    new_content = """\
-/******************************************************************************
- * Copyright (c) 2024, Tri Dao.
- ******************************************************************************/
+    # --- kerutils common/common.h ---
+    'csrc/kerutils/include/kerutils/common/common.h': [
+        (
+            '#include <hggc_runtime.h>',
+            '#if !defined(__CUDACC_RTC__)\n#include "cuda_runtime.h"\n#endif'
+        ),
+        ('hggcError_t status_ = call;', 'cudaError_t status_ = call;'),
+        ('if (status_ != hggcSuccess)', 'if (status_ != cudaSuccess)'),
+        (
+            'fprintf(stderr, "HGGC error (%s:%d): %s\\n", __FILE__, __LINE__,',
+            'fprintf(stderr, "CUDA error (%s:%d): %s\\n", __FILE__, __LINE__,'
+        ),
+        ('hggcGetErrorString(status_)', 'cudaGetErrorString(status_)'),
+        (
+            '#define CHECK_CUDA_KERNEL_LAUNCH() CHECK_CUDA(hggcGetLastError())',
+            '#define CHECK_CUDA_KERNEL_LAUNCH() CHECK_CUDA(cudaGetLastError())'
+        ),
+    ],
 
-#pragma once
+    # --- api/common.h ---
+    'csrc/api/common.h': [
+        # Remove hggcStream_t forward declaration
+        (
+            '#include <c10/cuda/CUDAStream.h>\n'
+            '// Forward-declare hggcStream_t so function signatures match between .cu and .cpp\n'
+            'typedef struct HGstream_st* hggcStream_t;',
+            '#include <c10/cuda/CUDAStream.h>'
+        ),
+        # Replace GraphCaptureModeSuspender struct
+        (
+            'struct GraphCaptureModeSuspender {\n'
+            '    hggcStreamCaptureMode original_mode;\n'
+            '\n'
+            '    explicit GraphCaptureModeSuspender(hggcStreamCaptureMode relaxed_mode = hggcStreamCaptureModeRelaxed) {\n'
+            '        original_mode = relaxed_mode;\n'
+            '        // Exchange current thread\'s mode with relaxed_mode, and store previous mode in original_mode\n'
+            '        hggcThreadExchangeStreamCaptureMode(&original_mode);\n'
+            '    }\n'
+            '\n'
+            '    ~GraphCaptureModeSuspender() {\n'
+            '        // Restore the saved original mode back to the current thread\n'
+            '        hggcThreadExchangeStreamCaptureMode(&original_mode);\n'
+            '    }',
+            'struct GraphCaptureModeSuspender {\n'
+            '    cudaStreamCaptureMode original_mode;\n'
+            '\n'
+            '    explicit GraphCaptureModeSuspender(cudaStreamCaptureMode relaxed_mode = cudaStreamCaptureModeRelaxed) {\n'
+            '        original_mode = relaxed_mode;\n'
+            '        // Exchange current thread\'s mode with relaxed_mode, and store previous mode in original_mode\n'
+            '        cudaThreadExchangeStreamCaptureMode(&original_mode);\n'
+            '    }\n'
+            '\n'
+            '    ~GraphCaptureModeSuspender() {\n'
+            '        // Restore the saved original mode back to the current thread\n'
+            '        cudaThreadExchangeStreamCaptureMode(&original_mode);\n'
+            '    }'
+        ),
+    ],
 
-#include <tuple>
+    # --- csrc/params.h ---
+    'csrc/params.h': [
+        (
+            '#include <hggc_fp16.h>\n#include <hggc_runtime.h>',
+            '#include <cuda_fp16.h>\n#include <cuda_runtime.h>\n#include <ATen/cuda/CUDAContext.h>'
+        ),
+        (
+            '#include <hggc_bf16.h>',
+            '#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800\n#include <cuda_bf16.h>\n#endif'
+        ),
+    ],
 
-#if !defined(__CUDACC_RTC__)
-#include "cuda_runtime.h"
-#endif
+    # --- csrc/utils.h ---
+    'csrc/utils.h': [
+        (
+            '#include <hggc_fp16.h>\n#include <hggc_bf16.h>',
+            '#include <cuda_fp16.h>\n\n#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800\n#include <cuda_bf16.h>\n#endif'
+        ),
+        (
+            '#define CUDA_DRIVER_CHECK(expr)                             \\\n'
+            '    HGresult _r = (expr);                                   \\\n'
+            '    if (_r != HGGC_SUCCESS) {                               \\\n'
+            '        const char* _name = nullptr;                        \\\n'
+            '        const char* _str = nullptr;                         \\\n'
+            '        hgGetErrorName(_r, &_name);                         \\\n'
+            '        hgGetErrorString(_r, &_str);                        \\\n'
+            '        printf("HG driver error: %s: %s\\n",                \\\n'
+            '               (_name ? _name : "?"), (_str ? _str : "?")); \\\n'
+            '    }',
+            '#define CUDA_DRIVER_CHECK(expr)                             \\\n'
+            '    CUresult _r = (expr);                                   \\\n'
+            '    if (_r != CUDA_SUCCESS) {                               \\\n'
+            '        const char* _name = nullptr;                        \\\n'
+            '        const char* _str = nullptr;                         \\\n'
+            '        cuGetErrorName(_r, &_name);                         \\\n'
+            '        cuGetErrorString(_r, &_str);                        \\\n'
+            '        TORCH_CHECK(false, "CUDA driver error ",            \\\n'
+            '        (_name ? _name : "?"), ": ", (_str ? _str : "?"));  \\\n'
+            '    }'
+        ),
+    ],
 
-#define CHECK_CUDA(call)                                                       \\
-  do {                                                                         \\
-    cudaError_t status_ = call;                                                \\
-    if (status_ != cudaSuccess) {                                              \\
-      fprintf(stderr, "CUDA error (%s:%d): %s\\n", __FILE__, __LINE__,          \\
-              cudaGetErrorString(status_));                                    \\
-      exit(1);                                                                 \\
-    }                                                                          \\
-  } while (0)
-
-
-inline int get_current_device() {
-    int device;
-    CHECK_CUDA(cudaGetDevice(&device));
-    return device;
+    # --- __HGGCCC__ guards around cuda_ad.h are applied post-conversion
+    #     (see apply_hggccc_guards) because the input uses <hggc_ad.h>. ---
 }
 
-inline std::tuple<int, int> get_compute_capability(int device) {
-    int capability_major, capability_minor;
-    CHECK_CUDA(cudaDeviceGetAttribute(&capability_major, cudaDevAttrComputeCapabilityMajor, device));
-    CHECK_CUDA(cudaDeviceGetAttribute(&capability_minor, cudaDevAttrComputeCapabilityMinor, device));
-    return {capability_major, capability_minor};
+# Files whose cuda_ad.h include must be wrapped in #ifdef __HGGCCC__ for nvcc.
+HGGCCC_GUARD_FILES = {
+    'csrc/ppu/decode/dense/splitkv_mla_kernel.cuh',
+    'csrc/ppu/decode/sparse/splitkv_mla.cuh',
+    'csrc/ppuxx/decode/combine/combine.cuh',
 }
 
-inline int get_num_sm(int device) {
-    int multiprocessor_count;
-    CHECK_CUDA(cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
-    return multiprocessor_count;
-}
-"""
-    open(fp, 'w').write(new_content)
-    return True
-
-
-def restore_utils_h(dry_run=False, verbose=False):
-    """Restore csrc/utils.h: fp16/bf16 includes, ATen guard, CUDA_DRIVER_CHECK."""
-    fp = 'csrc/utils.h'
-    if not os.path.isfile(fp):
-        return False
-    content = open(fp).read()
-    if '__HGGCCC__' not in content and 'hggc_fp16' not in content:
-        return False
-
-    if dry_run:
-        if verbose:
-            print(f"    [dry-run] {fp}")
-        return True
-
-    # 1. Replace hggc fp16/bf16 includes with cuda versions
-    content = content.replace(
-        '#include <hggc_fp16.h>\n#include <hggc_bf16.h>',
-        '#include <cuda_fp16.h>\n\n#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800\n#include <cuda_bf16.h>\n#endif')
-
-    # 2. Remove #ifndef __HGGCCC__ guard around ATen include
-    content = content.replace(
-        '#ifndef __HGGCCC__\n#include <ATen/cuda/CUDAContext.h>\n#endif',
-        '#include <ATen/cuda/CUDAContext.h>')
-
-    # 3. Replace the dual CUDA_DRIVER_CHECK block with original
-    old_driver = re.compile(
-        r'#ifdef __HGGCCC__\n'
-        r'#define CUDA_DRIVER_CHECK\(expr\).*?'
-        r'#else\n'
-        r'(.*?)'
-        r'#endif\n',
-        re.DOTALL)
-    content = old_driver.sub(r'\1', content, count=1)
-
-    # 4. Fix USE_PPU guard — ppu_dev uses commented-out original + simplified guard
-    content = content.replace(
-        '#if defined(USE_PPU) && ACOMPUTE_VERSION == 10000',
-        '// #if defined(USE_PPU) && ACOMPUTE_VERSION == 10000\n#if defined USE_PPU')
-
-    # 5. Fix CUDA_DRIVER_CHECK macro — ppu_dev uses TORCH_CHECK instead of printf
-    content = content.replace(
-        'printf("HG driver error: %s: %s\\n",                \\\n               (_name ? _name : "?"), (_str ? _str : "?")); \\\n    }',
-        'TORCH_CHECK(false, "CUDA driver error ",            \\\n        (_name ? _name : "?"), ": ", (_str ? _str : "?"));  \\\n    }                                                       \\\n')
-
-    # 5. Bulk replace remaining hggc symbols (HGresult, HGGC_SUCCESS, etc.)
-    content = apply_reverse_replacements(content)
-
-    open(fp, 'w').write(content)
-    return True
-
-
-def restore_launch_template_guards(dry_run=False, verbose=False):
-    """Remove #ifdef __HGGCCC__ guards from flash_fwd_launch_template.h, restore c10 includes."""
-    fp = 'csrc/flash_fwd_launch_template.h'
-    if not os.path.isfile(fp):
-        return False
-    content = open(fp).read()
-    if '#ifndef __HGGCCC__' not in content and '#ifdef __HGGCCC__' not in content:
-        return False
-
-    if dry_run:
-        if verbose:
-            print(f"    [dry-run] {fp}")
-        return True
-
-    # 1. Replace the include guard
-    content = content.replace(
-        '#ifndef __HGGCCC__\n#include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK\n'
-        '#include <ATen/cuda/CUDAContext.h>\n'
-        '#else\n'
-        '#define C10_CUDA_CHECK(x) (void)(x)\n'
-        '#define C10_CUDA_KERNEL_LAUNCH_CHECK()\n'
-        '#endif',
-        '#include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK\n'
-        '#include <ATen/cuda/CUDAContext.h>')
-
-    # 2. Replace #ifdef __HGGCCC__ / #include <hggc_ad.h> / #else / #include "cuda_ad.h" / #endif
-    content = content.replace(
-        '#ifdef __HGGCCC__\n#include <hggc_ad.h>\n#else\n#include "cuda_ad.h"\n#endif',
-        '#include "cuda_ad.h"')
-
-    # 3. Keep #ifdef __HGGCCC__ AIU launch blocks as-is (ppu_dev preserves them)
-    # Only bulk-replace symbols inside them (HGfunction → CUfunction, etc.)
-
-    # 4. Bulk replace remaining hggc types
-    content = apply_reverse_replacements(content)
-    content = apply_reverse_arch_values(content)
-
-    # 5. Restore #ifdef __HGGCCC__ guard around cuda_ad.h + utils.h
-    content = content.replace(
-        '#include "cuda_ad.h"\n#include "utils.h"',
-        '#ifdef __HGGCCC__\n#include "cuda_ad.h"\n#include "utils.h"\n#endif')
-
-    # 6. Fix SM detection: get_num_sm(get_current_device()) → at::cuda::getCurrentDeviceProperties()
-    # ppu_dev uses dprops->multiProcessorCount with ternary for 64→20
-    content = re.sub(
-        r'int sm_count = get_num_sm\(get_current_device\(\)\);\n\s*if \(sm_count == 64\) sm_count = 20;',
-        'auto dprops = at::cuda::getCurrentDeviceProperties();\n            int sm_count = dprops->multiProcessorCount == 64 ? 20 : dprops->multiProcessorCount;',
-        content)
-
-    # 7. Fix C10_CUDA_CHECK wrapper for cudaFuncSetAttribute
-    content = re.sub(
-        r'(\s*)cudaFuncSetAttribute\(\n\s*(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);',
-        r'\1C10_CUDA_CHECK(cudaFuncSetAttribute(\n\2));',
-        content)
-
-    # 8. Remove #ifdef __HGGCCC__ warp_interleave block — ppu_dev uses only the #else path
-    content = re.sub(
-        r'#ifdef __HGGCCC__\n\s*// Under hgcc.*?#else\n\s*\{\n\s*auto dprops = at::cuda::getCurrentDeviceProperties\(\);\n\s*if \(std::string\(dprops->name\)\.find\("610"\) != std::string::npos\)\n\s*warp_interleave = false;\n\s*\}\n#endif\n',
-        '    auto dprops = at::cuda::getCurrentDeviceProperties();\n    if (std::string(dprops->name).find("610") != std::string::npos)\n        warp_interleave = false;\n',
-        content, flags=re.DOTALL)
-
-    open(fp, 'w').write(content)
-    return True
-
-
-def restore_flash_api_cpp(dry_run=False, verbose=False):
-    """Restore csrc/flash_api.cpp: reverse stream type casts and dprops replacements."""
-    fp = 'csrc/flash_api.cpp'
-    if not os.path.isfile(fp):
-        return False
-    content = open(fp).read()
-    if 'hggcStream_t' not in content:
-        return False
-
-    if dry_run:
-        if verbose:
-            print(f"    [dry-run] {fp}")
-        return True
-
-    # Reverse: hggcStream_t stream = (hggcStream_t)at::cuda::getCurrentCUDAStream().stream();
-    # → auto stream = at::cuda::getCurrentCUDAStream().stream();
-    content = re.sub(
-        r'hggcStream_t\s+stream\s*=\s*\(hggcStream_t\)(at::cuda::getCurrentCUDAStream\(\)\.stream\(\))',
-        r'auto stream = \1', content)
-
-    # Also handle: hggcStream_t stream = (hggcStream_t)params.stream;
-    content = content.replace(
-        '(hggcStream_t)params.stream', 'params.stream')
-
-    # Bulk replace remaining types
-    content = apply_reverse_replacements(content)
-
-    # Remove redundant (cudaStream_t) casts from function calls
-    content = re.sub(r'\(cudaStream_t\)', '', content)
-
-    open(fp, 'w').write(content)
-    return True
-
-
-def restore_traits_h(dry_run=False, verbose=False):
-    """Restore csrc/flash_splitkv/traits.h: pipeline/awbarrier headers + atom names."""
-    fp = 'csrc/flash_splitkv/traits.h'
-    if not os.path.isfile(fp):
-        return False
-    content = open(fp).read()
-    if 'hggc_pipeline' not in content and 'PPU10_' not in content:
-        return False
-
-    if dry_run:
-        if verbose:
-            print(f"    [dry-run] {fp}")
-        return True
-
-    content = apply_reverse_replacements(content)
-    content = apply_reverse_arch_values(content)
-
-    open(fp, 'w').write(content)
-    return True
-
-
-def restore_metadata_cu(dry_run=False, verbose=False):
-    """Restore csrc/flash_fwd_mla_metadata.cu."""
-    fp = 'csrc/flash_fwd_mla_metadata.cu'
-    if not os.path.isfile(fp):
-        return False
-    content = open(fp).read()
-    if 'hggcStream_t' not in content:
-        return False
-
-    if dry_run:
-        if verbose:
-            print(f"    [dry-run] {fp}")
-        return True
-
-    content = apply_reverse_replacements(content)
-    open(fp, 'w').write(content)
-    return True
-
-
-def restore_splitkv_files(dry_run=False, verbose=False):
-    """Restore csrc/flash_splitkv/*.cu and *.h files."""
-    files = [
-        'csrc/flash_splitkv/splitkv_mla.cu',
-        'csrc/flash_splitkv/splitkv_mla.h',
-        'csrc/flash_splitkv/splitkv_dsa.cu',
-        'csrc/flash_splitkv/mla_combine.cu',
-        'csrc/flash_splitkv/mla_combine.h',
-    ]
-    count = 0
-    for fp in files:
-        if not os.path.isfile(fp):
-            continue
-        content = open(fp).read()
-        if 'hggcStream_t' not in content and 'hggcFuncSetAttribute' not in content \
-           and '__HGGC_ARCH__' not in content and 'hggc' not in content \
-           and 'hgtx' not in content:
-            continue
-
-        if dry_run:
-            if verbose:
-                print(f"    [dry-run] {fp}")
-            count += 1
-            continue
-
-        content = apply_reverse_replacements(content)
-        content = apply_reverse_arch_values(content)
-        # Fix mla_combine.cu: cudaLaunchKernelEx(args) with void* args → direct args
-        # ppu_dev uses cudaLaunchKernelEx(&config, kernel, params), not ExC with void**
-        content = re.sub(
-            r'cudaLaunchKernelEx\(([^,]+),\s*\(const void\*\)([^,]+),\s*\(void\*\*\)&([^)]+)\)',
-            r'cudaLaunchKernelEx(\1, \2, \3)', content)
-        # Restore #ifdef __HGGCCC__ guard around cuda_ad.h + utils.h in mla_combine.cu
-        content = content.replace(
-            '#include "cuda_ad.h"\n#include "utils.h"',
-            '#ifdef __HGGCCC__\n#include "cuda_ad.h"\n#include "utils.h"\n#endif')
-                
-        # Fix SM detection + C10_CUDA_CHECK: only for splitkv_mla.cu and splitkv_dsa.cu
-        if 'splitkv_mla' in fp or 'splitkv_dsa' in fp:
-            content = re.sub(
-                r'int sm_count = get_num_sm\(get_current_device\(\)\);\n\s*if \(sm_count == 64\) sm_count = 20;',
-                'auto dprops = at::cuda::getCurrentDeviceProperties();\n\n            int sm_count = dprops->multiProcessorCount;\n            if (std::string(dprops->name).find("810E") != std::string::npos) {\n                sm_count = 20;\n            }',
-                content)
-        
-            # Fix C10_CUDA_CHECK wrapper: ppu_dev wraps cudaFuncSetAttribute with C10_CUDA_CHECK
-            content = re.sub(
-                r'(\s*)cudaFuncSetAttribute\(',
-                r'\1C10_CUDA_CHECK(cudaFuncSetAttribute(', content)
-            content = re.sub(
-                r'C10_CUDA_CHECK\(cudaFuncSetAttribute\(([^;]+)\);',
-                r'C10_CUDA_CHECK(cudaFuncSetAttribute(\1));', content)
-        
-        open(fp, 'w').write(content)
-        count += 1
-        if verbose:
-            print(f"    {fp}")
-    return count
-
-
-def restore_cu_files(dry_run=False, verbose=False):
-    """Restore main .cu kernel files."""
-    files = [
-        'csrc/flash_fwd_split_hdim576_512_bf16_sm80.cu',
-        'csrc/flash_fwd_split_hdim576_512_fp16_sm80.cu',
-        'csrc/flash_fwd_sparse_prefill_hdim576_512_bf16_sm80.cu',
-    ]
-    count = 0
-    for fp in files:
-        if not os.path.isfile(fp):
-            continue
-        content = open(fp).read()
-        if 'hggcStream_t' not in content and 'hggcFuncSetAttribute' not in content:
-            continue
-
-        if dry_run:
-            if verbose:
-                print(f"    [dry-run] {fp}")
-            count += 1
-            continue
-
-        content = apply_reverse_replacements(content)
-        content = apply_reverse_arch_values(content)
-        open(fp, 'w').write(content)
-        count += 1
-        if verbose:
-            print(f"    {fp}")
-    return count
-
-
-def restore_other_headers(dry_run=False, verbose=False):
-    """Restore remaining headers: kernel_traits.h, dequant.h, acc_vreg_fraga.h, flash.h."""
-    files = [
-        'csrc/kernel_traits.h',
-        'csrc/dequant.h',
-        # Note: acc_vreg_fraga.h is NOT processed — ppu_dev uses __HGGC_ARCH__
-        # in this file (same as ppu-original), so no conversion needed.
-        'csrc/fmha_profiling_interface.hpp',
-    ]
-    count = 0
-    for fp in files:
-        if not os.path.isfile(fp):
-            continue
-        content = open(fp).read()
-        if '__HGGC_ARCH__' not in content and 'PPU10_' not in content \
-           and 'PPU_8x' not in content and 'PPU0015_' not in content \
-           and 'PPU0010_' not in content and '__hg_fp8' not in content \
-           and 'hggcStream_t' not in content \
-           and 'hgtx' not in content and 'hggc' not in content:
-            continue
-
-        if dry_run:
-            if verbose:
-                print(f"    [dry-run] {fp}")
-            count += 1
-            continue
-
-        content = apply_reverse_replacements(content)
-        content = apply_reverse_arch_values(content)
-
-        # kernel_traits.h: remove extra SmemCopyAtomQ/K fallback in #else branch
-        if fp == 'csrc/kernel_traits.h':
-            content = re.sub(
-                r'(using SmemCopyAtomTransposed = Copy_Atom<DefaultCopy, elem_type>;\n)'
-                r'    using SmemCopyAtomQ = SmemCopyAtom;\n'
-                r'    using SmemCopyAtomK = SmemCopyAtom;\n',
-                r'\1', content)
-
-        open(fp, 'w').write(content)
-        count += 1
-        if verbose:
-            print(f"    {fp}")
-    return count
-
-
 # =============================================================================
-# setup.py restoration (hardcode original CUDAExtension version)
+# setup.py full content (hardcoded CUDAExtension version)
 # =============================================================================
 
-ORIGINAL_SETUP_PY = r'''import os
+CUDA_SETUP_PY = r'''import os
 from pathlib import Path
 from datetime import datetime
 import subprocess
@@ -668,17 +406,24 @@ def append_nvcc_threads(nvcc_extra_args):
 
 def get_sources():
     sources = [
-        "csrc/flash_api.cpp",
-        "csrc/flash_fwd_split_hdim576_512_bf16_sm80.cu",
-        "csrc/flash_fwd_sparse_prefill_hdim576_512_bf16_sm80.cu",
-        "csrc/flash_fwd_mla_metadata.cu",
-        "csrc/flash_splitkv/mla_combine.cu",
-        "csrc/flash_splitkv/splitkv_mla.cu",
-        "csrc/flash_splitkv/splitkv_dsa.cu",
+        "csrc/api/api.cpp",
+        "csrc/ppu/decode/dense/instantiations/hdim576_512_bf16.cu",
+        "csrc/ppu/decode/dense/instantiations/splitkv_mla_bf16.cu",
+        "csrc/ppu/prefill/sparse/instantiations/dispatch_bf16.cu",
+        "csrc/ppu/decode/sparse/instantiations/hdim576_bf16.cu",
+        "csrc/ppu/decode/sparse/instantiations/hdim512_bf16.cu",
+        "csrc/ppuxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
+        "csrc/ppuxx/decode/combine/instantiations/mla_combine_bf16.cu",
+        "csrc/ppu/prefill/sparse/instantiations/wg_bf16_sm80.cu",
+        "csrc/ppu/prefill/sparse/instantiations/wg_bf16_sm89.cu",
     ]
 
     if not DISABLE_FP16:
-        sources.append("csrc/flash_fwd_split_hdim576_512_fp16_sm80.cu")
+        sources.append("csrc/ppu/decode/dense/instantiations/hdim576_512_fp16.cu")
+        sources.append("csrc/ppu/decode/dense/instantiations/splitkv_mla_fp16.cu")
+        sources.append("csrc/ppuxx/decode/combine/instantiations/mla_combine_fp16.cu")
+        sources.append("csrc/ppu/prefill/sparse/instantiations/wg_fp16_sm80.cu")
+        sources.append("csrc/ppu/prefill/sparse/instantiations/wg_fp16_sm89.cu")
 
     return sources
 
@@ -765,6 +510,9 @@ ext_modules.append(
         include_dirs=[
             Path(this_dir) / "csrc",
             Path(this_dir) / "csrc" / "actlize" / "include",
+            Path(this_dir) / "csrc" / "api",
+            Path(this_dir) / "csrc" / "kerutils" / "include",
+            Path(this_dir) / "csrc" / "ppu",
         ],
     )
 )
@@ -779,6 +527,9 @@ except Exception as _:
 def custom_local_scheme(version):
     return '+dev%03d.%s' % (version.distance, version.node[:7])
 
+### update FlashMLA Version
+### flash_mla-1.0.0 do not support deepseek-v4, with fixed commit-id #f907f433e
+### flash_mla-1.0.1 support deepseek-v4 with API Breaking Changes!
 def custom_version_scheme(version):
     return '2.0.0'
 
@@ -795,23 +546,218 @@ setup(
 )
 '''
 
+# =============================================================================
+# Full file content: files that are completely rewritten (not incrementally patched)
+# =============================================================================
 
-def restore_setup_py(dry_run=False, verbose=False):
-    """Restore setup.py to original CUDAExtension version."""
-    fp = 'setup.py'
-    if not os.path.isfile(fp):
-        return False
-    content = open(fp).read()
-    if 'HGCCBuildExtension' not in content:
-        return False
+FULL_FILE_CONTENT: Dict[str, str] = {
+    'setup.py': CUDA_SETUP_PY,
+    'csrc/kerutils/include/kerutils/host/hardware_info.h': (
+        '/******************************************************************************\n'
+        ' * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.\n'
+        ' * Copyright (c) 2024, Tri Dao.\n'
+        ' ******************************************************************************/\n'
+        '\n'
+        '#pragma once\n'
+        '\n'
+        '#include "kerutils/common/common.h"\n'
+        '\n'
+        '#include <tuple>\n'
+        '\n'
+        '#if !defined(__CUDACC_RTC__)\n'
+        '#include "cuda_runtime.h"\n'
+        '#endif\n'
+        '\n'
+        '\n'
+        'inline int get_current_device() {\n'
+        '    int device;\n'
+        '    CHECK_CUDA(cudaGetDevice(&device));\n'
+        '    return device;\n'
+        '}\n'
+        '\n'
+        'inline std::tuple<int, int> get_compute_capability(int device) {\n'
+        '    int capability_major, capability_minor;\n'
+        '    CHECK_CUDA(cudaDeviceGetAttribute(&capability_major, cudaDevAttrComputeCapabilityMajor, device));\n'
+        '    CHECK_CUDA(cudaDeviceGetAttribute(&capability_minor, cudaDevAttrComputeCapabilityMinor, device));\n'
+        '    return {capability_major, capability_minor};\n'
+        '}\n'
+        '\n'
+        'inline int get_num_sm(int device) {\n'
+        '    int multiprocessor_count;\n'
+        '    CHECK_CUDA(cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));\n'
+        '    return multiprocessor_count;\n'
+        '}\n'
+    ),
+}
+
+# =============================================================================
+# Files to skip entirely (no conversion needed)
+# =============================================================================
+
+EXCLUDE_FILES = [
+    'csrc/ppu/acc_vreg_fraga.h',  # uses __HGGC_ARCH__ in both modes
+]
+
+# =============================================================================
+# Helper functions
+# =============================================================================
+
+def apply_replacements(content: str, replacements: List[Tuple[str, str]]) -> str:
+    """Apply a list of (old, new) text replacements to content.
+
+    Idempotency guard: if old is a substring of new AND new is already in content,
+    skip the replacement (prevents double-insertion of guards/wrappers).
+    """
+    for old, new in replacements:
+        if old and old != new:
+            if old in new and new in content:
+                continue
+            content = content.replace(old, new)
+    return content
+
+
+def apply_arch_value_replacements(content: str) -> str:
+    """Replace __CUDA_ARCH__ arch values: hggc arch → cuda arch.
+    Also handles the LDSM/SmemCopyAtom special case (>= 800 → >= 750).
+    """
+    lines = content.split('\n')
+    new_lines = []
+    for i, line in enumerate(lines):
+        if '__CUDA_ARCH__' in line:
+            for old, new in ARCH_VALUE_REPLACEMENTS:
+                line = line.replace(old, new)
+            next_line = lines[i + 1] if i + 1 < len(lines) else ''
+            if 'LDSM' in next_line or 'SmemCopyAtom' in next_line:
+                line = line.replace('>= 800', '>= 750')
+        new_lines.append(line)
+    return '\n'.join(new_lines)
+
+
+def apply_regex_replacements(content: str, regex_list: List[Tuple[str, str, str]],
+                             filepath: str) -> str:
+    """Apply regex-based replacements. Each entry is (pattern, replacement, file_glob).
+    file_glob is matched against filepath via endswith(); None means apply to all files.
+    """
+    for pattern, replacement, file_glob in regex_list:
+        if file_glob and not filepath.endswith(file_glob):
+            continue
+        content = re.sub(pattern, replacement, content, flags=re.MULTILINE | re.DOTALL)
+    return content
+
+
+def apply_word_boundary_replacements(content: str,
+                                     replacements: List[Tuple[str, str]]) -> str:
+    """Apply (old, new) replacements using word-boundary regex.
+
+    Required for type names such as __ppu_bfloat162 so they do not also match
+    inside __ppu_bfloat162_raw (which str.replace would do as a prefix match).
+    """
+    for old, new in replacements:
+        if old and old != new:
+            content = re.sub(r'\b' + re.escape(old) + r'\b', new, content)
+    return content
+
+
+def apply_hggccc_guards(content: str, rel_path: str) -> str:
+    """Wrap cuda_ad.h includes in #ifdef __HGGCCC__ guards for nvcc (nvcc does
+    not define __HGGCCC__). Must run after <hggc_ad.h> -> "cuda_ad.h" conversion.
+
+    Files that already contain an __HGGCCC__ guard elsewhere are left untouched,
+    matching the reference behaviour (combine.cuh / splitkv_mla.cuh already
+    guard other blocks, so their cuda_ad.h include stays unguarded)."""
+    if rel_path not in HGGCCC_GUARD_FILES:
+        return content
+    if '#ifdef __HGGCCC__' in content:
+        return content
+    content = content.replace(
+        '#include "cuda_ad.h"\n#include "utils.h"',
+        '#ifdef __HGGCCC__\n#include "cuda_ad.h"\n#include "utils.h"\n#endif')
+    content = content.replace(
+        '#include "cuda_ad.h"',
+        '#ifdef __HGGCCC__\n#include "cuda_ad.h"\n#endif')
+    return content
+
+
+def process_file(filepath: str, repo_dir: str,
+                 dry_run: bool = False, verbose: bool = False) -> int:
+    """Process a single file through the replacement pipeline. Returns change count."""
+    rel_path = os.path.relpath(filepath, repo_dir)
+
+    # --- Full file content rewrites ---
+    if rel_path in FULL_FILE_CONTENT:
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except (IOError, OSError):
+            return 0
+        target = FULL_FILE_CONTENT[rel_path]
+        if content == target:
+            return 0
+        if dry_run:
+            if verbose:
+                print(f"    [dry-run] {rel_path}")
+            return 1
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(target)
+        if verbose:
+            print(f"    {rel_path}")
+        return 1
+
+    # --- Excluded files ---
+    if rel_path in EXCLUDE_FILES:
+        return 0
+
+    # --- Read content ---
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+            content = f.read()
+    except (IOError, OSError):
+        return 0
+    original = content
+
+    # --- Check relevance ---
+    has_file_specific = rel_path in FILE_SPECIFIC_REPLACEMENTS
+    has_hggc_patterns = bool(re.search(
+        r'\bhggc|\b__HGGC_ARCH__\b|\bPPU10_|__hg_fp8|__ppu_bfloat16|<hgtx3/|<hggc_',
+        content))
+    if not has_file_specific and not has_hggc_patterns:
+        return 0
+
+    # --- Pipeline ---
+    # 1. File-specific replacements (highest priority)
+    if has_file_specific:
+        content = apply_replacements(content, FILE_SPECIFIC_REPLACEMENTS[rel_path])
+
+    # 2. Category replacements (include → enum → type → func → macro → atom → nvtx)
+    for table in ALL_CATEGORY_REPLACEMENTS:
+        content = apply_replacements(content, table)
+
+    # 3. Word-boundary type replacements (FP8/bfloat16 — \b prevents prefix matches)
+    content = apply_word_boundary_replacements(content, WORD_BOUNDARY_REPLACEMENTS)
+
+    # 4. Arch value replacements (line-by-line on __CUDA_ARCH__ lines)
+    content = apply_arch_value_replacements(content)
+
+    # 5. Regex replacements (complex multi-line patterns)
+    content = apply_regex_replacements(content, REGEX_REPLACEMENTS, filepath)
+
+    # 6. __HGGCCC__ guards around cuda_ad.h (after <hggc_ad.h> → "cuda_ad.h")
+    content = apply_hggccc_guards(content, rel_path)
+
+    # --- Check and write ---
+    if content == original:
+        return 0
 
     if dry_run:
         if verbose:
-            print(f"    [dry-run] {fp}")
-        return True
+            print(f"    [dry-run] {rel_path}")
+        return 1
 
-    open(fp, 'w').write(ORIGINAL_SETUP_PY)
-    return True
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(content)
+    if verbose:
+        print(f"    {rel_path}")
+    return 1
 
 
 # =============================================================================
@@ -819,67 +765,64 @@ def restore_setup_py(dry_run=False, verbose=False):
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='FlashMLA PPU-original → CUDA-Compatible Transform')
-    parser.add_argument('target_dir', nargs='?', default='.', help='Target FlashMLA root directory')
-    parser.add_argument('--dry-run', action='store_true', help='Show what would be done')
-    parser.add_argument('--verbose', action='store_true', help='Print each modified file')
+    parser = argparse.ArgumentParser(
+        description='FlashMLA PPU-original → CUDA-Compatible Transform (lookup-table refactored)')
+    parser.add_argument('target_dir', nargs='?', default='.',
+                        help='Target FlashMLA root directory')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Show what would be done without making changes')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Print each modified file')
     args = parser.parse_args()
 
     target_dir = os.path.abspath(args.target_dir)
-    if not os.path.isfile(os.path.join(target_dir, 'setup.py')) or not os.path.isdir(os.path.join(target_dir, 'csrc')):
+    if (not os.path.isfile(os.path.join(target_dir, 'setup.py')) or
+            not os.path.isdir(os.path.join(target_dir, 'csrc'))):
         print(f"ERROR: {target_dir} is not a FlashMLA root directory.")
         sys.exit(1)
     os.chdir(target_dir)
 
     print("=" * 60)
-    print("FlashMLA PPU-original → CUDA-Compatible Transform")
+    print("FlashMLA PPU-original → CUDA-Compatible Transform (lookup-table)")
     print(f"Target: {target_dir}")
+    print(f"Mode: {'DRY-RUN' if args.dry_run else 'APPLY'}")
     print("=" * 60)
 
     t0 = time.time()
-    n_total = 0
 
-    # Step 1: Structural restorations
-    print("\n[1/3] Structural file restorations...")
-    restorers = [
-        ('csrc/flash.h', restore_flash_h),
-        ('csrc/hardware_info.h', restore_hardware_info_h),
-        ('csrc/utils.h', restore_utils_h),
-        ('csrc/flash_fwd_launch_template.h', restore_launch_template_guards),
-        ('csrc/flash_api.cpp', restore_flash_api_cpp),
-        ('csrc/flash_splitkv/traits.h', restore_traits_h),
-        ('csrc/flash_fwd_mla_metadata.cu', restore_metadata_cu),
-    ]
-    for name, func in restorers:
-        if func(dry_run=args.dry_run, verbose=args.verbose):
-            n_total += 1
-            if not args.dry_run and args.verbose:
-                print(f"    {name}")
+    # Collect all target files
+    all_files = []
+    for root, dirs, files in os.walk('csrc'):
+        if 'actlize' in root:
+            continue
+        for f in files:
+            if f.endswith(('.cu', '.cuh', '.h', '.hpp', '.cpp')):
+                all_files.append(os.path.join(root, f))
 
-    # Step 2: Bulk file transformations
-    print("\n[2/3] Bulk file transformations...")
-    n_bulk = restore_splitkv_files(dry_run=args.dry_run, verbose=args.verbose)
-    n_bulk += restore_cu_files(dry_run=args.dry_run, verbose=args.verbose)
-    n_bulk += restore_other_headers(dry_run=args.dry_run, verbose=args.verbose)
-    n_total += n_bulk
-    print(f"  Transformed: {n_bulk} files")
+    # Also include setup.py
+    setup_path = os.path.join(target_dir, 'setup.py')
+    if os.path.isfile(setup_path):
+        all_files.append(setup_path)
 
-    # Step 3: setup.py restoration
-    print("\n[3/3] Setup.py restoration...")
-    if restore_setup_py(dry_run=args.dry_run, verbose=args.verbose):
-        n_total += 1
-        if not args.dry_run and args.verbose:
-            print(f"    setup.py")
+    print(f"\nFound {len(all_files)} target files to process\n")
+
+    # Process all files through the unified pipeline
+    files_modified = 0
+    for fp in sorted(all_files):
+        changes = process_file(fp, target_dir, dry_run=args.dry_run, verbose=args.verbose)
+        if changes > 0:
+            files_modified += 1
 
     # Summary
     t1 = time.time()
-    print(f"\nDone in {t1-t0:.1f}s")
+    print(f"\nDone in {t1 - t0:.1f}s")
     print("=" * 60)
-    print(f"  Total files modified: {n_total}")
+    print(f"  Files scanned:   {len(all_files)}")
+    print(f"  Files modified:  {files_modified}")
     print("=" * 60)
 
     if args.dry_run:
-        print("\n  [DRY RUN - no files modified]")
+        print("\n  [DRY RUN — no files modified]")
     else:
         print("\n  Next steps:")
         print("  1. Build: python setup.py bdist_wheel")
