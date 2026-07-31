@@ -357,62 +357,52 @@ REGEX_REPLACEMENTS: List[Tuple[str, str, str]] = [
     # Text-replacement-only mode will leave einsum.py differences (acceptable trade-off for stability).
     # (r'\n# --- Fused permute\(1,0,2\) kernel.*return out_a, out_sfa\n\n', '\n', 'einsum.py'),
 
-    # Remove #ifndef USE_HGGC / #endif guards wrapping atomic_add_release_global in utils_rtc.cuh
-    # and the duplicated __HGGC__ guarded version at the bottom
-    (r'#ifndef USE_HGGC\n(__device__.*?atomic_add_release_global.*?\})\n#endif',
+    # --- utils_rtc.cuh ---
+    # One generic rule for both `#if defined(__HGGC__)` regions (atomic_add_release_global
+    # and computeBlockInfoKernel): keep the body, drop the guard. nvcc does not define
+    # __HGGC__, so leaving the guard in place would delete the code from the product.
+    # The body pattern is LINE-BOUNDED and refuses to cross any other preprocessor
+    # directive, so it cannot mis-pair one region's #if with another region's #endif --
+    # the failure mode of the DOTALL `.*?` patterns this replaces. It also does not
+    # depend on any comment text or on blank-line counts.
+    (r'(?m)^#if defined\(__HGGC__\)\n((?:(?!^#\s*(?:if|ifdef|ifndef|else|elif|endif)\b)[^\n]*\n)*)^#endif  // __HGGC__\n',
      r'\1', 'utils_rtc.cuh'),
 
-    # Remove the __HGGC__-only device qualifier blocks and USE_HGGC host-fallback macros
-    (r'// When not compiling with hgcc.*?#endif  // !USE_HGGC\n\n', '', 'utils_rtc.cuh'),
-    (r'\n#if defined\(__HGGC__\)\n__device__ __forceinline__ int atomic_add_release_global.*?#endif  // __HGGC__\n', '', 'utils_rtc.cuh'),
-    (r'\n#if defined\(__HGGC__\)\ntemplate <uint32_t BlockM>.*?#endif  // __HGGC__\n', '', 'utils_rtc.cuh'),
+    # NOTE: next_power_of_two needs no rule -- in utils_rtc.cuh it sits outside every
+    # guard and is valid for both backends, so it simply survives conversion.
 
-    # Remove next_power_of_two function from utils_rtc.cuh (added in ppu-original, not in target)
-    (r'\nuint32_t next_power_of_two\(uint32_t n\) \{.*?return n \+ 1;\n\}\n', '', 'utils_rtc.cuh'),
-
-    # --- profiling_interface.hpp: remove #ifdef DG_USE_NVTX guards ---
-    # Remove the top-level #ifdef DG_USE_NVTX (after #pragma once) and its #endif
-    (r'#pragma once\n#ifdef DG_USE_NVTX\n', '#pragma once\n', 'profiling_interface.hpp'),
-    # Remove the orphaned #endif left after the #include line
-    (r'#include <nvtx3/nvToolsExt.h>\n#endif\n', '#include <nvtx3/nvToolsExt.h>\n', 'profiling_interface.hpp'),
-    # Remove #include <cuda_runtime.h> that was added in ppu-original
+    # --- profiling_interface.hpp ---
+    # The DG_USE_HGTX guards used to be stripped here by 9 positional regexes that
+    # depended on \s+ indentation and on the HGTX->NVTX rename having already run.
+    # DG_USE_HGTX was never defined anywhere, so the guarded code was dead on the PPU
+    # side while the CUDA side needs the nvtx calls unguarded; the PPU source now simply
+    # has no guards, and conversion is pure token renaming. Only this include drop remains.
     (r'#include <cuda_runtime.h>\n', '', 'profiling_interface.hpp'),
-    # Remove #ifdef DG_USE_NVTX / #endif pairs wrapping nvtx code (keep content)
-    (r'#ifdef DG_USE_NVTX\n(\s+if \(use_nvtx_\) \{)', r'\1', 'profiling_interface.hpp'),
-    (r'\}\n#endif\n(\s+\} else \{)', r'}\n\1', 'profiling_interface.hpp'),
-    (r'#ifdef DG_USE_NVTX\n(\s+if \(use_nvtx_\) \{\n\s+nvtxDomainRangePop)', r'\1', 'profiling_interface.hpp'),
-    (r'nvtxDomainRangePop\(domain_\);\n\s+\}\n#endif', 'nvtxDomainRangePop(domain_);\n            }', 'profiling_interface.hpp'),
-    # Remove #ifdef/#else/#endif around domain_ member variable (keep nvtx version)
-    (r'#ifdef DG_USE_NVTX\n(\s+domain_ = nvtxDomainCreateA\("deepgemm"\);)\n#else\n\s+domain_ = nullptr;\n#endif',
-     r'\1', 'profiling_interface.hpp'),
-    # Remove #ifdef/#endif around nvtxDomainDestroy
-    (r'#ifdef DG_USE_NVTX\n(\s+nvtxDomainDestroy\(domain_\);)\n#endif',
-     r'\1', 'profiling_interface.hpp'),
-    # Remove #ifdef/#else/#endif around domain_ type declaration (keep nvtxDomainHandle_t)
-    (r'#ifdef DG_USE_NVTX\n(\s+nvtxDomainHandle_t domain_;)\n#else\n\s+void\* domain_;\n#endif',
-     r'\1', 'profiling_interface.hpp'),
 
-    # --- scheduler_cutlass3.cuh: remove #ifdef __clang__, #if defined(__HGGC__), #ifdef USE_HGGC guards ---
-    (r'#ifdef __clang__\n#pragma clang diagnostic push\n', '#pragma clang diagnostic push\n', 'scheduler_cutlass3.cuh'),
-    (r'#ifdef __clang__\n#pragma clang diagnostic pop\n', '#pragma clang diagnostic pop\n', 'scheduler_cutlass3.cuh'),
+    # --- scheduler_cutlass3.cuh: resolve the #if defined(__HGGC__) guards ---
     # Remove orphaned #endif after pragma lines (left over from #ifdef __clang__ removal)
-    (r'#pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"\n#endif\n',
-     '#pragma ide diagnostic ignored "cppcoreguidelines-pro-type-member-init"\n', 'scheduler_cutlass3.cuh'),
-    (r'#pragma clang diagnostic pop\n#endif\n', '#pragma clang diagnostic pop\n', 'scheduler_cutlass3.cuh'),
     # Remove #if defined(__HGGC__) and its matching #endif (keeping content between)
-    (r'\n#if defined\(__HGGC__\)\n\s*// --- Device-only.*?---\n\n', '\n', 'scheduler_cutlass3.cuh'),
-    (r'\n#if defined\(__HGGC__\)\n\s*// --- Device-only.*?---\n', '\n', 'scheduler_cutlass3.cuh'),
-    (r'\n#if defined\(__HGGC__\)\n', '\n', 'scheduler_cutlass3.cuh'),
-    (r'\n#endif  // defined\(__HGGC__\)\n', '\n', 'scheduler_cutlass3.cuh'),
-    (r'\n#ifdef USE_HGGC\n', '\n', 'scheduler_cutlass3.cuh'),
-    (r'\n#endif  // USE_HGGC \(DynamicTile section\)\n', '\n', 'scheduler_cutlass3.cuh'),
+    # NOTE: the __clang__ and USE_HGGC guards are gone from the PPU source itself.
+    # hgcc does not predefine __clang__ (so those pragmas never applied), and USE_HGGC
+    # is passed by every compile path including hgrtc, so both guards were inert.
+    # The __HGGC__ guards below MUST stay: csrc/python_api.cpp is a host TU built by
+    # g++, which does not define __HGGC__, and the guarded code uses threadIdx /
+    # blockDim / __shfl_sync / __syncthreads.
+    # One line-bounded rule for all four `#if defined(__HGGC__)` regions: keep the body,
+    # drop the guard (nvcc does not define __HGGC__, so the guard would delete the code).
+    # It replaces three patterns that split the work by whether the #if happened to be
+    # followed by a '// --- Device-only ...' comment -- rewording that comment used to
+    # leave a stray #if while its #endif was still removed. The body pattern refuses to
+    # cross any other preprocessor directive, so regions can never be mis-paired.
+    (r'(?m)^#if defined\(__HGGC__\)\n((?:(?!^#\s*(?:if|ifdef|ifndef|else|elif|endif)\b)[^\n]*\n)*)^#endif  // defined\(__HGGC__\)\n',
+     r'\1', 'scheduler_cutlass3.cuh'),
     # Remove standalone comment about host-callable methods added in ppu-original
-    (r'\n    // Host-callable methods and type definitions\n', '\n', 'scheduler_cutlass3.cuh'),
-    (r'\n    // Host-callable: to_underlying_arguments and get_workspace_size\n', '\n', 'scheduler_cutlass3.cuh'),
+    # NOTE: two blank-line-only rules were removed here. They normalised the number
+    # of empty lines around '};' and did not change a single token, so any
+    # reformatting of the source silently disabled them. The product now keeps the
+    # source's blank lines, which cannot affect compilation.
     # Remove extra blank lines between closing } and }; near the Dynamic Tile comment
-    (r'    \}\n\n\};\n\n\n// ==', '    }\n};\n\n// ==', 'scheduler_cutlass3.cuh'),
     # Remove triple newline before #pragma clang diagnostic pop
-    (r'\};\n\n\n#pragma clang diagnostic pop', '};\n\n#pragma clang diagnostic pop', 'scheduler_cutlass3.cuh'),
 ]
 
 # Commented-out function to insert in common_bf16.hpp
@@ -467,222 +457,86 @@ COMMON_BF16_COMMENT_BLOCK = """// std::vector<std::vector<int>> generate_search_
 // }
 """
 
-# Content to append to utils.cuh (next_power_of_two + computeBlockInfoKernel)
-UTILS_CUH_APPEND = """\n
-uint32_t next_power_of_two(uint32_t n) {
-  if (n == 0) return 1;
-  n--;
-  n |= n >> 1;
-  n |= n >> 2;
-  n |= n >> 4;
-  n |= n >> 8;
-  n |= n >> 16;
-  return n + 1;
-}
-
-template <uint32_t BlockM>
-__global__ void computeBlockInfoKernel(
-    const uint32_t* __restrict__ group_num_list,
-    const uint32_t group_num,
-    uint32_t* __restrict__ block_info)
-{
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = threadIdx.x % 32;
-    const uint32_t warp_id = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
-    const uint32_t num_warps = blockDim.x / 32;
-    uint32_t group_val = tid < group_num ? group_num_list[tid] : 0;
-    uint32_t block_val = (group_val + BlockM - 1) / BlockM;
-    uint32_t warp_group_scan = group_val;
-    uint32_t warp_block_scan = block_val;
-    for (uint32_t offset = 1; offset < 32; offset *= 2) {
-        uint32_t tmp_group = __shfl_up_sync(0xFFFFFFFF, warp_group_scan, offset);
-        uint32_t tmp_block = __shfl_up_sync(0xFFFFFFFF, warp_block_scan, offset);
-        if (lane >= offset) {
-            warp_group_scan += tmp_group;
-            warp_block_scan += tmp_block;
-        }
-    }
-
-    __shared__ uint32_t warp_group_totals[32];
-    __shared__ uint32_t warp_block_totals[32];
-
-    if (lane == 31) {
-        warp_group_totals[warp_id] = warp_group_scan;
-        warp_block_totals[warp_id] = warp_block_scan;
-    }
-    __syncthreads();
-
-    __shared__ uint32_t warp_group_prefix[32];
-    __shared__ uint32_t warp_block_prefix[32];
-
-    if (warp_id == 0) {
-        uint32_t group_sum = 0;
-        uint32_t block_sum = 0;
-        for (uint32_t w = 0; w < num_warps; ++w) {
-            warp_group_prefix[w] = group_sum;
-            warp_block_prefix[w] = block_sum;
-            group_sum += warp_group_totals[w];
-            block_sum += warp_block_totals[w];
-        }
-        if (tid == 0) {
-            *block_info = block_sum;
-        }
-    }
-    __syncthreads();
-
-    uint32_t group_prefix = warp_group_prefix[warp_id];
-    uint32_t block_prefix = warp_block_prefix[warp_id];
-    uint32_t warp_group_exclusive = warp_group_scan - group_val;
-    uint32_t warp_block_exclusive = warp_block_scan - block_val;
-    uint32_t global_group_prefix = group_prefix + warp_group_exclusive;
-    uint32_t global_block_prefix = block_prefix + warp_block_exclusive;
-
-    uint32_t base_offset = global_block_prefix * 4;
-    uint32_t* output_info = block_info + 4;
-    for (uint32_t i = 0; i < block_val; ++i) {
-        uint32_t block_idx = base_offset + i * 4;
-        output_info[block_idx]     = tid;          // group_idx
-        output_info[block_idx + 1] = group_val;    // group_num
-        output_info[block_idx + 2] = global_block_prefix; // prefix_block_m_idx
-        output_info[block_idx + 3] = global_group_prefix; // prefix_group_sum
-    }
-}"""
 
 # Specific whole-line or block replacements per file
 # Format: {relative_path: [(old_text, new_text), ...]}
 FILE_SPECIFIC_REPLACEMENTS: Dict[str, List[Tuple[str, str]]] = {
-    # --- csrc/jit/compiler.hpp ---
+    # --- csrc/jit/compiler.hpp (ACTIVE) ---
+    # Pure token/phrase renames only. All genuinely divergent multi-line regions are
+    # handled by FILE_SPECIFIC_BLOCK_REPLACEMENTS (anchor-delimited). This list is
+    # robust to incidental edits (whitespace/comments/reordering) around these tokens.
     'csrc/jit/compiler.hpp': [
-        # Include overrides (file-specific, different from generic rules)
+        # Includes (file-specific; differ from generic hggc.h -> cuda.h mapping)
         ('#include <hggc_runtime_api.h>', '#include <ATen/cuda/CUDAContext.h>'),
         ('#include <hggc.h>', '#include <cuda_runtime.h>'),
+        # The offline PPU compiler rejects both --diag-suppress and --ptxas-options, so the
+        # base ctor seeds neither; both are re-injected here for the CUDA build. -lineinfo
+        # IS accepted by the PPU compiler and therefore stays on both sides.
+        ('flags = fmt::format("-std=c++{} ",',
+         'flags = fmt::format("-std=c++{} --diag-suppress=39,174,177,940 ",'),
+        # Anchored on the 8-space, non-template LINEINFO if-line (the RtcOptions copy uses
+        # get_env<int>(...) with 12 spaces, so it is not touched).
+        ('        if (get_env("DG_JIT_WITH_LINEINFO", 0))\n',
+         '        if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0) or get_env("DG_JIT_PTXAS_CHECK", 0))\n            flags += " --ptxas-options=--verbose,--warn-on-local-memory-usage";\n        if (get_env("DG_JIT_WITH_LINEINFO", 0))\n'),
+        # The PPU-only defines collapse to a bare separator (the base flags do not always
+        # end with a space, so the space must be kept).
+        (' -DUSE_HGGC -DUSE_CLANG -DUSE_ACWRAPPER ', ' '),
         # Class names
-        ('class HGCCCompiler final: public Compiler', 'class NVCCCompiler final: public Compiler'),
-        ('class HGRTCCompiler final: public Compiler', 'class NVRTCCompiler final: public Compiler'),
-        ('std::filesystem::path hgcc_path;', 'std::filesystem::path nvcc_path;'),
-        ('std::filesystem::path sdk_home;', 'std::filesystem::path cuda_home;'),
-        # Version method - return type changed
-        ("std::string get_hgcc_version()", "std::pair<int, int> get_nvcc_version()"),
-        # Replace get_hgcc_version function body (multiline block)
-        # The regex in the source uses R"(...)" which is tricky to match exactly
-        # So we replace key lines individually:
-        ('DG_HOST_ASSERT(std::filesystem::exists(hgcc_path) and "hgcc compiler not found");',
-         'DG_HOST_ASSERT(std::filesystem::exists(nvcc_path));'),
-        ('DG_HOST_ASSERT(return_code == 0 and "Failed to query hgcc --version");\n\n        std::smatch match;',
-         'DG_HOST_ASSERT(return_code == 0);\n\n        // The version should be at least 12.3, for the best performance with 12.9\n        int major, minor;\n        std::smatch match;'),
-        ('if (std::regex_search(output, match, std::regex(R"(version (\\d+\\.\\d+(?:\\.\\d+)?))")))',
-         'DG_HOST_ASSERT(std::regex_search(output, match, std::regex(R"(release (\\d+\\.\\d+))")));\n        std::sscanf(match[1].str().c_str(), "%d.%d", &major, &minor);\n        DG_HOST_ASSERT((major > 12 or (major == 12 and minor >= 3)) and "NVCC version should be >= 12.3");\n        if (major == 12 and minor < 9)\n            printf("Warning: please use at least NVCC 12.9 for the best DeepGEMM performance\\n");\n        return {major, minor};\n    }'),
-        ('            return match[1].str();\n        return "unknown";\n    }\n', ''),
-        # NVCCCompiler constructor body: path and signature (MUST be before generic hgcc_path replacement)
-        ('// Locate the hgcc offline compiler shipped with the PPU SDK', '// Override the compiler signature'),
-        ('hgcc_path = "/usr/local/PPU_SDK/bin/hgcc";', 'nvcc_path = cuda_home / "bin" / "nvcc";'),
-        ('signature = fmt::format("HGCC{}", get_hgcc_version());', 'const auto& [nvcc_major, nvcc_minor] = get_nvcc_version();\n        signature = fmt::format("NVCC{}.{}", nvcc_major, nvcc_minor);'),
-        # Comments that reference HGBIN/CUBIN
-        ('// Compile into a temporary HGBIN', '// Compile into a temporary CUBIN'),
-        ('// Query the hgcc driver version (best-effort; never fatal on format mismatch)', ''),
-        # NVRTCCompiler printf format specifiers (size_t vs int)
-        ('printf("HGRTC compile options (%zu):', 'printf("NVRTC compile options (%d):'),
-        ('for (size_t i = 0; i < opts.size(); ++i) {', 'for (int i = 0; i < opts.size(); ++i) {'),
-        ('printf("  [%zu] %s', 'printf("  [%d] %s'),
-        # Get HGBIN comments
-        ('// Get HGBIN size and data', '// Get CUBIN size and data'),
-        ('// Create HGRTC program and compile', '// Create NVRTC program and compile'),
-        ('// Print HGRTC compile options', '// Print NVRTC compile options'),
-        # Env variable for compiler path (MUST be before generic hgcc_path)
-        ('DG_JIT_HGCC_COMPILER', 'DG_JIT_NVCC_COMPILER'),
-        ('env_hgcc_path', 'env_nvcc_path'),
-        # Compiler messages
-        ('hgcc compiler not found', 'nvcc compiler not found'),
-        ("Failed to query hgcc --version", "Failed to query nvcc --version"),
-        # hgcc_extra_flags -> nvcc_flags
-        ('hgcc_extra_flags', 'nvcc_flags'),
-        # NVCCCompiler flags: replace hgcc-specific flags with nvcc equivalents
-        ('-hgbin -ftemplate-depth=8192 -O3 -DNDEBUG', '-cubin --expt-relaxed-constexpr --expt-extended-lambda'),
-        ('flags += " -x hg ";', ''),
-        # All usages of hgcc_path -> nvcc_path (generic, MUST be LAST for hgcc_path)
-        ('hgcc_path', 'nvcc_path'),
-        # All usages of get_hgcc_version -> get_nvcc_version
-        ('get_hgcc_version', 'get_nvcc_version'),
-        # Constructor
-        ('HGCCCompiler()', 'NVCCCompiler()'),
-        ('HGRTCCompiler()', 'NVRTCCompiler()'),
-        # Env and paths
+        ('HGCCCompiler', 'NVCCCompiler'),
+        ('HGRTCCompiler', 'NVRTCCompiler'),
+        # Member / parameter / local variable renames (longer patterns first)
         ('sdk_home_path', 'cuda_home_path_by_python'),
         ('sdk_home', 'cuda_home'),
-        # Signature format strings
-        ('HGCC{}', 'NVCC{}.{}'),
-        ('HGRTC{}.{}', 'NVRTC{}.{}'),
-        # Messages
-        ('Running HGCC command:', 'Running NVCC command:'),
-        ('HGCC compilation failed', 'NVCC compilation failed'),
-        ('HGGCRTC log:', 'NVRTC log:'),
-        ('HGRTC compile options', 'NVRTC compile options'),
-        # Binary file extensions
-        ('kernel.hgbin', 'kernel.cubin'),
-        ('tmp_hgbin_path', 'tmp_cubin_path'),
-        ('hgbin_path', 'cubin_path'),
-        ('hgbin_size', 'cubin_size'),
-        ('hgbin_data', 'cubin_data'),
-        # Instance creation
-        ('std::make_shared<HGRTCCompiler>()', 'std::make_shared<NVRTCCompiler>()'),
-        ('std::make_shared<HGCCCompiler>()', 'std::make_shared<NVCCCompiler>()'),
-        # Env variable names in code
-        ('DG_JIT_USE_HGRTC', 'DG_JIT_USE_NVRTC'),
-        ('default_use_hgrtc', 'default_use_nvrtc'),
-        ('DG_CPP_STANDARD', 'DG_NVCC_OVERRIDE_CPP_STANDARD'),
-        # PPU_HOME -> CUDA_HOME in NVRTC RtcOptions
-        ('PPU_HOME', 'CUDA_HOME'),
-        ('No PPU_HOME exist', 'No CUDA_HOME exist'),
-        # NVRTC RtcOptions: restore -D__CUDACC__ and remove -DUSE_HGGC
-        ('"-DUSE_HGGC",', '// "-D__CUDACC_RTC__",\n            "-D__CUDACC__",'),
-        # NVRTC RtcOptions: restore #else includes (cuda/std and thrust paths)
-        # NOTE: must be BEFORE sdk_include rename
-        ('includes_insert({sdk_include});', 'includes_insert({cuda_home, cuda_home + "/cuda/std", cuda_home + "/../targets/x86_64-linux/include/thrust/system/cuda"});'),
-        # NVRTC RtcOptions: add missing cccl cuda/std path
-        # NOTE: must be BEFORE sdk_include_cccl rename
-        ('includes_insert({sdk_include, sdk_include_cccl});', 'includes_insert({cuda_home, cuda_home1, cuda_home1 + "/cuda/std"});'),
-        # NVRTC RtcOptions: restore register-usage-level option
-        ('// "--ptxas-options=--register-usage-level=10", // not supported', '// "--ptxas-options=--register-usage-level=10", // not supported'),
-        # NVRTCCompiler constructor: restore version assertion
-        ('signature = fmt::format("NVRTC{}.{}", major, minor);\n', 'signature = fmt::format("NVRTC{}.{}", major, minor);\n        DG_HOST_ASSERT((major > 12 or (major == 12 and minor >= 3)) and "NVRTC version should be >= 12.3");\n'),
-        # Local variable rename (longer match first!)
+        ('hgcc_path', 'nvcc_path'),
+        ('hgcc_extra_flags', 'nvcc_flags'),
+        # RTC include lists: the CUDA side needs extra toolkit paths, so these are
+        # value rules rather than renames. They must precede the sdk_include* renames.
+        ('includes_insert({sdk_include, sdk_include_cccl});',
+         'includes_insert({cuda_home, cuda_home1, cuda_home1 + "/cuda/std"});'),
+        ('includes_insert({sdk_include});',
+         'includes_insert({cuda_home, cuda_home + "/cuda/std", cuda_home + "/../targets/x86_64-linux/include/thrust/system/cuda"});'),
         ('sdk_include_cccl', 'cuda_home1'),
         ('sdk_include', 'cuda_home'),
-        # Loading message
-        ('Loading HGBIN:', 'Loading CUBIN:'),
-        # --- Additional structural fixes (run after all above) ---
-        # Remove blank line with trailing whitespace after nvcc_path;
-        ('nvcc_path;\n\n    \n', 'nvcc_path;\n\n'),
-        # Replace the big comment block + flags construction with compact target version
-        ('        // Build hgcc flags incrementally for clarity and maintainability.\n        // All configurable paths come from environment variables or SDK detection.\n        //\n        // Environment variables:\n        //   DG_NVCC_OVERRIDE_CPP_STANDARD               - C++ standard version (default: 17)\n        //   DG_CCBIN                       - host compiler path (e.g. /usr/bin/g++-13)\n        //   DG_DELAYED_TEMPLATE_PARSING    - set to "false" to debug hgcc segfaults\n        //\n        // NOTE on `-fdelayed-template-parsing=false`:\n        //   hgcc/hgrtc (clang 13 fork) crashes with NPE inside\n        //   clang::Stmt::getBeginLoc() -> clang::InitializationSequence::Diagnose(...)\n        //   under default delayed-template-parsing when a template instantiation fails.\n        //   Setting DG_DELAYED_TEMPLATE_PARSING=false forces immediate parsing, avoiding\n        //   the crash and yielding precise diagnostics. Trade-off: all non-dependent names\n        //   must be visible at the template definition point.\n\n        const int cpp_standard = get_env<int>("DG_NVCC_OVERRIDE_CPP_STANDARD", 17);\n        const std::string inc = library_include_path.string();\n\n        // --- Language & defines ---\n        flags = fmt::format("-std=c++{} -DUSE_HGGC -DUSE_CLANG -DUSE_ACWRAPPER ", cpp_standard);\n\n        // --- Architecture ---\n        if (is_ppu1v5_device()) {\n            flags += "-arch=ppu_15 ";\n        } else {\n            flags += "-arch=ppu_10 ";\n        }\n\n        // --- Include paths (derived from library_include_path) ---\n        if (is_ppu1v5_device()) {\n            flags += fmt::format("-I{}/actlize_v1.0.0 -I{}/deep_gemm ", inc, inc);\n        } else {\n            flags += fmt::format("-I{} -I{}/actlize_v0.5.0 -I{}/deep_gemm ", inc, inc, inc);\n        }\n\n        // --- Output format & optimization ---\n        flags += "-cubin --expt-relaxed-constexpr --expt-extended-lambda ";\n\n        // --- Host compiler flags (passed via -Xcompiler) ---\n        flags += "-Xcompiler -fPIC ";\n        flags += "-Xcompiler -Wno-deprecated-declarations -Xcompiler -Wno-abi ";\n\n        // --- Optional: host compiler path (DG_CCBIN) ---\n        if (const char* ccbin = std::getenv("DG_CCBIN"); ccbin && ccbin[0] != \'\\0\') {\n            flags += fmt::format("-ccbin {} ", ccbin);\n        }\n\n        // --- Optional: delayed-template-parsing control ---\n        if (const auto& dtp = get_env<std::string>("DG_DELAYED_TEMPLATE_PARSING"); dtp == "false") {\n            flags += "-fno-delayed-template-parsing ";\n        }\n        // NOTE: --ptxas-options=--register-usage-level=10 is not supported by hgcc',
-         '        const auto& arch = 89;//device_runtime->get_arch(false, nvcc_major > 12 or nvcc_minor >= 9);\n\n        auto arch_flag = "";\n        if (is_ppu1v5_device()) {\n            arch_flag = "-gencode=arch=compute_89,code=sm_89";\n            flags = fmt::format("{} -I{}/actlize_v1.0.0 -I{}/deep_gemm {} "\n                            " -Xcompiler -O3,-Wno-deprecated-declarations,-Wno-abi "\n                            "-cubin --expt-relaxed-constexpr --expt-extended-lambda ",\n                            flags, library_include_path.c_str(), library_include_path.c_str(), arch_flag);\n        } else {\n            arch_flag = "-gencode=arch=compute_80a,code=sm_80a";\n            flags = fmt::format("{} -I{} -I{}/actlize_v0.5.0 -I{}/deep_gemm {} "\n                            " -Xcompiler -O3,-Wno-deprecated-declarations,-Wno-abi "\n                            "-cubin --expt-relaxed-constexpr --expt-extended-lambda ",\n                            flags, library_include_path.c_str(), library_include_path.c_str(), library_include_path.c_str(), arch_flag);\n        }\n'),
-        # Fix the ppu flags in constructor: -Xllvm prefix removed, -Xllvm combined flags simplified
-        ('            flags += " -Xllvm -ppu-patch-fence-ppu=false -Xllvm -wno-loop-miss-transform"\n                     " -Xllvm -ppu-cg-to-kp1=true -Xllvm -ppu-fix-uninit=true";',
-         '            flags += " -mllvm -ppu-patch-fence-ppu=false -mllvm -wno-loop-miss-transform"\n                     " -mllvm -ppu-cg-to-kp1=true -mllvm -ppu-fix-uninit=true";'),
-        # Remove source language line and preceding blank line
-        ('        }\n\n        // --- Source language ---\n        \n    }',
-         '        }\n    }'),
-        # Fix per-kernel flags comment
-        ('// Per-kernel flags: warp-interleaving kernels (gemm_fp8, mqa_logits) use the full\n        // -Xllvm tuning set; others only need -ppu-simt-branch=false (aligned with compiler.py logic)',
-         '// Per-kernel flags: warp-interleaving kernels (gemm_fp8, mqa_logits) use -mllvm flags,\n        // others only need -ppu-simt-branch=false (aligned with compiler.py logic)'),
-        # Fix per-kernel flags: -Xllvm -> nothing for single flag, -Xllvm -> -mllvm for multi
-        ('per_kernel_flags = " -Xllvm -ppu-simt-branch=false";',
-         'per_kernel_flags = " -mllvm -ppu-simt-branch=false";'),
-        ('-Xllvm -ppu-blksync-nb-schedule-boundary', '-mllvm -ppu-blksync-nb-schedule-boundary'),
-        ('" -Xllvm -ppu-simt-branch=false"', '" -mllvm -ppu-simt-branch=false"'),
-        ('" -Xllvm -ppu-adjust-tsm-valu-war=13"', '" -mllvm -ppu-adjust-tsm-valu-war=13"'),
-        ('" -Xllvm -ppu-reassign-subregs=true"', '" -mllvm -ppu-reassign-subregs=true"'),
-        ('" -Xllvm -ppu-pref-fma-reuse=true"', '" -mllvm -ppu-pref-fma-reuse=true"'),
-        ('" -Xllvm -ppu-pref-mma-reuse=true";', '" -mllvm -ppu-pref-mma-reuse=true";'),
-        ('" -Xllvm -sort-copy-before-coalesce"', '" -mllvm -sort-copy-before-coalesce"'),
-        # Fix Print compiler log -> Check local memory + Print PTXAS log
-        ('        // Print compiler log\n        if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0))\n            printf("%s", output.c_str());',
-         '        // Check local memory usage\n        if (get_env("DG_JIT_PTXAS_CHECK", 0))\n            DG_HOST_ASSERT(not std::regex_search(output, std::regex(R"(Local memory used)")));\n\n        // Print PTXAS log\n        if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0))\n            printf("%s", output.c_str());'),
-        # Add printf return_code comment after command execution
-        ('if (return_code != 0) {\n            printf("NVCC compilation failed',
-         '// printf("return_code %s\\n", return_code.c_str());\n        if (return_code != 0) {\n            printf("NVCC compilation failed'),
-        # NVRTC: remove ccbin and delayed-template-parsing blocks
-        ('            const char* rtc_ccbin_env = std::getenv("DG_CCBIN");\n            if (rtc_ccbin_env && rtc_ccbin_env[0] != \'\\0\') {\n                opts.emplace_back("-ccbin");\n                opts.emplace_back(rtc_ccbin_env);\n            }\n            // Optional: delayed-template-parsing control (DG_DELAYED_TEMPLATE_PARSING=false)\n            if (const auto& dtp = get_env<std::string>("DG_DELAYED_TEMPLATE_PARSING"); dtp == "false") {\n                opts.emplace_back("-fno-delayed-template-parsing");\n            }\n', ''),
+        # Environment variable names
+        ('DG_CPP_STANDARD', 'DG_NVCC_OVERRIDE_CPP_STANDARD'),
+        ('DG_JIT_USE_HGRTC', 'DG_JIT_USE_NVRTC'),
+        ('default_use_hgrtc', 'default_use_nvrtc'),
+        ('PPU_HOME', 'CUDA_HOME'),
+        # HGRTC ctor: signature + restore NVRTC version assertion
+        ('signature = fmt::format("HGRTC{}.{}", major, minor);',
+         'signature = fmt::format("NVRTC{}.{}", major, minor);\n        DG_HOST_ASSERT((major > 12 or (major == 12 and minor >= 3)) and "NVRTC version should be >= 12.3");'),
+        # RtcOptions opts init: -DUSE_HGGC -> -D__CUDACC__
+        ('            "-DUSE_HGGC",', '            // "-D__CUDACC_RTC__",\n            "-D__CUDACC__",'),
+        # Compiler path + version/signature (pure token; no structural block needed)
+        ('"bin" / "hgcc"', '"bin" / "nvcc"'),
+        ('DG_JIT_HGCC_COMPILER', 'DG_JIT_NVCC_COMPILER'),
+        ('signature = fmt::format("HGCC{}", get_hgcc_version());',
+         'const auto& [nvcc_major, nvcc_minor] = get_nvcc_version();\n        signature = fmt::format("NVCC{}.{}", nvcc_major, nvcc_minor);'),
+        # Flag-value translation (PPU offline hgcc flags -> nvcc equivalents). Makes the
+        # token-converted output produce a flag SET equivalent to the hand-written
+        # cuda-compat version, while cuda-free keeps its readable per-section structure.
+        ('-arch=ppu_15 ', '-gencode=arch=compute_89,code=sm_89 '),
+        ('-arch=ppu_10 ', '-gencode=arch=compute_80a,code=sm_80a '),
+        ('-hgbin -ftemplate-depth=8192 -O3 -DNDEBUG ', '-cubin --expt-relaxed-constexpr --expt-extended-lambda '),
+        ('-Xcompiler -fPIC ', ''),
+        ('-Xcompiler -Wno-deprecated-declarations -Xcompiler -Wno-abi ', '-Xcompiler -O3,-Wno-deprecated-declarations,-Wno-abi '),
+        # PPU LLVM backend flag prefix
+        ('-Xllvm', '-mllvm'),
+        # Binary/buffer variable suffixes (generic rule covers hgbin_path / kernel.hgbin)
+        ('hgbin_size', 'cubin_size'),
+        ('hgbin_data', 'cubin_data'),
+        # Comment / log message tokens
+        ('temporary HGBIN', 'temporary CUBIN'),
+        ('Get HGBIN size', 'Get CUBIN size'),
+        ('Running HGCC command', 'Running NVCC command'),
+        ('HGCC compilation failed', 'NVCC compilation failed'),
+        ('Create HGRTC program', 'Create NVRTC program'),
+        ('HGRTC compile options', 'NVRTC compile options'),
+        ('HGGCRTC log:', 'NVRTC log:'),
+        # printf format specifiers (size_t -> int)
+        ('compile options (%zu):', 'compile options (%d):'),
+        ('for (size_t i = 0; i < opts.size(); ++i)', 'for (int i = 0; i < opts.size(); ++i)'),
+        ('printf("  [%zu] %s', 'printf("  [%d] %s'),
     ],
 
     # --- csrc/jit/handle.hpp ---
@@ -700,7 +554,8 @@ FILE_SPECIFIC_REPLACEMENTS: Dict[str, List[Tuple[str, str]]] = {
         # Variable renames (longer patterns first to avoid partial matches)
         ('sdk_home_path', 'cuda_home_path_by_python'),
         ('sdk_home', 'cuda_home'),
-        ('DG_DECLARE_STATIC_VAR_IN_CLASS(KernelRuntime, sdk_home)', 'DG_DECLARE_STATIC_VAR_IN_CLASS(KernelRuntime, cuda_home)'),
+        # NOTE: DG_DECLARE_STATIC_VAR_IN_CLASS(KernelRuntime, sdk_home) needs no rule of
+        # its own -- the generic ('sdk_home', 'cuda_home') entry above already covers it.
         # Stream usage: (uintptr_t)stream -> stream.id()
         ('(uintptr_t)stream', 'stream.id()'),
     ],
@@ -777,8 +632,11 @@ FILE_SPECIFIC_REPLACEMENTS: Dict[str, List[Tuple[str, str]]] = {
     # --- deep_gemm/include/deep_gemm/utils.cuh ---
     'deep_gemm/include/deep_gemm/utils.cuh': [
         ('HGGC API error', 'CUDA API error'),
-        # Append next_power_of_two and computeBlockInfoKernel functions at end of file
-        ('    } \\\n}\n', '    } \\\n}' + UTILS_CUH_APPEND),
+        # NOTE: next_power_of_two / computeBlockInfoKernel are deliberately NOT injected
+        # here. They stay in utils_rtc.cuh, which this header includes; conversion only
+        # strips the __HGGC__ guard there. The old rule anchored on '    } \\' + '}' --
+        # the tail of ANY multi-line macro -- so str.replace could inject the block more
+        # than once and produce a redefinition error.
     ],
 
     # --- deep_gemm/include/deep_gemm/bf16_gemm.cuh ---
@@ -829,15 +687,20 @@ FILE_SPECIFIC_REPLACEMENTS: Dict[str, List[Tuple[str, str]]] = {
 
     # --- setup.py ---
     'setup.py': [
-        # Remove PPU SDK path block entirely
-        ("# PPU SDK path \u2014 provides hggc headers for cutlass3\nppu_sdk = os.environ.get('PPU_SDK', '/usr/local/PPU_SDK')\nppu_include = os.path.join(ppu_sdk, 'targets', 'x86_64-linux', 'include')\n\n",
+        # The SDK path block is dropped. Split in two so removing the *code* is not
+        # coupled to the *comment* text: if someone rewords the comment, only the
+        # (harmless) comment rule stops matching, while verify_required still guards
+        # the code rules. Neither depends on surrounding blank lines.
+        ("ppu_sdk = os.environ.get('PPU_SDK', '/usr/local/PPU_SDK')\n"
+         "ppu_include = os.path.join(ppu_sdk, 'targets', 'x86_64-linux', 'include')\n\n",
          ""),
+        ("# PPU SDK path \u2014 provides hggc headers for actlize\n", ""),
         ("sources = ['csrc/python_api.cpp']", "sources = ['csrc/python_api.cu']"),
         # Fix include dirs
         ("    ppu_include,", "    f'{CUDA_HOME}/include',"),
-        # Fix library list (remove extra blank line before it)
-        ("\n\nbuild_libraries = ['hggc', 'hggcrt1', 'hgrtc']",
-         "\nbuild_libraries = ['cuda', 'cudart', 'nvrtc']"),
+        # NOTE: build_libraries needs no rule -- the generic PYTHON_REPLACEMENTS
+        # tokens ('hggc'->'cuda', 'hggcrt1'->'cudart', 'hgrtc'->'nvrtc') already
+        # produce the exact target text.
         # Fix library dirs
         ("    os.path.join(ppu_sdk, 'lib'),",
          "    f'{CUDA_HOME}/lib64',\n    f'{CUDA_HOME}/lib64/stub'"),
@@ -857,60 +720,34 @@ FILE_SPECIFIC_REPLACEMENTS: Dict[str, List[Tuple[str, str]]] = {
 
     # --- deep_gemm/__init__.py ---
     'deep_gemm/__init__.py': [
-        # Replace PPU_HOME helper function with imports (lines 4-13 → 4-6)
-        ("\n# PPU SDK path: env PPU_SDK > env PPU_HOME > default\ndef _get_ppu_home():\n    for env_key in ('PPU_SDK', 'PPU_HOME'):\n        val = os.environ.get(env_key)\n        if val:\n            return val\n    return '/usr/local/PPU_SDK'\n\nPPU_HOME = _get_ppu_home()\n",
-         'from torch.version import cuda as cuda_version\nfrom packaging import version\nfrom torch.utils.cpp_extension import CUDA_HOME\n'),
-        # Move deep_gemm_cpp.init() from before use_cpp_jit block to after it
-        ('deep_gemm_cpp.init(\n    os.path.dirname(os.path.abspath(__file__)), # Library root directory path\n    PPU_HOME         # PPU SDK home\n)\n\nuse_cpp_jit_for_python',
-         'use_cpp_jit_for_python'),
-        # Insert deep_gemm_cpp.init() after the if block ends (before aliases)
-        # Guard: only match when init is NOT already present (the closing ) before
-        # '# Some alias' comes from import block at 4-space indent, not from init block)
-        ('    )\n\n# Some alias for APIs',
-         '    )\n\ndeep_gemm_cpp.init(\n    os.path.dirname(os.path.abspath(__file__)), # Library root directory path\n    CUDA_HOME         # CUDA home\n)\n\n# Some alias for APIs'),
+        # The PPU source keeps deep_gemm_cpp.init() at its final position and derives the
+        # SDK root in a single expression, so only this import swap is needed. It must run
+        # before the generic PPU_HOME -> CUDA_HOME token (which would otherwise rewrite the
+        # definition into a self-shadowing CUDA_HOME assignment); file-specific rules do.
+        ("# SDK root: env PPU_SDK > env PPU_HOME > default\nPPU_HOME = os.environ.get('PPU_SDK') or os.environ.get('PPU_HOME') or '/usr/local/PPU_SDK'",
+         'from torch.version import cuda as cuda_version\nfrom packaging import version\nfrom torch.utils.cpp_extension import CUDA_HOME'),
     ],
 
-    # --- deep_gemm/jit/compiler.py ---
+    # --- deep_gemm/jit/compiler.py (token-only; structural part is a block) ---
     'deep_gemm/jit/compiler.py': [
-        # Add CUDA_HOME import
+        # CUDA_HOME import needed by the converted get_nvcc_compiler()
         ('import torch\nfrom typing import Tuple',
          'import torch\nfrom torch.utils.cpp_extension import CUDA_HOME\nfrom typing import Tuple'),
-        # get_nvcc_compiler: remove docstring and fix env var/path
-        # NOTE: FILE_SPECIFIC runs BEFORE global rules, so match source text directly
-        ('    """Find hgcc compiler path and version.\n    Checks DG_JIT_HGCC_COMPILER env var first, then falls back to PPU_SDK default path.\n    """\n    paths = []\n    if os.getenv(\'DG_JIT_HGCC_COMPILER\'):\n        paths.append(os.getenv(\'DG_JIT_HGCC_COMPILER\'))\n    # Default PPU SDK hgcc path\n    paths.append(\'/usr/local/PPU_SDK/bin/hgcc\')',
-         '    paths = []\n    if os.getenv(\'DG_NVCC_COMPILER\'):\n        paths.append(os.getenv(\'DG_NVCC_COMPILER\'))\n    paths.append(f\'{CUDA_HOME}/bin/nvcc\')'),
-        # Version pattern
-        ("version_pattern = re.compile(r'version (\\d+\\.\\d+)')",
-         "# Try to find the first available NVCC compiler\n    least_version_required = '11.6'\n    version_pattern = re.compile(r'release (\\d+\\.\\d+)')"),
-        # Version detection logic
-        ('        if os.path.exists(path):\n            try:\n                output = os.popen(f\'{path} --version 2>&1\').read()\n                match = version_pattern.search(output)\n                version = match.group(1) if match else \'unknown\'\n            except Exception:\n                version = \'unknown\'\n            return path, version\n    raise RuntimeError(\'Cannot find any available hgcc compiler. \'\n                       \'Set DG_JIT_HGCC_COMPILER or ensure /usr/local/PPU_SDK/bin/hgcc exists.\')',
-         '        if os.path.exists(path):\n            match = version_pattern.search(os.popen(f\'{path} --version\').read())\n            version = match.group(1)\n            assert match, f\'Cannot get the version of NVCC compiler {path}\'\n            assert version >= least_version_required, f\'NVCC {path} version {version} is lower than {least_version_required}\'\n            return path, version\n    raise RuntimeError(\'Cannot find any available NVCC compiler\')'),
-        # build() function: replace docstring+opening with single comment
-        ('    """\n    JIT compile a kernel using hgcc, producing a shared library (.so).\n    Flags are aligned with compiler.hpp\'s HGCCCompiler for consistency.\n    """\n    # --- Language standard & defines ---',
-         '    # Compiler flags'),
-        # Replace hgcc_flags construction block
-        ('    hgcc_flags = [\n        f\'-std=c++{cpp_standard}\',\n        \'-shared\',                  # produce .so (unlike -hgbin in compiler.hpp which produces raw binary)\n        \'-DUSE_HGGC\', \'-DUSE_CLANG\', \'-DUSE_ACWRAPPER\',\n    ]\n\n    # --- Architecture ---\n    if is_ppu1v5_device():\n        hgcc_flags.append(\'-arch=ppu_15\')\n    else:\n        hgcc_flags.append(\'-arch=ppu_10\')\n\n    # --- Optimization ---\n    hgcc_flags.extend([\'-ftemplate-depth=8192\', \'-O3\', \'-DNDEBUG\'])',
-         "    gen_code = '-gencode=arch=compute_89,code=sm_89' if is_ppu1v5_device() else '-gencode=arch=compute_80a,code=sm_80a'\n    nvcc_flags = [f'-std=c++{cpp_standard}', '-shared', '-O3', '--expt-relaxed-constexpr', '--expt-extended-lambda',\n                  gen_code,\n                  # Suppress some unnecessary warnings, such as unused variables for certain `constexpr` branch cases\n                  '--diag-suppress=39,174,177,940']"),
-        # Remove host compiler flags block
-        ('\n\n    # --- Host compiler flags (via -Xcompiler) ---\n    hgcc_flags.extend([\n        \'-Xcompiler\', \'-fPIC\',\n        \'-Xcompiler\', \'-Wno-deprecated-declarations\',\n        \'-Xcompiler\', \'-Wno-abi\',\n    ])\n\n    # --- Optional: host compiler path (DG_CCBIN) ---\n    ccbin = os.getenv(\'DG_CCBIN\')\n    if ccbin:\n        hgcc_flags.extend([\'-ccbin\', ccbin])\n\n    # --- Optional: delayed-template-parsing control ---\n    # Set DG_DELAYED_TEMPLATE_PARSING=false to debug hgcc segfaults.\n    # Default: delayed parsing ON (avoids crash in clang::Stmt::getBeginLoc).\n    if os.getenv(\'DG_DELAYED_TEMPLATE_PARSING\') == \'false\':\n        hgcc_flags.append(\'-fno-delayed-template-parsing\')\n\n    # --- PPU LLVM backend tuning ---',
-         ''),
-        # PPU backend flags: -Xllvm → top-level for non-interleaving, -mllvm for interleaving
-        ("        hgcc_flags.extend(['-Xllvm', '-ppu-patch-fence-ppu=false',\n                           '-Xllvm', '-wno-loop-miss-transform'])\n\n        # Per-kernel PPU tuning\n        lower_name = name.lower()\n        use_warp_interleaving = ('gemm_fp8' in lower_name) or \\\n                                ('mqa_logits' in lower_name and 'paged' not in lower_name)\n        if not use_warp_interleaving:\n            hgcc_flags.extend(['-Xllvm', '-ppu-simt-branch=false',\n                               '-Xllvm', '-ppu-cg-to-kp1=true',\n                               '-Xllvm', '-ppu-fix-uninit=true'])\n        else:\n            hgcc_flags.extend(['-Xllvm', '-ppu-cg-to-kp1=true',\n                               '-Xllvm', '-ppu-fix-uninit=true',\n                               '-Xllvm', '-ppu-blksync-nb-schedule-boundary=true',\n                               '-Xllvm', '-ppu-simt-branch=false',\n                               '-Xllvm', '-ppu-adjust-tsm-valu-war=13',\n                               '-Xllvm', '-ppu-reassign-subregs=true',\n                               '-Xllvm', '-ppu-pref-fma-reuse=true',\n                               '-Xllvm', '-ppu-pref-mma-reuse=true',\n                               '-Xllvm', '-regalloc=pbqp'])\n        if 'w4a16' in lower_name:\n            hgcc_flags.extend(['-Xllvm', '-sort-copy-before-coalesce'])",
-         "        # append compiler options for ppu1.5\n        lower_name = name.lower()\n        use_warp_interleaving = ('gemm_fp8' in lower_name) or ('mqa_logits' in lower_name and 'paged' not in lower_name)\n        if not use_warp_interleaving:\n            nvcc_flags.extend(['-mllvm', '-ppu-simt-branch=false', '-mllvm', '-ppu-patch-fence-ppu=false', '-mllvm', '-wno-loop-miss-transform',\n                               '-mllvm', '-ppu-cg-to-kp1=true', '-mllvm', '-ppu-fix-uninit=true'])\n        else:\n            nvcc_flags.extend(['-mllvm', '-ppu-patch-fence-ppu=false', '-mllvm', '-wno-loop-miss-transform',\n                               '-mllvm', '-ppu-cg-to-kp1=true', '-mllvm', '-ppu-fix-uninit=true',\n                               '-mllvm', '-ppu-blksync-nb-schedule-boundary=true',\n                               '-mllvm', '-ppu-simt-branch=false',\n                               '-mllvm', '-ppu-adjust-tsm-valu-war=13',\n                               '-mllvm', '-ppu-reassign-subregs=true',\n                               '-mllvm', '-ppu-pref-fma-reuse=true',\n                               '-mllvm', '-ppu-pref-mma-reuse=true'])\n        if 'w4a16' in lower_name:\n            nvcc_flags.extend(['-mllvm', '-sort-copy-before-coalesce'])"),
-        # Replace source language + include path block with cxx_flags/flags
-        ("\n    # --- Source language ---\n    hgcc_flags.append('-x')\n    hgcc_flags.append('hg')\n\n    # --- Include paths ---\n    include_dirs = [get_jit_include_dir()]\n    # Always include deep_gemm headers (aligned with compiler.hpp)\n    deep_gemm_inc = f'{_jit_include_dir_default}/deep_gemm'\n    if deep_gemm_inc not in include_dirs:\n        include_dirs.append(deep_gemm_inc)\n    # NOTE: Do NOT add PPU_SDK/include explicitly here.\n    # hgcc finds its own SDK headers via built-in paths.\n    # Adding it explicitly causes GCC 13 <cmath> conflicts.\n    # (compiler.hpp HGCCCompiler also does NOT add PPU_HOME path)\n\n    # --- Build signature ---",
-         "\n    cxx_flags = ['-fPIC', '-O3', '-Wno-deprecated-declarations', '-Wno-abi']\n    flags = [*nvcc_flags, f'--compiler-options={\",\".join(cxx_flags)}']\n    include_dirs = [get_jit_include_dir()]\n    # Build signature\n    # enable_sass_opt = get_nvcc_compiler()[1] <= '12.8' and int(os.getenv('DG_DISABLE_FFMA_INTERLEAVE', 0)) == 0"),
-        # Signature variable
-        ('$${hgcc_flags}$$', '$${flags}$$'),
-        # tmp path
+        # Flag-value translation (PPU -> nvcc). Equivalent flag SET, per-section structure kept.
+        ("'-DUSE_HGGC', '-DUSE_CLANG', '-DUSE_ACWRAPPER',",
+         "'--expt-relaxed-constexpr', '--expt-extended-lambda', '--diag-suppress=39,174,177,940',"),
+        ("'-arch=ppu_15'", "'-gencode=arch=compute_89,code=sm_89'"),
+        ("'-arch=ppu_10'", "'-gencode=arch=compute_80a,code=sm_80a'"),
+        ("['-ftemplate-depth=8192', '-O3', '-DNDEBUG']", "['-O3']"),
+        ("['-Xcompiler', '-fPIC', '-Xcompiler', '-Wno-deprecated-declarations', '-Xcompiler', '-Wno-abi']",
+         "['--compiler-options=-fPIC,-O3,-Wno-deprecated-declarations,-Wno-abi']"),
+        # PPU-only extra that the CUDA build does not take
+        ("    hgcc_flags.extend(['-x', 'hg'])\n", ""),
+        # PPU LLVM backend flag prefix + list name (must run after the two rules above)
+        ('-Xllvm', '-mllvm'),
+        ('hgcc_flags', 'nvcc_flags'),
+        # tmp file prefix
         ('hgcc.tmp.', 'nvcc.tmp.'),
-        # compile command variable
-        ('               *hgcc_flags,', '               *flags,'),
-        # print message
-        ("print(f'Compiling JIT kernel {name} with command: {\" \".join(command)}')",
-         "print(f'Compiling JIT runtime {name} with command {command}')"),
-        # FFMA comment
-        ('# Interleave FFMA reuse (currently disabled)', '# Interleave FFMA reuse'),
     ],
 
     # --- deep_gemm/jit/__init__.py ---
@@ -1080,6 +917,174 @@ FILE_SPECIFIC_REPLACEMENTS: Dict[str, List[Tuple[str, str]]] = {
 
 
 # =============================================================================
+# LEVEL 3b: Natural-landmark structural region replacements
+# Converts genuinely divergent regions that are NOT pure token renames (e.g. the
+# version query, the flags construction, the RTC include block). The PPU source
+# stays completely NATURAL -- it contains NO conversion markers. Each entry is
+#     (name, pattern, cuda_text)
+# where `pattern` anchors on stable, self-justifying code that already exists in
+# the source (a function signature, a distinctive section comment, an #if line)
+# and uses non-greedy `.*?`, so a region's INTERIOR can be edited freely without
+# breaking the match. `cuda_text == ''` deletes the region. Drift in a landmark
+# fails loud (see apply_block_replacements + verify_required), never silent.
+# =============================================================================
+FILE_SPECIFIC_BLOCK_REPLACEMENTS: Dict[str, List[Tuple[str, str, str]]] = {
+    'deep_gemm/jit/compiler.py': [
+        # The compiler-discovery helper is a genuine rewrite (different env var, no
+        # try/except, extra version assertions), so it is a structural region anchored
+        # on its `def` line; the body may be edited freely.
+        ('get_compiler_fn',
+         r'def get_hgcc_compiler\(\) -> Tuple\[str, str\]:\n.*?(?=\n\n@functools\.lru_cache\(maxsize=None\)\ndef get_default_user_dir\(\):)',
+         r"""def get_nvcc_compiler() -> Tuple[str, str]:
+    paths = []
+    if os.getenv('DG_NVCC_COMPILER'):
+        paths.append(os.getenv('DG_NVCC_COMPILER'))
+    paths.append(f'{CUDA_HOME}/bin/nvcc')
+
+    # Try to find the first available NVCC compiler
+    least_version_required = '11.6'
+    version_pattern = re.compile(r'release (\d+\.\d+)')
+    for path in paths:
+        if os.path.exists(path):
+            match = version_pattern.search(os.popen(f'{path} --version').read())
+            version = match.group(1)
+            assert match, f'Cannot get the version of NVCC compiler {path}'
+            assert version >= least_version_required, f'NVCC {path} version {version} is lower than {least_version_required}'
+            return path, version
+    raise RuntimeError('Cannot find any available NVCC compiler')"""),
+    ],
+    'csrc/jit/compiler.hpp': [
+        ('version',
+         r'(?:    //[^\n]*\n)*    std::string get_hgcc_version\(\) const \{\n.*?\n    \}\n(?:    //[^\n]*\n)*',
+         r"""    std::pair<int, int> get_nvcc_version() const {
+        DG_HOST_ASSERT(std::filesystem::exists(nvcc_path));
+
+        // Call the version command
+        const auto& command = std::string(nvcc_path) + " --version";
+        const auto& [return_code, output] = call_external_command(command);
+        DG_HOST_ASSERT(return_code == 0);
+
+        // The version should be at least 12.3, for the best performance with 12.9
+        int major, minor;
+        std::smatch match;
+        DG_HOST_ASSERT(std::regex_search(output, match, std::regex(R"(release (\d+\.\d+))")));
+        std::sscanf(match[1].str().c_str(), "%d.%d", &major, &minor);
+        DG_HOST_ASSERT((major > 12 or (major == 12 and minor >= 3)) and "NVCC version should be >= 12.3");
+        if (major == 12 and minor < 9)
+            printf("Warning: please use at least NVCC 12.9 for the best DeepGEMM performance\n");
+        return {major, minor};
+    }
+"""),
+        # cuda-free-only trailer ("-x hg" + its comment): deleted on the CUDA side.
+        ('flags_lang',
+         r'\n(?:        //[^\n]*\n)*        flags \+= " -x hg ";\n(?:        //[^\n]*\n)*',
+         ''),
+    ],
+}
+
+# Text that MUST be present after conversion -- the single conversion check.
+# If a rule stops matching, the code it was supposed to produce is simply absent,
+# and that is exactly what is asserted here. Deliberately NOT a denylist of
+# forbidden PPU tokens: such a list false-positives on legitimate code and stops
+# the PPU source from evolving freely, which is the coupling this converter avoids.
+# A rule that silently fails but leaves valid-looking code
+# behind (e.g. an includes_insert list missing the CUDA-only paths) would pass it.
+# This positive guard makes every token rule fail loud instead.
+REQUIRED_AFTER_CONVERSION: Dict[str, List[str]] = {
+    'csrc/jit/compiler.hpp': [
+        '#include <ATen/cuda/CUDAContext.h>',
+        '#include <cuda_runtime.h>',
+        '#include <nvrtc.h>',
+        'std::pair<int, int> get_nvcc_version() const {',
+        'nvcc_path = cuda_home / "bin" / "nvcc";',
+        'get_env<std::string>("DG_JIT_NVCC_COMPILER")',
+        'const auto& [nvcc_major, nvcc_minor] = get_nvcc_version();',
+        'signature = fmt::format("NVCC{}.{}", nvcc_major, nvcc_minor);',
+        '-gencode=arch=compute_89,code=sm_89',
+        '-gencode=arch=compute_80a,code=sm_80a',
+        '-cubin --expt-relaxed-constexpr --expt-extended-lambda',
+        'flags += " ";',
+        '--diag-suppress=39,174,177,940',
+        'if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0) or get_env("DG_JIT_PTXAS_CHECK", 0))',
+        '-Xcompiler -O3,-Wno-deprecated-declarations,-Wno-abi',
+        '-mllvm -ppu-patch-fence-ppu=false',
+        'std::string nvcc_flags;',
+        '#if defined(CUDA_VERSION) && CUDA_VERSION >= 13000',
+        'includes_insert({cuda_home, cuda_home1, cuda_home1 + "/cuda/std"});',
+        'thrust/system/cuda',
+        'signature = fmt::format("NVRTC{}.{}", major, minor);',
+        'and "NVRTC version should be >= 12.3"',
+        'kernel.cubin',
+        'cubin_size',
+        'cubin_data',
+        'nvcc_path',
+    ],
+    'deep_gemm/jit/compiler.py': [
+        'from torch.utils.cpp_extension import CUDA_HOME',
+        'def get_nvcc_compiler() -> Tuple[str, str]:',
+        "paths.append(f'{CUDA_HOME}/bin/nvcc')",
+        "least_version_required = '11.6'",
+        "'-gencode=arch=compute_89,code=sm_89'",
+        "'-gencode=arch=compute_80a,code=sm_80a'",
+        "'--expt-relaxed-constexpr', '--expt-extended-lambda', '--diag-suppress=39,174,177,940',",
+        "'--compiler-options=-fPIC,-O3,-Wno-deprecated-declarations,-Wno-abi'",
+        "'-mllvm', '-ppu-patch-fence-ppu=false'",
+        'nvcc_flags',
+        'nvcc.tmp.',
+    ],
+    # 3.1: a 5-line match injects ~39 lines of cuBLASLt support. If it ever fails to match,
+    # the conversion used to succeed silently and only blow up much later at compile time.
+    'csrc/jit/device_runtime.hpp': [
+        '#include <cublasLt.h>',
+        '#include <ATen/cuda/CUDAContext.h>',
+        'std::shared_ptr<cudaDeviceProp> cached_prop;',
+        'static constexpr size_t kCublasLtWorkspaceSize = 32 * 1024 * 1024;',
+        '#if TORCH_VERSION_MAJOR > 2 or (TORCH_VERSION_MAJOR == 2 and TORCH_VERSION_MINOR >= 3)',
+        'at::cuda::getCurrentCUDABlasLtHandle()',
+        'get_cublaslt_handle',
+        'get_cublaslt_workspace',
+        'cublasLtCreate(&cublaslt_handle)',
+        'cublasLtDestroy(cublaslt_handle)',
+    ],
+    # 3.2: the DG_CUBLASLT_CHECK macro is injected by matching the very generic
+    # "} while (0) / #endif / } // namespace deep_gemm" tail.
+    'csrc/utils/exception.hpp': [
+        '#include <cublasLt.h>',
+        '#define DG_CUBLASLT_CHECK(cmd)',
+        'CUBLAS_STATUS_SUCCESS',
+        'cublasGetStatusString(e)',
+        'DGException("cuBLASLt"',
+        '"NVRTC"',
+        '"CUDA driver"',
+        '"CUDA runtime"',
+    ],
+    # setup.py: NOTE the deliberate survivors -- get_ppu_sdk_version() still shells out
+    # to `hgcc --version` (works under CUDA too) and -DDG_HGGC_SUPPORT_PCH stays, so a
+    # denylist on 'hgcc'/'HGGC' would have been wrong here.
+    'setup.py': [
+        'from torch.utils.cpp_extension import CppExtension, CUDA_HOME, CUDAExtension, BuildExtension',
+        "sources = ['csrc/python_api.cu']",
+        "f'{CUDA_HOME}/include',",
+        "build_libraries = ['cuda', 'cudart', 'nvrtc']",
+        "f'{CUDA_HOME}/lib64',",
+        "f'{CUDA_HOME}/lib64/stub'",
+        'extra_nvcc_args = ["-O3", "-std=c++17", "--use_fast_math"]',
+        '"nvcc": extra_nvcc_args,',
+        "CUDAExtension(name='deep_gemm.deep_gemm_cpp',",
+    ],
+    # 3.3: init() is no longer moved by the converter, but it must still be present exactly
+    # once and the CUDA_HOME import must exist.
+    'deep_gemm/__init__.py': [
+        'from torch.version import cuda as cuda_version',
+        'from packaging import version',
+        'from torch.utils.cpp_extension import CUDA_HOME',
+        'deep_gemm_cpp.init(',
+        'CUDA_HOME         #',
+    ],
+}
+
+
+# =============================================================================
 # LEVEL 4: Full file copy from reference directory
 # Files with structural differences too large for string replacement.
 # These files will be copied verbatim from the reference (original) DeepGemm.
@@ -1226,6 +1231,95 @@ def apply_regex_replacements(content: str, regex_list: List[Tuple[str, str, str]
     return content
 
 
+def apply_block_replacements(content: str, blocks: List[Tuple[str, str, str]], rel_path: str) -> str:
+    """Replace structural regions matched on NATURAL code landmarks.
+
+    Each entry is (name, pattern, cuda_text). `pattern` anchors on stable natural
+    code in the PPU source (a function signature, a distinctive section comment,
+    an #if line) and uses non-greedy `.*?`, so editing a region's INTERIOR never
+    breaks the match -- only the landmark lines are load-bearing. The whole
+    matched span is replaced by `cuda_text` ('' deletes the region). A landmark
+    that no longer matches is a hard error (unless already converted), so drift
+    fails loud instead of silently emitting a half-converted file.
+    """
+    for name, pattern, cuda_text in blocks:
+        rx = re.compile(pattern, re.DOTALL)
+        new_content, n = rx.subn(lambda m: cuda_text, content)
+        if n == 0:
+            # Landmark not found: tolerate only if clearly already converted.
+            if cuda_text == '':
+                continue
+            if cuda_text.strip() and cuda_text in content:
+                continue
+            raise RuntimeError(
+                "[cuda_compat] Structural region '%s' not found in %s. Its natural landmark "
+                "lines were altered or removed; refusing to emit a half-converted file. "
+                "Update its pattern in FILE_SPECIFIC_BLOCK_REPLACEMENTS or restore the "
+                "landmark." % (name, rel_path))
+        elif n > 1:
+            raise RuntimeError(
+                "[cuda_compat] Structural region '%s' matched %d times in %s (ambiguous "
+                "landmark). Tighten its pattern in FILE_SPECIFIC_BLOCK_REPLACEMENTS." % (
+                    name, n, rel_path))
+        content = new_content
+    return content
+
+
+def verify_required(content: str, rel_path: str) -> None:
+    """Fail loud if expected CUDA text is missing after conversion (silent under-conversion)."""
+    required = REQUIRED_AFTER_CONVERSION.get(rel_path)
+    if not required:
+        return
+    missing = [s for s in required if s not in content]
+    if missing:
+        raise RuntimeError(
+            "[cuda_compat] Converted %s is missing expected CUDA text:\n%s\n"
+            "  A conversion rule silently failed to match -- the result may still be\n"
+            "  syntactically valid, it just lost the ported behaviour. Check the "
+            "corresponding rule in FILE_SPECIFIC_REPLACEMENTS / "
+            "FILE_SPECIFIC_BLOCK_REPLACEMENTS." % (
+                rel_path, "\n".join("    missing: %r" % s for s in missing[:20])))
+
+
+def verify_python_syntax(content: str, rel_path: str, original: str = None) -> None:
+    """Fail loud if conversion BROKE a .py file's syntax.
+
+    Substring replacements can silently corrupt indentation (e.g. a rule whose match
+    text carries fewer leading spaces than the line it hits leaves stray whitespace
+    behind). The token/required guards work on substrings and cannot see that, so parse
+    the result instead.
+
+    This is deliberately a DIFFERENTIAL check. compile() runs under whatever interpreter
+    executes this script, which may be older than the Python the sources target -- e.g.
+    Python 3.6 rejects the valid 3.8+ self-documenting f-string `f'{x=}'`. Judging the
+    converted file on its own therefore produces false alarms. Instead the original is
+    parsed too, and a failure is only reported when the original parsed and the
+    converted one does not, which pins the blame on conversion.
+    """
+    if not rel_path.endswith('.py'):
+        return
+    try:
+        compile(content, rel_path, 'exec')
+        return                                    # converted file parses: nothing to do
+    except SyntaxError as e:
+        converted_err = e
+
+    if original is not None:
+        try:
+            compile(original, rel_path, 'exec')
+        except SyntaxError:
+            # The source does not parse under this interpreter either, so the converter
+            # is not at fault (most likely a language feature newer than this Python).
+            return
+
+    raise RuntimeError(
+        "[cuda_compat] Conversion broke the syntax of %s: %s (line %s).\n"
+        "  The file parsed before conversion but not after, so a replacement rule\n"
+        "  corrupted it -- most often a rule whose match text has a different\n"
+        "  indentation than the line it matched." % (
+            rel_path, converted_err.msg, converted_err.lineno))
+
+
 # =============================================================================
 # Main Processing
 # =============================================================================
@@ -1275,6 +1369,10 @@ def process_file(filepath: str, repo_dir: str, dry_run: bool = False, verbose: b
 
     content = original
 
+    # 0. Apply anchor-delimited structural block replacements (robust to interior edits)
+    if rel_path in FILE_SPECIFIC_BLOCK_REPLACEMENTS:
+        content = apply_block_replacements(content, FILE_SPECIFIC_BLOCK_REPLACEMENTS[rel_path], rel_path)
+
     # 1. Apply file-specific replacements first (highest priority)
     if rel_path in FILE_SPECIFIC_REPLACEMENTS:
         content = apply_replacements(content, FILE_SPECIFIC_REPLACEMENTS[rel_path])
@@ -1306,6 +1404,10 @@ def process_file(filepath: str, repo_dir: str, dry_run: bool = False, verbose: b
 
     # 10. Apply regex replacements
     content = apply_regex_replacements(content, REGEX_REPLACEMENTS, filepath)
+
+    # 11. Robustness guard: fail loud if PPU/HGGC tokens survived in guarded files
+    verify_required(content, rel_path)
+    verify_python_syntax(content, rel_path, original)
 
     # Check if anything changed
     if content == original:
@@ -1539,3 +1641,4 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
+
