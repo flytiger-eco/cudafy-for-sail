@@ -3,7 +3,7 @@
 FlashMLA PPU-original → CUDA-Compatible Transformation Script.
 
 Refactored with lookup-table approach for maintainability.
-Transforms FlashMLA from ppu-original compilation back to CUDA-compatible source trees.
+Converts a FlashMLA ppu-original source tree into a CUDA-compatible one.
 
 Usage:
     python cuda_compat.py [TARGET_DIR] [--dry-run] [--verbose]
@@ -66,7 +66,6 @@ TYPE_REPLACEMENTS: List[Tuple[str, str]] = [
     ('hggcLaunchAttribute', 'cudaLaunchAttribute'),
     ('hggcStream_t', 'cudaStream_t'),
     ('hggcFunction_t', 'cudaFunction_t'),
-    ('hggcError_t', 'cudaError_t'),
     ('hggcDataType_t', 'cudaDataType_t'),
     ('hggcEvent_t', 'cudaEvent_t'),
     ('hggcFuncAttributes', 'cudaFuncAttributes'),
@@ -78,13 +77,12 @@ TYPE_REPLACEMENTS: List[Tuple[str, str]] = [
     ('HGlaunchConfigAD', 'CUlaunchConfigAD'),
     ('HGfunction', 'CUfunction'),
     ('HGresult', 'CUresult'),
+    ('__hg_fp8', '__nv_fp8'),
 ]
 
-# FP8 / bfloat16 type names require word-boundary matching so that e.g.
+# bfloat16 type names require word-boundary matching so that e.g.
 # __ppu_bfloat162 does not also match inside __ppu_bfloat162_raw.
 WORD_BOUNDARY_REPLACEMENTS: List[Tuple[str, str]] = [
-    ('__hg_fp8_e8m0', '__nv_fp8_e8m0'),
-    ('__hg_fp8x4_e4m3', '__nv_fp8x4_e4m3'),
     ('__ppu_bfloat162', '__nv_bfloat162'),
     ('__ppu_bfloat16_raw', '__nv_bfloat16_raw'),
     ('__ppu_bfloat16', '__nv_bfloat16'),
@@ -147,7 +145,7 @@ NVTX_REPLACEMENTS: List[Tuple[str, str]] = [
     ('use_hgtx_', 'use_nvtx_'),
 ]
 
-# Processing order: includ → enum → type → func → macro → nvtx
+# Processing order: include → enum → type → func → macro → nvtx
 ALL_CATEGORY_REPLACEMENTS = [
     INCLUDE_REPLACEMENTS,
     ENUM_REPLACEMENTS,
@@ -181,14 +179,6 @@ REGEX_REPLACEMENTS: List[Tuple[str, str, str]] = [
      r'\1C10_CUDA_CHECK(cudaFuncSetAttribute(\2));', 'splitkv_mla_kernel.cuh'),
     (r'^([ \t]+)cudaFuncSetAttribute\(([^)]+)\);',
      r'\1C10_CUDA_CHECK(cudaFuncSetAttribute(\2));', 'sparse_prefill_wg.cuh'),
-
-    # C10_CUDA_CHECK wrapping (multi-line)
-    (r'([ \t]+)cudaFuncSetAttribute\(\n([ \t]+)(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size)\);',
-     r'\1C10_CUDA_CHECK(cudaFuncSetAttribute(\n\2\3));', 'splitkv_mla.cuh'),
-    (r'([ \t]+)cudaFuncSetAttribute\(\n([ \t]+)(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size)\);',
-     r'\1C10_CUDA_CHECK(cudaFuncSetAttribute(\n\2\3));', 'splitkv_mla_kernel.cuh'),
-    (r'([ \t]+)cudaFuncSetAttribute\(\n([ \t]+)(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size)\);',
-     r'\1C10_CUDA_CHECK(cudaFuncSetAttribute(\n\2\3));', 'sparse_prefill_wg.cuh'),
 
     # SM detection for splitkv_mla_kernel
     (r'            int sm_count = get_num_sm\(get_current_device\(\)\);\s*\n'
@@ -272,16 +262,32 @@ FILE_SPECIFIC_REPLACEMENTS: Dict[str, List[Tuple[str, str]]] = {
             '#include <hggc_runtime.h>',
             '#if !defined(__CUDACC_RTC__)\n#include "cuda_runtime.h"\n#endif'
         ),
-        ('hggcError_t status_ = call;', 'cudaError_t status_ = call;'),
-        ('if (status_ != hggcSuccess)', 'if (status_ != cudaSuccess)'),
         (
             'fprintf(stderr, "HGGC error (%s:%d): %s\\n", __FILE__, __LINE__,',
             'fprintf(stderr, "CUDA error (%s:%d): %s\\n", __FILE__, __LINE__,'
         ),
-        ('hggcGetErrorString(status_)', 'cudaGetErrorString(status_)'),
+    ],
+
+    # --- kerutils host/hardware_info.h ---
+    'csrc/kerutils/include/kerutils/host/hardware_info.h': [
+        ('#include <cstdio>\n#include <cstdlib>\n', ''),
         (
-            '#define CHECK_CUDA_KERNEL_LAUNCH() CHECK_CUDA(hggcGetLastError())',
-            '#define CHECK_CUDA_KERNEL_LAUNCH() CHECK_CUDA(cudaGetLastError())'
+            '#include <hggc_runtime.h>',
+            '#if !defined(__CUDACC_RTC__)\n#include "cuda_runtime.h"\n#endif'
+        ),
+        # Drop the duplicate CHECK_CUDA definition, common.h already provides it
+        (
+            '#define CHECK_CUDA(call)                                                       \\\n'
+            '  do {                                                                         \\\n'
+            '    hggcError_t status_ = call;                                                \\\n'
+            '    if (status_ != hggcSuccess) {                                              \\\n'
+            '      fprintf(stderr, "HGGC error (%s:%d): %s\\n", __FILE__, __LINE__,          \\\n'
+            '              hggcGetErrorString(status_));                                    \\\n'
+            '      exit(1);                                                                 \\\n'
+            '    }                                                                          \\\n'
+            '  } while (0)\n'
+            '\n',
+            ''
         ),
     ],
 
@@ -294,76 +300,23 @@ FILE_SPECIFIC_REPLACEMENTS: Dict[str, List[Tuple[str, str]]] = {
             'typedef struct HGstream_st* hggcStream_t;',
             '#include <c10/cuda/CUDAStream.h>'
         ),
-        # Replace GraphCaptureModeSuspender struct
-        (
-            'struct GraphCaptureModeSuspender {\n'
-            '    hggcStreamCaptureMode original_mode;\n'
-            '\n'
-            '    explicit GraphCaptureModeSuspender(hggcStreamCaptureMode relaxed_mode = hggcStreamCaptureModeRelaxed) {\n'
-            '        original_mode = relaxed_mode;\n'
-            '        // Exchange current thread\'s mode with relaxed_mode, and store previous mode in original_mode\n'
-            '        hggcThreadExchangeStreamCaptureMode(&original_mode);\n'
-            '    }\n'
-            '\n'
-            '    ~GraphCaptureModeSuspender() {\n'
-            '        // Restore the saved original mode back to the current thread\n'
-            '        hggcThreadExchangeStreamCaptureMode(&original_mode);\n'
-            '    }',
-            'struct GraphCaptureModeSuspender {\n'
-            '    cudaStreamCaptureMode original_mode;\n'
-            '\n'
-            '    explicit GraphCaptureModeSuspender(cudaStreamCaptureMode relaxed_mode = cudaStreamCaptureModeRelaxed) {\n'
-            '        original_mode = relaxed_mode;\n'
-            '        // Exchange current thread\'s mode with relaxed_mode, and store previous mode in original_mode\n'
-            '        cudaThreadExchangeStreamCaptureMode(&original_mode);\n'
-            '    }\n'
-            '\n'
-            '    ~GraphCaptureModeSuspender() {\n'
-            '        // Restore the saved original mode back to the current thread\n'
-            '        cudaThreadExchangeStreamCaptureMode(&original_mode);\n'
-            '    }'
-        ),
     ],
 
-    # --- csrc/params.h ---
+    # --- csrc/params.h (fp16/bf16/runtime headers handled by INCLUDE table) ---
     'csrc/params.h': [
         (
-            '#include <hggc_fp16.h>\n#include <hggc_runtime.h>',
-            '#include <cuda_fp16.h>\n#include <cuda_runtime.h>\n#include <ATen/cuda/CUDAContext.h>'
-        ),
-        (
-            '#include <hggc_bf16.h>',
-            '#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800\n#include <cuda_bf16.h>\n#endif'
+            '#include <hggc_runtime.h>',
+            '#include <hggc_runtime.h>\n#include <ATen/cuda/CUDAContext.h>'
         ),
     ],
 
-    # --- csrc/utils.h ---
+    # --- csrc/utils.h (fp16/bf16 headers handled by INCLUDE table) ---
     'csrc/utils.h': [
         (
-            '#include <hggc_fp16.h>\n#include <hggc_bf16.h>',
-            '#include <cuda_fp16.h>\n\n#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800\n#include <cuda_bf16.h>\n#endif'
-        ),
-        (
-            '#define CUDA_DRIVER_CHECK(expr)                             \\\n'
-            '    HGresult _r = (expr);                                   \\\n'
-            '    if (_r != HGGC_SUCCESS) {                               \\\n'
-            '        const char* _name = nullptr;                        \\\n'
-            '        const char* _str = nullptr;                         \\\n'
-            '        hgGetErrorName(_r, &_name);                         \\\n'
-            '        hgGetErrorString(_r, &_str);                        \\\n'
             '        printf("HG driver error: %s: %s\\n",                \\\n'
-            '               (_name ? _name : "?"), (_str ? _str : "?")); \\\n'
-            '    }',
-            '#define CUDA_DRIVER_CHECK(expr)                             \\\n'
-            '    CUresult _r = (expr);                                   \\\n'
-            '    if (_r != CUDA_SUCCESS) {                               \\\n'
-            '        const char* _name = nullptr;                        \\\n'
-            '        const char* _str = nullptr;                         \\\n'
-            '        cuGetErrorName(_r, &_name);                         \\\n'
-            '        cuGetErrorString(_r, &_str);                        \\\n'
+            '               (_name ? _name : "?"), (_str ? _str : "?")); \\\n',
             '        TORCH_CHECK(false, "CUDA driver error ",            \\\n'
             '        (_name ? _name : "?"), ": ", (_str ? _str : "?"));  \\\n'
-            '    }'
         ),
     ],
 
@@ -379,216 +332,37 @@ HGGCCC_GUARD_FILES = {
 }
 
 # =============================================================================
-# setup.py full content (hardcoded CUDAExtension version)
+# setup.py replacements
 # =============================================================================
 
-CUDA_SETUP_PY = r'''import os
-from pathlib import Path
-from datetime import datetime
-import subprocess
+SETUP_PY_REPLACEMENTS: List[Tuple[str, str]] = [
+    # --- ppu arch flags -> gencode ---
+    ('cc_flag.append("-arch=ppu_10")\n'
+     'cc_flag.append("-arch=ppu_15")\n',
+     'cc_flag.append("-gencode")\n'
+     'cc_flag.append("arch=compute_80,code=sm_80")\n'),
 
-from setuptools import setup, find_packages
+    # --- cuda driver library ---
+    ('        sources=get_sources(),\n'
+     '        extra_compile_args={\n',
+     '        sources=get_sources(),\n'
+     "        libraries=['cuda'],\n"
+     '        extra_compile_args={\n'),
 
-from torch.utils.cpp_extension import (
-    BuildExtension,
-    CUDAExtension,
-    IS_WINDOWS,
-)
-
-DISABLE_FP16 = os.getenv("FLASH_MLA_DISABLE_FP16", "FALSE") == "TRUE"
-ENABLE_C_DECODE_SPARSE = os.getenv("FLASHMLA_C_ENABLE_DECODE_SPARSE", "TRUE") == "TRUE"
-CPP_INFERENCE = 'FLASH_MLA_CPP_INFER_BUILD' in os.environ.keys() and os.environ['FLASH_MLA_CPP_INFER_BUILD'] == "1"
-
-def append_nvcc_threads(nvcc_extra_args):
-    nvcc_threads = os.getenv("NVCC_THREADS") or "32"
-    return nvcc_extra_args + ["--threads", nvcc_threads]
-
-
-def get_sources():
-    sources = [
-        "csrc/api/api.cpp",
-        "csrc/ppu/decode/dense/instantiations/hdim576_512_bf16.cu",
-        "csrc/ppu/decode/dense/instantiations/splitkv_mla_bf16.cu",
-        "csrc/ppu/prefill/sparse/instantiations/dispatch_bf16.cu",
-        "csrc/ppu/decode/sparse/instantiations/hdim576_bf16.cu",
-        "csrc/ppu/decode/sparse/instantiations/hdim512_bf16.cu",
-        "csrc/ppuxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
-        "csrc/ppuxx/decode/combine/instantiations/mla_combine_bf16.cu",
-        "csrc/ppu/prefill/sparse/instantiations/wg_bf16_sm80.cu",
-        "csrc/ppu/prefill/sparse/instantiations/wg_bf16_sm89.cu",
-    ]
-
-    if not DISABLE_FP16:
-        sources.append("csrc/ppu/decode/dense/instantiations/hdim576_512_fp16.cu")
-        sources.append("csrc/ppu/decode/dense/instantiations/splitkv_mla_fp16.cu")
-        sources.append("csrc/ppuxx/decode/combine/instantiations/mla_combine_fp16.cu")
-        sources.append("csrc/ppu/prefill/sparse/instantiations/wg_fp16_sm80.cu")
-        sources.append("csrc/ppu/prefill/sparse/instantiations/wg_fp16_sm89.cu")
-
-    return sources
-
-def get_features_args():
-    features_args = []
-    if DISABLE_FP16:
-        features_args.append("-DFLASH_MLA_DISABLE_FP16")
-    if ENABLE_C_DECODE_SPARSE:
-        features_args.append("-DFLASHMLA_C_ENABLE_DECODE_SPARSE")
-    if CPP_INFERENCE:
-        features_args.append("-DFLASH_MLA_CPP_INFER_BUILD")
-    features_args.append("-DFLASH_MLA_STANDALONE_BUILD")
-    features_args.append("-DUSE_TS")
-
-    return features_args
-
-this_dir = os.path.dirname(os.path.abspath(__file__))
-# subprocess.run(["git", "submodule", "update", "--init", "csrc/actlize"])  # disabled: no git
-dir_actlize = this_dir +  "/csrc/actlize"
-# check the existence of actlize
-if not os.path.exists(dir_actlize):
-    try:
-        repo_actlize = os.path.dirname(this_dir) + "/actlize"
-        if not os.path.exists(repo_actlize):
-            raise RuntimeError(
-                f"actlize does not exist: actlize must be fetched in advance as:\n"
-                f" \"{repo_actlize}\" or \"{dir_actlize}\""
-            )
-        else:
-            os.symlink(repo_actlize, dir_actlize)
-    except Exception as e:
-        raise EnvironmentError("setup dependencies FAILED: " + repr(e))
-
-cc_flag = []
-cc_flag.append("-gencode")
-cc_flag.append("arch=compute_80,code=sm_80")
-
-cxx_args = ["-O3", "-std=c++17", "-DNDEBUG", "-Wno-deprecated-declarations"]
-
-ext_modules = []
-ext_modules.append(
-    CUDAExtension(
-        name="flash_mla_cuda",
-        sources=get_sources(),
-        libraries=['cuda'],
-        extra_compile_args={
-            "cxx": cxx_args + get_features_args(),
-            "nvcc": append_nvcc_threads(
-                [
-                    "-O3",
-                    "-std=c++17",
-                    "-DNDEBUG",
-                    "-D_USE_MATH_DEFINES",
-                    "-Wno-deprecated-declarations",
-                    "--expt-relaxed-constexpr",
-                    "--expt-extended-lambda",
-                    "--use_fast_math",
-                    "--ptxas-options=-v,--register-usage-level=10",
-                    "-mllvm",
-                    "-ppu-max-vreg-count=256",
-                    "-mllvm",
-                    "-ppu-sink-matrix-addr=true",
-                    "-mllvm",
-                    "-ppu-max-alloca-byte-size=320",
-                    "-mllvm",
-                    "-ppu-sink-async-addr=true",
-                    "-mllvm",
-                    "-ppu-sink-load-addr=true",
-                    "-mllvm",
-                    "-ppu-sink-store-addr=true",
-                    "-mllvm",
-                    "-ppu-alloca-half-ldst-simplify=true",
-                    "-mllvm",
-                    "-ppu-force-warpage=true",
-                    "-mllvm",
-                    "-ppu-force-vregrr=true",
-                    "-DUSE_PPU",
-                    "-DUSE_AIU=1",
-                    "-DACOMPUTE_VERSION=10000"
-                ]
-                + cc_flag
-            ) + get_features_args(),
-        },
-        include_dirs=[
-            Path(this_dir) / "csrc",
-            Path(this_dir) / "csrc" / "actlize" / "include",
-            Path(this_dir) / "csrc" / "api",
-            Path(this_dir) / "csrc" / "kerutils" / "include",
-            Path(this_dir) / "csrc" / "ppu",
-        ],
-    )
-)
+    # --- ptxas resource report + register usage level ---
+    ('                    "--use_fast_math",\n'
+     '                    "-mllvm",\n',
+     '                    "--use_fast_math",\n'
+     '                    "--ptxas-options=-v,--register-usage-level=10",\n'
+     '                    "-mllvm",\n'),
+]
 
 
-try:
-    _now = datetime.now()
-    rev = '+' + _now.strftime("%Y-%m-%d-%H-%M-%S")
-except Exception as _:
-    rev = '+dev'
+def rewrite_setup_py(content: str) -> str:
+    """Convert setup.py from the ppu-original form to the cuda-compatible form."""
+    content = content.replace('hgcc', 'nvcc')
+    return apply_replacements(content, SETUP_PY_REPLACEMENTS)
 
-def custom_local_scheme(version):
-    return '+dev%03d.%s' % (version.distance, version.node[:7])
-
-### update FlashMLA Version
-### flash_mla-1.0.0 do not support deepseek-v4, with fixed commit-id #f907f433e
-### flash_mla-1.0.1 support deepseek-v4 with API Breaking Changes!
-def custom_version_scheme(version):
-    return '2.0.0'
-
-setup(
-    name="flash_mla",
-    use_scm_version={
-        "local_scheme": custom_local_scheme,
-        "version_scheme": custom_version_scheme,
-    },
-    setup_requires=["setuptools-scm==9.2.2"],
-    packages=find_packages(include=['flash_mla']),
-    ext_modules=ext_modules,
-    cmdclass={"build_ext": BuildExtension},
-)
-'''
-
-# =============================================================================
-# Full file content: files that are completely rewritten (not incrementally patched)
-# =============================================================================
-
-FULL_FILE_CONTENT: Dict[str, str] = {
-    'setup.py': CUDA_SETUP_PY,
-    'csrc/kerutils/include/kerutils/host/hardware_info.h': (
-        '/******************************************************************************\n'
-        ' * Copyright (c) 2022-2026, T-HEAD (SHANGHAI) SEMICONDUCTOR CO., LTD.\n'
-        ' * Copyright (c) 2024, Tri Dao.\n'
-        ' ******************************************************************************/\n'
-        '\n'
-        '#pragma once\n'
-        '\n'
-        '#include "kerutils/common/common.h"\n'
-        '\n'
-        '#include <tuple>\n'
-        '\n'
-        '#if !defined(__CUDACC_RTC__)\n'
-        '#include "cuda_runtime.h"\n'
-        '#endif\n'
-        '\n'
-        '\n'
-        'inline int get_current_device() {\n'
-        '    int device;\n'
-        '    CHECK_CUDA(cudaGetDevice(&device));\n'
-        '    return device;\n'
-        '}\n'
-        '\n'
-        'inline std::tuple<int, int> get_compute_capability(int device) {\n'
-        '    int capability_major, capability_minor;\n'
-        '    CHECK_CUDA(cudaDeviceGetAttribute(&capability_major, cudaDevAttrComputeCapabilityMajor, device));\n'
-        '    CHECK_CUDA(cudaDeviceGetAttribute(&capability_minor, cudaDevAttrComputeCapabilityMinor, device));\n'
-        '    return {capability_major, capability_minor};\n'
-        '}\n'
-        '\n'
-        'inline int get_num_sm(int device) {\n'
-        '    int multiprocessor_count;\n'
-        '    CHECK_CUDA(cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));\n'
-        '    return multiprocessor_count;\n'
-        '}\n'
-    ),
-}
 
 # =============================================================================
 # Files to skip entirely (no conversion needed)
@@ -681,24 +455,35 @@ def apply_hggccc_guards(content: str, rel_path: str) -> str:
 def process_file(filepath: str, repo_dir: str,
                  dry_run: bool = False, verbose: bool = False) -> int:
     """Process a single file through the replacement pipeline. Returns change count."""
-    rel_path = os.path.relpath(filepath, repo_dir)
+    # realpath on both sides: main() chdir's into repo_dir, so a symlink anywhere in
+    # the path would otherwise make relpath climb out and every rel_path key miss.
+    rel_path = os.path.relpath(os.path.realpath(filepath), os.path.realpath(repo_dir))
 
-    # --- Full file content rewrites ---
-    if rel_path in FULL_FILE_CONTENT:
+    # --- setup.py ---
+    if rel_path == 'setup.py':
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 content = f.read()
         except (IOError, OSError):
             return 0
-        target = FULL_FILE_CONTENT[rel_path]
-        if content == target:
+        if 'HGCCBuildExtension' in content:
+            print("  WARNING: setup.py uses the legacy HGCCBuildExtension, which this "
+                  "script no longer converts, left untouched")
+            return 0
+        if 'CUDAExtension' not in content:
+            print("  WARNING: setup.py matches no known shape, left untouched")
+            return 0
+        new_content = rewrite_setup_py(content)
+        if '-arch=ppu_' in new_content or 'hgcc' in new_content:
+            print("  WARNING: setup.py still has PPU-only build flags after rewrite")
+        if new_content == content:
             return 0
         if dry_run:
             if verbose:
                 print(f"    [dry-run] {rel_path}")
             return 1
         with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(target)
+            f.write(new_content)
         if verbose:
             print(f"    {rel_path}")
         return 1
@@ -728,7 +513,7 @@ def process_file(filepath: str, repo_dir: str,
     if has_file_specific:
         content = apply_replacements(content, FILE_SPECIFIC_REPLACEMENTS[rel_path])
 
-    # 2. Category replacements (include → enum → type → func → macro → atom → nvtx)
+    # 2. Category replacements (include → enum → type → func → macro → nvtx)
     for table in ALL_CATEGORY_REPLACEMENTS:
         content = apply_replacements(content, table)
 
