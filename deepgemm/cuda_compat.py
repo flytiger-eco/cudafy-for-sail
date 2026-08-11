@@ -57,15 +57,15 @@ TARGET_EXTENSIONS = {'.py', '.hpp', '.cuh', '.cu', '.cpp', '.h', '.sh', '.md'}
 # --- C/C++ Header includes ---
 INCLUDE_REPLACEMENTS = [
     # Headers
-    ('#include <hggc_runtime.h>', '#include <cuda_runtime.h>'),
-    ('#include <hggc.h>', '#include <cuda.h>'),
-    ('#include <hgrtc.h>', '#include <nvrtc.h>'),
-    ('#include <hggc_fp8.h>', '#include <cuda_fp8.h>'),
-    ('#include <hggc_fp16.h>', '#include <cuda_fp16.h>'),
-    ('#include <hggc_bf16.h>', '#include <cuda_bf16.h>'),
-    ('#include <hgtx3/hgToolsExt.h>', '#include <nvtx3/nvToolsExt.h>'),
-    ('#include <hggc_pipeline.h>', '#include <cuda_pipeline.h>'),
-    ('#include "cutlass/arch/memory_ppu.h"', '#include "cutlass/arch/memory_sm80.h"'),
+    ('<hggc_runtime.h>', '<cuda_runtime.h>'),
+    ('<hggc.h>', '<cuda.h>'),
+    ('<hgrtc.h>', '<nvrtc.h>'),
+    ('<hggc_fp8.h>', '<cuda_fp8.h>'),
+    ('<hggc_fp16.h>', '<cuda_fp16.h>'),
+    ('<hggc_bf16.h>', '<cuda_bf16.h>'),
+    ('<hgtx3/hgToolsExt.h>', '<nvtx3/nvToolsExt.h>'),
+    ('<hggc_pipeline.h>', '<cuda_pipeline.h>'),
+    ('<hggc/std/cstdint>', '<cuda/std/cstdint>'),
     # NOTE: '#include <torch/torch.h>' → ATen/cuda/CUDAContext.h is NOT a global rule.
     # common_fp4.hpp legitimately uses torch/torch.h in both versions.
     # File-specific handling in device_runtime.hpp if needed.
@@ -73,26 +73,13 @@ INCLUDE_REPLACEMENTS = [
 
 # --- Macro definitions and checks ---
 MACRO_REPLACEMENTS = [
-    # Error check macros
-    ('DG_HGRTC_CHECK', 'DG_NVRTC_CHECK'),
-    ('DG_HGGC_DRIVER_CHECK', 'DG_CUDA_DRIVER_CHECK'),
-    ('DG_HGGC_RUNTIME_CHECK', 'DG_CUDA_RUNTIME_CHECK'),
-    ('DG_HGGC_CHECK', 'DG_CUDA_UNIFIED_CHECK'),
-    # Macro declarations
-    ('DECL_LAZY_HGGC_DRIVER_FUNCTION', 'DECL_LAZY_CUDA_DRIVER_FUNCTION'),
     # Version macros
     ('HGGCRT_VERSION', 'CUDART_VERSION'),
     ('HGGC_VERSION', 'CUDA_VERSION'),
-    # Compile defines
-    ('-DUSE_HGGC', '-DUSE_HGGC'),  # keep (PPU-specific define, no CUDA equivalent)
     # NVRTC defines in code strings
     ('BF16_HGRTC', 'BF16_NVRTC'),
     ('FP8_HGRTC', 'FP8_NVRTC'),
     ('INT8_HGRTC', 'INT8_NVRTC'),
-    # Conditional compilation
-    ('DG_USE_HGTX', 'DG_USE_NVTX'),
-    # CHECK macro
-    ('CHECK_HGGC', 'CHECK_CUDA'),
 ]
 
 # --- Type replacements (C/C++) ---
@@ -100,8 +87,6 @@ TYPE_REPLACEMENTS = [
     # Cutlass host adapter type: NOT using simple string replace here because
     # 'HostAdapter' appears inside 'CudaHostAdapter' causing double-replacement.
     # Handled via REGEX_REPLACEMENTS with negative lookbehind instead.
-    # ('HostAdapter', 'CudaHostAdapter'),  # MOVED to REGEX_REPLACEMENTS
-    # ('host_adapter', 'cuda_adapter'),    # MOVED to REGEX_REPLACEMENTS
     # Driver API types
     ('HGtensorMapDataType', 'CUtensorMapDataType'),
     ('HGtensorMapSwizzle', 'CUtensorMapSwizzle'),
@@ -125,14 +110,11 @@ TYPE_REPLACEMENTS = [
     ('hguint32_t', 'cuuint32_t'),
     # Device type intrinsics
     ('__ppu_bfloat16', '__nv_bfloat16'),
-    ('__ppu_bfloat162', '__nv_bfloat162'),
     ('__hg_fp8_e4m3', '__nv_fp8_e4m3'),
     # Runtime API types (additional)
     ('hggcFuncAttributes', 'cudaFuncAttributes'),
     ('hggcFuncGetAttributes', 'cudaFuncGetAttributes'),
     ('hggcOccupancyMaxActiveBlocksPerMultiprocessor', 'cudaOccupancyMaxActiveBlocksPerMultiprocessor'),
-    # Cutlass3 KernelHardwareInfo field name (PPU cu_count -> CUDA sm_count)
-    ('hw_info.cu_count', 'hw_info.sm_count'),
 ]
 
 # --- Enum/constant replacements ---
@@ -259,31 +241,6 @@ PYTHON_REPLACEMENTS = [
     ("'hgrtc'", "'nvrtc'"),
 ]
 
-# --- Cutlass arch replacement ---
-# NOTE: cutlass::arch::PPU0010 should NOT be globally replaced!
-# In the target code, most files KEEP PPU0010.
-# Only PPU0015 (in cutlass3 files) maps to Sm80.
-ARCH_REPLACEMENTS = [
-    # Only the SHORT form (without cutlass:: prefix) should be converted.
-    # Files like fused_moe_gemm.cuh use cutlass::arch::PPU0015 which must STAY.
-    ('= arch::PPU0015;', '= arch::Sm80;'),
-    ('MainloopPPUCpAsync', 'MainloopSm80CpAsync'),
-    ('ppu_epilogue_vectorized.hpp', 'sm70_epilogue_vectorized.hpp'),
-    # CuTe copy atom replacements (PPU → SM80/SM75)
-    ('PPU_CP_ASYNC_CACHEALWAYS_ZFILL', 'SM80_CP_ASYNC_CACHEALWAYS_ZFILL'),
-    ('PPU_CP_ASYNC_CACHEGLOBAL', 'SM80_CP_ASYNC_CACHEGLOBAL'),
-    # Class name replacements (PPU kernel classes → Sm80)
-    ('PPUPagedMqaLogitsFP4', 'Sm80PagedMqaLogitsFP4'),
-    ('PPUMqaLogitsFP4', 'Sm80MqaLogitsFP4'),
-    ('PPUPagedMqaLogits', 'Sm80PagedMqaLogits'),
-    ('PPUMqaLogits', 'Sm80MqaLogits'),
-]
-
-# --- NVTX-specific variable name replacements ---
-NVTX_VAR_REPLACEMENTS = [
-    ('use_hgtx_', 'use_nvtx_'),
-]
-
 # =============================================================================
 # LEVEL 2: File-level operations
 # =============================================================================
@@ -291,27 +248,6 @@ NVTX_VAR_REPLACEMENTS = [
 # Files to handle: if .cpp exists and .cu does not, rename; if both exist, remove .cpp
 FILE_RENAMES = [
     ('csrc/python_api.cpp', 'csrc/python_api.cu'),
-]
-
-# Files/symlinks that only exist in ppu original version and must be deleted on revert
-FILES_TO_DELETE = [
-    'csrc/compat_shim/hggc_fp16.h',
-    'deep_gemm/include/accutlass.h',           # symlink (PPU-specific)
-    'deep_gemm/include/aiu',                   # symlink (PPU AIU headers)
-    'deep_gemm/include/cutlass',               # symlink (PPU build shortcut)
-    'deep_gemm/include/cutlass3/accutlass.hpp', # symlink (PPU-specific)
-    'deep_gemm/include/cutlass3/cute',          # symlink (PPU build shortcut)
-    'deep_gemm/include/cutlass3/cutlass',       # symlink (PPU build shortcut)
-    'deep_gemm/include/cutlass3/ppu_include.hpp', # symlink (PPU-specific)
-    'deep_gemm/include/cutlass3/tools',         # symlink (PPU build shortcut)
-    'deep_gemm/nvcc_wrapper.sh',               # PPU-specific nvcc wrapper
-    'docker_test.sh',                          # PPU-specific docker test
-    'revert_cuda_free.sh',                     # revert helper (not needed after revert)
-]
-
-# Directories to remove if empty after file deletions
-DIRS_TO_CLEANUP = [
-    'csrc/compat_shim',
 ]
 
 # Files to restore (were deleted in ppu-original; provide content to recreate)
@@ -342,11 +278,6 @@ REGEX_REPLACEMENTS: List[Tuple[str, str, str]] = [
     # but target uses at::cuda::CUDAStream stream = at::cuda::getDefaultCUDAStream()
     (r'cudaStream_t stream = at::cuda::getCurrentCUDAStream\(\)',
      'at::cuda::CUDAStream stream = at::cuda::getDefaultCUDAStream()', None),
-
-    # Cutlass host adapter type: use negative lookbehind to avoid double-replacement
-    # 'HostAdapter' appears inside 'CudaHostAdapter' so simple replace would break it
-    (r'(?<!Cuda)HostAdapter', 'CudaHostAdapter', None),
-    (r'(?<!cuda_)host_adapter', 'cuda_adapter', None),
 
     # nv_bfloat16 (without __) — REMOVED: this regex would incorrectly modify files
     # where nv_bfloat16 is used intentionally (e.g., m_grouped_int8_gemm.hpp, cutlass headers)
@@ -405,58 +336,6 @@ REGEX_REPLACEMENTS: List[Tuple[str, str, str]] = [
     # Remove triple newline before #pragma clang diagnostic pop
 ]
 
-# Commented-out function to insert in common_bf16.hpp
-COMMON_BF16_COMMENT_BLOCK = """// std::vector<std::vector<int>> generate_search_space_v2(
-//     int64_t m,          // lhs[0].shape[0]
-//     int64_t n,          // rhs[0].shape[0]
-//     int64_t k,          // lhs[0].shape[1] (implicitly rhs[0].shape[1] == k)
-//     DataType dtype,     // lhs[0].dtype
-//     const std::string& device_name, // CUDA device name (e.g. "ZW810E-100")
-//     int num_candidate   // Number of candidate tiles
-// ) {
-//     // TODO: Modified input params, and internal call to device_props =
-//     torch.cuda.get_device_properties(device='cuda') statement, need to find a solution
-//     // Condition 1: All dimensions >=4096 and 64 aligned
-//     if (!(m >= 4096 && m % 64 == 0 &&
-//           n >= 4096 && n % 64 == 0 &&
-//           k >= 4096 && k % 64 == 0)) {
-//         return {};
-//     }
-
-//     // Condition 2: Data type must be BFLOAT16 or FLOAT16
-//     if (dtype != DataType::BFLOAT16 && dtype != DataType::FLOAT16) {
-//         return {};
-//     }
-
-//     // Condition 3: Device name must contain "ZW810E" or "ZW810" (case sensitive)
-//     if (device_name.find("ZW810E") == std::string::npos &&
-//         device_name.find("ZW810") == std::string::npos) {
-//         return {};
-//     }
-
-//     std::vector<int> shape = {
-//         static_cast<int>(m),
-//         static_cast<int>(n),
-//         static_cast<int>(k)
-//     };
-
-//     MatmulHeuristicsTile candidate_tile(shape, 2, CONFIG_TILE_GREATER_4096);
-
-//     auto tile_list = candidate_tile.get_candidate_tile(num_candidate);
-
-//     std::vector<std::vector<int>> result;
-//     result.reserve(tile_list.size());
-//     for (const auto& tile : tile_list) {
-//         // Safe slice: only extract when tile length >=11 (defensive programming, original Python didn't explicitly check)
-//         if (tile.size() >= 11) {
-//             result.emplace_back(tile.begin() + 3, tile.begin() + 11);
-//         }
-//         // Note: If tile length is insufficient, original Python logic should crash; here we conservatively skip (actual need to be guaranteed by MatmulHeuristicsTile)
-//     }
-//     return result;
-// }
-"""
-
 
 # Specific whole-line or block replacements per file
 # Format: {relative_path: [(old_text, new_text), ...]}
@@ -481,12 +360,7 @@ FILE_SPECIFIC_REPLACEMENTS: Dict[str, List[Tuple[str, str]]] = {
         # The PPU-only defines collapse to a bare separator (the base flags do not always
         # end with a space, so the space must be kept).
         (' -DUSE_HGGC -DUSE_CLANG -DUSE_ACWRAPPER ', ' '),
-        # Class names
-        ('HGCCCompiler', 'NVCCCompiler'),
-        ('HGRTCCompiler', 'NVRTCCompiler'),
         # Member / parameter / local variable renames (longer patterns first)
-        ('sdk_home_path', 'cuda_home_path_by_python'),
-        ('sdk_home', 'cuda_home'),
         ('hgcc_path', 'nvcc_path'),
         ('hgcc_extra_flags', 'nvcc_flags'),
         # RTC include lists: the CUDA side needs extra toolkit paths, so these are
@@ -497,11 +371,6 @@ FILE_SPECIFIC_REPLACEMENTS: Dict[str, List[Tuple[str, str]]] = {
          'includes_insert({cuda_home, cuda_home + "/cuda/std", cuda_home + "/../targets/x86_64-linux/include/thrust/system/cuda"});'),
         ('sdk_include_cccl', 'cuda_home1'),
         ('sdk_include', 'cuda_home'),
-        # Environment variable names
-        ('DG_CPP_STANDARD', 'DG_NVCC_OVERRIDE_CPP_STANDARD'),
-        ('DG_JIT_USE_HGRTC', 'DG_JIT_USE_NVRTC'),
-        ('default_use_hgrtc', 'default_use_nvrtc'),
-        ('PPU_HOME', 'CUDA_HOME'),
         # HGRTC ctor: signature + restore NVRTC version assertion
         ('signature = fmt::format("HGRTC{}.{}", major, minor);',
          'signature = fmt::format("NVRTC{}.{}", major, minor);\n        DG_HOST_ASSERT((major > 12 or (major == 12 and minor >= 3)) and "NVRTC version should be >= 12.3");'),
@@ -522,48 +391,12 @@ FILE_SPECIFIC_REPLACEMENTS: Dict[str, List[Tuple[str, str]]] = {
         ('-Xcompiler -Wno-deprecated-declarations -Xcompiler -Wno-abi ', '-Xcompiler -O3,-Wno-deprecated-declarations,-Wno-abi '),
         # PPU LLVM backend flag prefix
         ('-Xllvm', '-mllvm'),
-        # Binary/buffer variable suffixes (generic rule covers hgbin_path / kernel.hgbin)
-        ('hgbin_size', 'cubin_size'),
-        ('hgbin_data', 'cubin_data'),
-        # Comment / log message tokens
-        ('temporary HGBIN', 'temporary CUBIN'),
-        ('Get HGBIN size', 'Get CUBIN size'),
-        ('Running HGCC command', 'Running NVCC command'),
-        ('HGCC compilation failed', 'NVCC compilation failed'),
-        ('Create HGRTC program', 'Create NVRTC program'),
-        ('HGRTC compile options', 'NVRTC compile options'),
-        ('HGGCRTC log:', 'NVRTC log:'),
-        # printf format specifiers (size_t -> int)
-        ('compile options (%zu):', 'compile options (%d):'),
-        ('for (size_t i = 0; i < opts.size(); ++i)', 'for (int i = 0; i < opts.size(); ++i)'),
-        ('printf("  [%zu] %s', 'printf("  [%d] %s'),
-    ],
-
-    # --- csrc/jit/handle.hpp ---
-    'csrc/jit/handle.hpp': [
-        # Error messages specific to handle.hpp
-        ('"Failed to load HGGC driver `libhggc.so`"', '"Failed to load CUDA driver `libcuda.so.1`"'),
-        ('// Macro to define wrapper functions named `lazy_hg{API name}`',
-         '// Macro to define wrapper functions named `lazy_cu{API name}`'),
-        ('// Use HGGC runtime API', '// Use CUDA runtime API'),
-        ('// Use HGGC driver API', '// Use CUDA driver API'),
     ],
 
     # --- csrc/jit/kernel_runtime.hpp ---
     'csrc/jit/kernel_runtime.hpp': [
-        # Variable renames (longer patterns first to avoid partial matches)
-        ('sdk_home_path', 'cuda_home_path_by_python'),
-        ('sdk_home', 'cuda_home'),
-        # NOTE: DG_DECLARE_STATIC_VAR_IN_CLASS(KernelRuntime, sdk_home) needs no rule of
-        # its own -- the generic ('sdk_home', 'cuda_home') entry above already covers it.
         # Stream usage: (uintptr_t)stream -> stream.id()
         ('(uintptr_t)stream', 'stream.id()'),
-    ],
-
-    # --- csrc/apis/runtime.hpp ---
-    'csrc/apis/runtime.hpp': [
-        ('sdk_home_path_ptr', 'cuda_home_path_by_python_ptr'),
-        ('sdk_home_path', 'cuda_home_path_by_python'),
     ],
 
     # --- csrc/jit/device_runtime.hpp ---
@@ -577,10 +410,6 @@ FILE_SPECIFIC_REPLACEMENTS: Dict[str, List[Tuple[str, str]]] = {
 
     # --- csrc/utils/exception.hpp ---
     'csrc/utils/exception.hpp': [
-        # Error message text (applied BEFORE global rules)
-        ('"HGGCRTC"', '"NVRTC"'),
-        ('"HGGC driver"', '"CUDA driver"'),
-        ('"HGGC runtime"', '"CUDA runtime"'),
         # Add cublasLt include at top of includes
         ('#pragma once\n\n#include <exception>', '#pragma once\n\n#include <cublasLt.h>\n#include <exception>'),
         # Add DG_CUBLASLT_CHECK macro after the DG_CUDA_RUNTIME_CHECK block
@@ -596,78 +425,11 @@ FILE_SPECIFIC_REPLACEMENTS: Dict[str, List[Tuple[str, str]]] = {
          '} while (0)\n#endif\n\n} // namespace deep_gemm'),
     ],
 
-    # --- csrc/utils/compatibility.hpp ---
-    'csrc/utils/compatibility.hpp': [
-        ('`hgTensorMapEncodeTiled` is supported since HGGC Driver API 12.1',
-         '`cuTensorMapEncodeTiled` is supported since CUDA Driver API 12.1'),
-    ],
-
-    # --- deep_gemm/include/deep_gemm/profiling_interface.hpp ---
-    'deep_gemm/include/deep_gemm/profiling_interface.hpp': [
-        # Fix comments: "device graph" -> "cuda graph"
-        ('// check if device graph captured', '// check if cuda graph captured'),
-        ('// add device graph mode later', '// add cuda graph mode later'),
-        ('"\\ndump_group_m not supported in device graph mode.\\n"',
-         '"\\ndump_group_m not supported in cuda graph mode.\\n"'),
-    ],
-
-    # --- deep_gemm/include/deep_gemm/tf32_hc_prenorm_gemm.cuh ---
-    'deep_gemm/include/deep_gemm/tf32_hc_prenorm_gemm.cuh': [
-        ('#include <hggc/std/cstdint>', '#include <cuda/std/cstdint>'),
-        ('#include <cute/arch/copy_ppu.hpp>', '#include <cute/arch/copy_sm80.hpp>'),
-        ('namespace hc_detail {', 'namespace sm80_hc_detail {'),
-        ('} // namespace hc_detail', '} // namespace sm80_hc_detail'),
-        ('tf32_hc_prenorm_gemm_impl', 'sm80_tf32_hc_prenorm_gemm_impl'),
-        ('Invalid block K for PPU TF32 MMA', 'Invalid block K for SM80 TF32 MMA'),
-        ('BLOCK_N must <= 32 for PPU TF32 MMA', 'BLOCK_N must <= 32 for SM80 TF32 MMA'),
-        ('This kernel only supports PPU or newer', 'This kernel only supports sm_80 or newer'),
-        ('hc_detail::', 'sm80_hc_detail::'),
-    ],
-
-    # --- deep_gemm/include/deep_gemm/fused_gemm_util.cuh ---
-    'deep_gemm/include/deep_gemm/fused_gemm_util.cuh': [
-        ('PPU_U32x4_LDSM_N', 'cute::SM75_U32x4_LDSM_N'),
-    ],
-
-    # --- deep_gemm/include/deep_gemm/utils.cuh ---
-    'deep_gemm/include/deep_gemm/utils.cuh': [
-        ('HGGC API error', 'CUDA API error'),
-        # NOTE: next_power_of_two / computeBlockInfoKernel are deliberately NOT injected
-        # here. They stay in utils_rtc.cuh, which this header includes; conversion only
-        # strips the __HGGC__ guard there. The old rule anchored on '    } \\' + '}' --
-        # the tail of ANY multi-line macro -- so str.replace could inject the block more
-        # than once and produce a redefinition error.
-    ],
-
-    # --- deep_gemm/include/deep_gemm/bf16_gemm.cuh ---
-    'deep_gemm/include/deep_gemm/bf16_gemm.cuh': [
-        # Only bf16_gemm.cuh and int8_gemm.cuh convert PPU0010 to Sm80
-        ('cutlass::arch::PPU0010', 'cutlass::arch::Sm80'),
-    ],
-
     # --- deep_gemm/include/deep_gemm/bf16_gemm_cutlass3.cuh ---
     'deep_gemm/include/deep_gemm/bf16_gemm_cutlass3.cuh': [
-        # Add blank line between instrument() and max_active_tb_num
-        ('ProfilingInterface::Instance().instrument(false, dg_prof_params);\n\n        int max_active_tb_num',
-         'ProfilingInterface::Instance().instrument(false, dg_prof_params);\n\n\n        int max_active_tb_num'),
         # Remove the #include "utils.cuh" / #else / #include "utils_rtc.cuh" block
         ('#include "profiling_interface.hpp"\n    #include "utils.cuh"\n#else\n    #include "utils_rtc.cuh"\n#endif',
          '#include "profiling_interface.hpp"\n#endif'),
-    ],
-
-    # --- deep_gemm/include/deep_gemm/int8_gemm.cuh ---
-    'deep_gemm/include/deep_gemm/int8_gemm.cuh': [
-        ('cutlass::arch::PPU0010', 'cutlass::arch::Sm80'),
-    ],
-
-    # --- deep_gemm/include/deep_gemm/fp4_mqa_logits.cuh ---
-    'deep_gemm/include/deep_gemm/fp4_mqa_logits.cuh': [
-        ('Key differences from PPUMqaLogits (FP8):', 'Key differences from Sm80MqaLogits (FP8):'),
-    ],
-
-    # --- deep_gemm/include/deep_gemm/fp4_paged_mqa_logits.cuh ---
-    'deep_gemm/include/deep_gemm/fp4_paged_mqa_logits.cuh': [
-        ('Key differences from FP8 PPUPagedMqaLogits:', 'Key differences from FP8 Sm80PagedMqaLogits:'),
     ],
 
     # --- deep_gemm/include/deep_gemm/w4a16_gemm_cutlass3.cuh ---
@@ -675,14 +437,6 @@ FILE_SPECIFIC_REPLACEMENTS: Dict[str, List[Tuple[str, str]]] = {
         # Add #pragma clang diagnostic ignored after push
         ('#pragma clang diagnostic push\n#pragma clang diagnostic ignored "-Wunknown-attributes"',
          '#pragma clang diagnostic push\n#pragma clang diagnostic ignored "-Wunknown-attributes"\n#pragma clang diagnostic ignored "-Wcuda-compat"'),
-    ],
-
-    # --- README.md ---
-    'README.md': [
-        ('DG_JIT_USE_HGRTC', 'DG_JIT_USE_NVRTC'),
-        ('DG_JIT_HGCC_COMPILER', 'DG_JIT_NVCC_COMPILER'),
-        ('will find in `PPU_SDK` or `PPU_HOME` env by default',
-         'will find in `torch.utils.cpp_extension.CUDA_HOME` by default'),
     ],
 
     # --- setup.py ---
@@ -766,80 +520,10 @@ FILE_SPECIFIC_REPLACEMENTS: Dict[str, List[Tuple[str, str]]] = {
         ('run_hgobjdump', 'run_cuobjdump'),
     ],
 
-    # --- deep_gemm/jit/template.py ---
-    'deep_gemm/jit/template.py': [
-        ("'<hggc.h>'", "'<cuda.h>'"),
-        ("'<hggc_fp8.h>'", "'<cuda_fp8.h>'"),
-        ("'<hggc_runtime.h>'", "'<cuda_runtime.h>'"),
-        ("'__ppu_bfloat16*'", "'__nv_bfloat16*'"),
-        ("'__hg_fp8_e4m3*'", "'__nv_fp8_e4m3*'"),
-        ("'hggcStream_t'", "'cudaStream_t'"),
-        ('DeepGEMM auto-generated JIT source file', 'DeepGEMM auto-generated JIT CUDA source file'),
-        ('# Includes (PPU SDK headers)', '# Includes'),
-    ],
-
-    # --- deep_gemm/jit_kernels/utils.py ---
-    'deep_gemm/jit_kernels/utils.py': [
-        ('you may rewrite/fuse this function in a device kernel',
-         'you may rewrite/fuse this function in CUDA'),
-    ],
-
-    # --- deep_gemm/jit_kernels/einsum.py ---
-    # NOTE: einsum.py differences (fused_permute, lru_cache) are not strictly ppu-original changes.
-    # Handled via FULL_FILE_COPY_LIST in reference-dir mode; text-replacement skips this file.
-
-    # --- csrc/apis/layout.hpp ---
-    'csrc/apis/layout.hpp': [
-        # Add SM90/SM100 comments before if-blocks in transform_sf_into_required_layout
-        ('    if (sf.scalar_type() == torch::kFloat and gran_mn == 1 and gran_k == 128 and\n        (arch_major == 9 or disable_ue8m0_cast))',
-         '    // (FP32, 1, 128) on SM90: transform to TMA-aligned and MN-major\n    if (sf.scalar_type() == torch::kFloat and gran_mn == 1 and gran_k == 128 and\n        (arch_major == 9 or disable_ue8m0_cast))'),
-        ('    if (sf.scalar_type() == torch::kFloat and gran_mn == 1 and gran_k == 128 and arch_major == 10) {',
-         '    // (FP32, 1, 128) on SM100: transform to (INT, 1, 128), TMA-aligned and MN-major\n    if (sf.scalar_type() == torch::kFloat and gran_mn == 1 and gran_k == 128 and arch_major == 10) {'),
-        ('    if (sf.scalar_type() == torch::kFloat and gran_mn == 128 and gran_k == 128 and\n        (arch_major == 9 or disable_ue8m0_cast))',
-         '    // (FP32, 128, 128) on SM90: no need to transform, check SFB requirements\n    if (sf.scalar_type() == torch::kFloat and gran_mn == 128 and gran_k == 128 and\n        (arch_major == 9 or disable_ue8m0_cast))'),
-        ('    if (sf.scalar_type() == torch::kFloat and gran_mn == 128 and gran_k == 128 and arch_major == 10) {',
-         '    // (FP32, 128, 128) on SM100: transform to (INT, 1, 128), TMA-aligned and MN-major\n    if (sf.scalar_type() == torch::kFloat and gran_mn == 128 and gran_k == 128 and arch_major == 10) {'),
-        ('    if (sf.scalar_type() == torch::kInt and gran_mn == 1 and gran_k == 128 and arch_major == 10)',
-         '    // (INT, 1, 128) on SM100: transform to TMA-aligned and MN-major\n    if (sf.scalar_type() == torch::kInt and gran_mn == 1 and gran_k == 128 and arch_major == 10)'),
-        # Add SM90/SM100/INT comments in transform_k_grouped_sf_into_required_layout
-        ('    if (sf.scalar_type() == torch::kFloat and arch_major == 9)\n        return get_mn_major_tma_aligned_tensor(sf);',
-         '    // FP32 on SM90\n    if (sf.scalar_type() == torch::kFloat and arch_major == 9)\n        return get_mn_major_tma_aligned_tensor(sf);'),
-        ('    if (sf.scalar_type() == torch::kFloat and arch_major == 10)\n        return get_k_grouped',
-         '    // FP32 on SM100\n    if (sf.scalar_type() == torch::kFloat and arch_major == 10)\n        return get_k_grouped'),
-        ('    if (sf.scalar_type() == torch::kInt and arch_major == 10)\n        DG_HOST_UNREACHABLE',
-         '    // INT on SM100\n    if (sf.scalar_type() == torch::kInt and arch_major == 10)\n        DG_HOST_UNREACHABLE'),
-    ],
-
-    # --- indexing/main.cu ---
-    'indexing/main.cu': [
-        # This file uses nv_bfloat16 (without __ prefix) in the original
-        ('__ppu_bfloat16', 'nv_bfloat16'),
-    ],
-
-    # --- tests/test_fp4_core.py ---
-    # NOTE: test_fp4_core.py comment difference is incidental, not ppu-original related.
-
-    # --- deep_gemm/utils.py ---
-    'deep_gemm/utils.py': [
-        ('upstream PPU0010 (FP32, 128, 128) path',
-         'upstream SM90 (FP32, 128, 128) path'),
-    ],
-
     # --- csrc/utils/utils.hpp ---
     'csrc/utils/utils.hpp': [
         # In this file, the #include should be ATen/cuda/CUDAContext.h, not cuda_runtime.h
         ('#include <hggc_runtime_api.h>', '#include <ATen/cuda/CUDAContext.h>'),
-    ],
-
-    # --- csrc/utils/layout.hpp ---
-    'csrc/utils/layout.hpp': [
-        ('const bool& sfb_check = false,', 'const bool& sm90_sfb_check = false,'),
-        ('if (sfb_check) {', '// SM90 SFB must be contiguous, or contiguous after transposing the last two dimensions\n    if (sm90_sfb_check) {'),
-    ],
-
-    # --- tests/test_fp4_core.py ---
-    'tests/test_fp4_core.py': [
-        ('import argparse\n\n', 'import argparse\n\n# torch.cuda.manual_seed(42)\n\n'),
     ],
 
     # --- tests/test_jit.py ---
@@ -848,71 +532,14 @@ FILE_SPECIFIC_REPLACEMENTS: Dict[str, List[Tuple[str, str]]] = {
         ('jit.get_hgcc_compiler()', 'jit.get_nvcc_compiler()'),
     ],
 
-    # --- tests/run_deep_gemm.py & run_deep_gemm_perf.py ---
-    'tests/run_deep_gemm.py': [
-        ('device_sync_at_exit', 'cuda_sync_at_exit'),
-        ('Device synchronized on exit.', 'CUDA synchronized on exit.'),
-    ],
-    'tests/run_deep_gemm_perf.py': [
-        ('device_sync_at_exit', 'cuda_sync_at_exit'),
-        ('Device synchronized on exit.', 'CUDA synchronized on exit.'),
-    ],
-
-    # --- csrc/jit_kernels/heuristics/common_fp8.hpp ---
-    'csrc/jit_kernels/heuristics/common_fp8.hpp': [
-        # Add SM90/SM100 comments before member fields
-        ('    int num_tma_threads;', '    // SM90\n    int num_tma_threads;'),
-        ('    int num_non_epilogue_threads;', '    // SM100\n    int num_non_epilogue_threads;'),
-    ],
-
-    # --- csrc/jit_kernels/heuristics/common_bf16.hpp ---
-    'csrc/jit_kernels/heuristics/common_bf16.hpp': [
-        # Insert commented-out generate_search_space_v2 function
-        ('{128, 256, 64, 32, 128, 64, 2}};\nstd::tuple',
-         '{128, 256, 64, 32, 128, 64, 2}};\n' + COMMON_BF16_COMMENT_BLOCK + '\nstd::tuple'),
-    ],
-
     # --- csrc/jit_kernels/impls/m_grouped_int8_gemm.hpp ---
     'csrc/jit_kernels/impls/m_grouped_int8_gemm.hpp': [
-        # This file uses nv_bfloat16 without __ prefix in target
-        ('__ppu_bfloat16', 'nv_bfloat16'),
-        # config -> configs in launch_impl
-        ('LaunchConfigHandle& config,', 'LaunchConfigHandle& configs,'),
-        ('launch_kernel(kernel, config,', 'launch_kernel(kernel, configs,'),
         # Profiling param change: layout_info -> m_rows_tensor.data_ptr<int32_t>()
         ('expected_m, layout_info,', 'expected_m, m_rows_tensor.data_ptr<int32_t>(),'),
         # Return statement change (only the 8-space-indented occurrence)
         ('        return std::make_pair(block_m, ceil_div(n, block_n));', '        return;'),
     ],
 
-    # --- csrc/jit_kernels/impls/bf16_gemm.hpp ---
-    'csrc/jit_kernels/impls/bf16_gemm.hpp': [
-        # config -> configs in launch_impl
-        ('LaunchConfigHandle& config,', 'LaunchConfigHandle& configs,'),
-        ('launch_kernel(kernel, config,', 'launch_kernel(kernel, configs,'),
-        # PPU0010 -> Sm80 (specific to this file)
-        ('cutlass::arch::PPU0010', 'cutlass::arch::Sm80'),
-    ],
-
-    # --- csrc/jit_kernels/impls/fp8_gemm.hpp ---
-    'csrc/jit_kernels/impls/fp8_gemm.hpp': [
-        # config -> configs in launch_impl
-        ('LaunchConfigHandle& config,', 'LaunchConfigHandle& configs,'),
-        ('launch_kernel(kernel, config,', 'launch_kernel(kernel, configs,'),
-    ],
-
-    # --- csrc/jit_kernels/impls/int8_gemm.hpp ---
-    'csrc/jit_kernels/impls/int8_gemm.hpp': [
-        # PPU0010 -> Sm80 (specific to this file)
-        ('cutlass::arch::PPU0010', 'cutlass::arch::Sm80'),
-    ],
-
-    # --- csrc/jit_kernels/impls/m_grouped_bf16_gemm.hpp ---
-    'csrc/jit_kernels/impls/m_grouped_bf16_gemm.hpp': [
-        # Add commented line before experts_for_rows declaration
-        ('int64_t min_n = std::min<int64_t>(counts.size(0), num_groups);\n\n        at::Tensor experts_for_rows =',
-         'int64_t min_n = std::min<int64_t>(counts.size(0), num_groups);\n\n        // experts_for_rows = torch.zeros(num_groups, dtype=torch.int32, device=\'cuda\')\n        at::Tensor experts_for_rows ='),
-    ],
 }
 
 
@@ -996,7 +623,7 @@ REQUIRED_AFTER_CONVERSION: Dict[str, List[str]] = {
         '#include <cuda_runtime.h>',
         '#include <nvrtc.h>',
         'std::pair<int, int> get_nvcc_version() const {',
-        'nvcc_path = cuda_home / "bin" / "nvcc";',
+        'nvcc_path = sdk_home / "bin" / "nvcc";',
         'get_env<std::string>("DG_JIT_NVCC_COMPILER")',
         'const auto& [nvcc_major, nvcc_minor] = get_nvcc_version();',
         'signature = fmt::format("NVCC{}.{}", nvcc_major, nvcc_minor);',
@@ -1015,8 +642,6 @@ REQUIRED_AFTER_CONVERSION: Dict[str, List[str]] = {
         'signature = fmt::format("NVRTC{}.{}", major, minor);',
         'and "NVRTC version should be >= 12.3"',
         'kernel.cubin',
-        'cubin_size',
-        'cubin_data',
         'nvcc_path',
     ],
     'deep_gemm/jit/compiler.py': [
@@ -1054,9 +679,9 @@ REQUIRED_AFTER_CONVERSION: Dict[str, List[str]] = {
         'CUBLAS_STATUS_SUCCESS',
         'cublasGetStatusString(e)',
         'DGException("cuBLASLt"',
-        '"NVRTC"',
-        '"CUDA driver"',
-        '"CUDA runtime"',
+        '"HGGCRTC"',
+        '"HGGC driver"',
+        '"HGGC runtime"',
     ],
     # setup.py: NOTE the deliberate survivors -- get_ppu_sdk_version() still shells out
     # to `hgcc --version` (works under CUDA too) and -DDG_HGGC_SUPPORT_PCH stays, so a
@@ -1096,70 +721,22 @@ FULL_FILE_COPY_LIST = [
     'deep_gemm/jit/compiler.py',
     'deep_gemm/jit/interleave_ffma.py',
     'deep_gemm/__init__.py',
-    'deep_gemm/jit_kernels/einsum.py',
 
     # C++ JIT infrastructure
     'csrc/jit/compiler.hpp',
     'csrc/jit/device_runtime.hpp',
 
     # C++ utilities
-    'csrc/utils/compatibility.hpp',
     'csrc/utils/exception.hpp',
-    'csrc/utils/layout.hpp',
     'csrc/utils/utils.hpp',
 
-    # C++ APIs
-    'csrc/apis/layout.hpp',
-    'csrc/apis/runtime.hpp',
-
     # C++ JIT kernel implementations
-    'csrc/jit_kernels/heuristics/common_bf16.hpp',
-    'csrc/jit_kernels/heuristics/common_fp8.hpp',
-    'csrc/jit_kernels/heuristics/common.hpp',
-    'csrc/jit_kernels/heuristics/sm90.hpp',
-    'csrc/jit_kernels/heuristics/sm100.hpp',
-    'csrc/jit_kernels/impls/bf16_gemm.hpp',
-    'csrc/jit_kernels/impls/fp4_gemm.hpp',
-    'csrc/jit_kernels/impls/fp8_gemm.hpp',
-    'csrc/jit_kernels/impls/int8_gemm.hpp',
-    'csrc/jit_kernels/impls/m_grouped_bf16_gemm.hpp',
-    'csrc/jit_kernels/impls/m_grouped_fp4_gemm.hpp',
-    'csrc/jit_kernels/impls/m_grouped_fp8_gemm.hpp',
     'csrc/jit_kernels/impls/m_grouped_int8_gemm.hpp',
-    'csrc/jit_kernels/impls/runtime_utils.hpp',
-    'csrc/jit_kernels/impls/static_kernel_params_verify/fake_bf16_gemm.hpp',
-    'csrc/jit_kernels/impls/static_kernel_params_verify/fake_fp8_gemm.hpp',
-    'csrc/jit_kernels/impls/static_kernel_params_verify/fake_int8_gemm.hpp',
 
     # CUDA kernel headers
-    'deep_gemm/include/deep_gemm/bf16_gemm.cuh',
     'deep_gemm/include/deep_gemm/bf16_gemm_cutlass3.cuh',
-    'deep_gemm/include/deep_gemm/bf16_gemm_cutlass3_overlap_mainloop.cuh',
-    'deep_gemm/include/deep_gemm/bf16_gemm_cutlass3_overlap_prologue.cuh',
-    'deep_gemm/include/deep_gemm/blockwise_gemvt.cuh',
-    'deep_gemm/include/deep_gemm/fp4_gemm_cutlass3.cuh',
-    'deep_gemm/include/deep_gemm/fp4_mma.cuh',
-    'deep_gemm/include/deep_gemm/fp8_gemm.cuh',
-    'deep_gemm/include/deep_gemm/fused_gemm_util.cuh',
-    'deep_gemm/include/deep_gemm/fused_moe_gemm.cuh',
-    'deep_gemm/include/deep_gemm/fused_moe_gemm_with_blkwise_quant.cuh',
-    'deep_gemm/include/deep_gemm/fused_moe_gemm_with_perchannel_quant.cuh',
-    'deep_gemm/include/deep_gemm/gemvt.cuh',
-    'deep_gemm/include/deep_gemm/int8_gemm.cuh',
-    'deep_gemm/include/deep_gemm/int8_gemm_cutlass3.cuh',
-    'deep_gemm/include/deep_gemm/int8_gemm_cutlass3_overlap_prologue.cuh',
-    'deep_gemm/include/deep_gemm/profiling_interface.hpp',
-    'deep_gemm/include/deep_gemm/scheduler_cutlass3.cuh',
-    'deep_gemm/include/deep_gemm/tf32_hc_prenorm_gemm.cuh',
-    'deep_gemm/include/deep_gemm/utils.cuh',
-    'deep_gemm/include/deep_gemm/utils_cutlass3.h',
-    'deep_gemm/include/deep_gemm/utils_rtc.cuh',
     'deep_gemm/include/deep_gemm/w4a16_gemm_cutlass3.cuh',
 
-    # Other
-    'README.md',
-    'compile.sh',
-    'tests/test_fp4_core.py',
 ]
 
 # Default reference directory: NONE (script is self-contained via text replacement rules)
@@ -1392,20 +969,14 @@ def process_file(filepath: str, repo_dir: str, dry_run: bool = False, verbose: b
     # 6. Apply macro replacements
     content = apply_replacements(content, MACRO_REPLACEMENTS)
 
-    # 7. Apply arch replacements
-    content = apply_replacements(content, ARCH_REPLACEMENTS)
-
-    # 8. Apply NVTX variable replacements
-    content = apply_replacements(content, NVTX_VAR_REPLACEMENTS)
-
-    # 9. Apply Python-specific replacements (only for .py files)
+    # 7. Apply Python-specific replacements (only for .py files)
     if filepath.endswith('.py'):
         content = apply_replacements(content, PYTHON_REPLACEMENTS)
 
-    # 10. Apply regex replacements
+    # 8. Apply regex replacements
     content = apply_regex_replacements(content, REGEX_REPLACEMENTS, filepath)
 
-    # 11. Robustness guard: fail loud if PPU/HGGC tokens survived in guarded files
+    # 9. Robustness guard: fail loud if PPU/HGGC tokens survived in guarded files
     verify_required(content, rel_path)
     verify_python_syntax(content, rel_path, original)
 
@@ -1430,36 +1001,6 @@ def process_file(filepath: str, repo_dir: str, dry_run: bool = False, verbose: b
             print(f"  [MODIFIED] {rel_path} ({changes} line changes)")
 
     return changes
-
-
-def handle_file_deletions(repo_dir: str, dry_run: bool = False, verbose: bool = False) -> int:
-    """Delete files/symlinks that only exist in ppu-original version."""
-    changes = 0
-    for rel_path in FILES_TO_DELETE:
-        full_path = os.path.join(repo_dir, rel_path)
-        if os.path.exists(full_path) or os.path.islink(full_path):
-            if dry_run:
-                print(f"  [DRY-RUN] Would delete: {rel_path}")
-            else:
-                os.remove(full_path)
-                print(f"  [DELETED] {rel_path}")
-            changes += 1
-    # Clean up empty directories
-    for rel_dir in DIRS_TO_CLEANUP:
-        full_dir = os.path.join(repo_dir, rel_dir)
-        if os.path.isdir(full_dir):
-            try:
-                if not os.listdir(full_dir):
-                    if dry_run:
-                        print(f"  [DRY-RUN] Would remove empty dir: {rel_dir}")
-                    else:
-                        os.rmdir(full_dir)
-                        print(f"  [RMDIR] {rel_dir}")
-                    changes += 1
-            except OSError:
-                pass
-    return changes
-
 
 def handle_file_renames(repo_dir: str, dry_run: bool = False, verbose: bool = False) -> int:
     """Handle file rename operations."""
@@ -1610,7 +1151,6 @@ def main():
 
     # --- Phase 1: File operations ---
     print("\n[Phase 1] File operations (deletions, renames, restores)...")
-    total_changes += handle_file_deletions(repo_dir, args.dry_run, args.verbose)
     total_changes += handle_file_renames(repo_dir, args.dry_run, args.verbose)
     total_changes += restore_cmakelists(repo_dir, args.dry_run)
 

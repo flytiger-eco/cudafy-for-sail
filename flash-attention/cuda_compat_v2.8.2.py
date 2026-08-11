@@ -56,7 +56,6 @@ CONVERT_HEADER = {
 CONVERT_MACRO = {
     '__HGGCCC_RTC__': '__CUDACC_RTC__',
     '__HGGCCC__': '__CUDACC__',
-    '__HGGC_ARCH__': '__CUDA_ARCH__',
     '__HGGC_NO_HALF_OPERATORS__': '__CUDA_NO_HALF_OPERATORS__',
     '__HGGC_NO_HALF_CONVERSIONS__': '__CUDA_NO_HALF_CONVERSIONS__',
     '__HGGC_NO_HALF2_OPERATORS__': '__CUDA_NO_HALF2_OPERATORS__',
@@ -76,32 +75,6 @@ CONVERT_MACRO = {
 CONVERT_TEXT = {
     'HGGC error': 'CUDA error',
 }
-
-# Applied only on lines containing __CUDA_ARCH__ (after macro replacement)
-CONVERT_ARCH_VALUE = {
-    '>= 100': '>= 800',
-    '== 100': '== 800',
-    '== 150': '== 890',
-    # PPU1.0 is cuda sm80 and PPU1.5 is sm89; the remaining comparison forms use the
-    # same two anchors so an arch check keeps its meaning after the macro swap.
-    '<= 100': '<= 800',
-    '< 100': '< 800',
-    '>= 150': '>= 890',
-    # hgcc arch tops out at 150 (== cuda 890); cuda's next gen 900 has no hgcc code
-    # yet, so ppu-original spells it '> 150' and the compat form uses '>= 900'.
-    '> 150': '>= 900',
-    '<= 150': '<= 890',
-}
-
-# CU -> SM naming: KernelHardwareInfo carries cu_count in the ppu cutlass and sm_count
-# in the cuda-compatible one, so the kernels have to follow the actlize conversion
-# (cuda_compat_v1.0.0.py: cu_count -> sm_count). Word boundaries keep compound names
-# such as available_cu_count out, they are converted by actlize itself.
-CU_TO_SM_RULES = [
-    (re.compile(r'\bcu_count\b'), 'sm_count'),
-    (re.compile(r'\bCU count\b'), 'SM count'),
-]
-
 
 def get_all_convert_maps():
     """Merge all maps."""
@@ -126,25 +99,6 @@ def build_pattern(maps):
 def replace_content(content, maps, pattern):
     """Apply dict-based replacement."""
     return pattern.sub(lambda m: maps[m.group(0)], content)
-
-
-def apply_convert_arch_values(content):
-    """Replace arch values only on lines containing __CUDA_ARCH__."""
-    lines = content.split('\n')
-    new_lines = []
-    for line in lines:
-        if '__CUDA_ARCH__' in line:
-            for old, new in CONVERT_ARCH_VALUE.items():
-                line = line.replace(old, new)
-        new_lines.append(line)
-    return '\n'.join(new_lines)
-
-
-def apply_cu_to_sm(content):
-    """Rename KernelHardwareInfo cu_count to sm_count, comments and traces included."""
-    for pattern, replacement in CU_TO_SM_RULES:
-        content = pattern.sub(replacement, content)
-    return content
 
 
 def _rewrite_torch_ext_setup_py(content, is_fa3):
@@ -234,17 +188,13 @@ def find_source_files(directories):
 
 def transform_content(content, maps, pattern):
     """Apply every conversion to one file's content."""
-    # cu_count is independent of the hggc naming, so it is also renamed in files that
-    # are already in compat mode
-    new_content = apply_cu_to_sm(content)
-
     # Skip the hggc replacement if already in compat mode
-    if ('cudaStream_t' in new_content and '__CUDA_ARCH__' in new_content
-            and 'hggcStream_t' not in new_content):
-        return new_content
+    if ('cudaStream_t' in content and '__CUDA_ARCH__' in content
+            and 'hggcStream_t' not in content):
+        return content
 
-    new_content = replace_content(new_content, maps, pattern)
-    return apply_convert_arch_values(new_content)
+    new_content = replace_content(content, maps, pattern)
+    return new_content
 
 
 def transform_file(filepath, maps, pattern):
