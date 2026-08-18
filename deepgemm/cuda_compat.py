@@ -149,6 +149,12 @@ ENUM_REPLACEMENTS = [
     ('HGTX_VERSION', 'NVTX_VERSION'),
     ('HGTX_EVENT_ATTRIB_STRUCT_SIZE', 'NVTX_EVENT_ATTRIB_STRUCT_SIZE'),
     ('HGTX_MESSAGE_TYPE_ASCII', 'NVTX_MESSAGE_TYPE_ASCII'),
+    # Device attribute enums (for ppu_occ_model.cuh)
+    ('hggcDevAttrMaxSharedMemoryPerMultiprocessor', 'cudaDevAttrMaxSharedMemoryPerMultiprocessor'),
+    ('hggcDevAttrMaxThreadsPerMultiProcessor', 'cudaDevAttrMaxThreadsPerMultiProcessor'),
+    ('hggcDevAttrMaxRegistersPerMultiprocessor', 'cudaDevAttrMaxRegistersPerMultiprocessor'),
+    ('hggcDevAttrMaxThreadsPerBlock', 'cudaDevAttrMaxThreadsPerBlock'),
+    ('hggcDevAttrWarpSize', 'cudaDevAttrWarpSize'),
 ]
 
 # --- Function/API name replacements ---
@@ -188,6 +194,7 @@ FUNC_REPLACEMENTS = [
     ('hggcStreamSynchronize', 'cudaStreamSynchronize'),
     ('hggcStreamIsCapturing', 'cudaStreamIsCapturing'),
     ('hggcGetLastError', 'cudaGetLastError'),
+    ('hggcDeviceGetAttribute', 'cudaDeviceGetAttribute'),
     ('hggcGetErrorName', 'cudaGetErrorName'),
     ('hggcGetErrorString', 'cudaGetErrorString'),
     ('hggcMemcpyAsync', 'cudaMemcpyAsync'),
