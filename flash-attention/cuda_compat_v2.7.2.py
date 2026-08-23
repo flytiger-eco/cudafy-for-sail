@@ -2,7 +2,7 @@
 """
 Flash-Attention PPU-original -> CUDA-Compatible Transformation Script.
 
-Converts flash-attention (FA2 + FA3) from ppu-original compilation to nvcc wrapper /
+Converts flash-attention (FA2) from ppu-original compilation to nvcc wrapper /
 CUDAExtension compilation mode. Pure regex/dict replacement, no git dependency.
 Follows acompute's replace_cuda approach.
 
@@ -50,19 +50,7 @@ CONVERT_HEADER = {
     '<hgtx3/hgToolsExt.h>': '<nvtx3/nvToolsExt.h>',
 }
 
-CONVERT_CUTLASS_SYMBOL = {
-    'PPU_16x8x16_F32F16F16F32_TN': 'SM80_16x8x16_F32F16F16F32_TN',
-    'PPU_16x8x16_F32BF16BF16F32_TN': 'SM80_16x8x16_F32BF16BF16F32_TN',
-    'PPU_16x8x8_F32F16F16F32_TN': 'SM75_16x8x8_F32F16F16F32_TN',
-    'PPU_U32x4_LDSM_N': 'SM75_U32x4_LDSM_N',
-    'PPU_U16x8_LDSM_T': 'SM75_U16x8_LDSM_T',
-    'PPU_CP_ASYNC_CACHEGLOBAL': 'SM80_CP_ASYNC_CACHEGLOBAL',
-    'PPU_CP_ASYNC_CACHEALWAYS': 'SM80_CP_ASYNC_CACHEALWAYS',
-    'CUTE_ARCH_CP_ASYNC_PPU_ENABLED': 'CUTE_ARCH_CP_ASYNC_SM80_ENABLED',
-}
-
 CONVERT_MACRO = {
-    '__HGGC_ARCH__': '__CUDA_ARCH__',
     '__HGGCCC_RTC__': '__CUDACC_RTC__',
     '__HGGCCC__': '__CUDACC__',
     '__HGGC_NO_HALF_OPERATORS__': '__CUDA_NO_HALF_OPERATORS__',
@@ -78,24 +66,21 @@ CONVERT_MACRO = {
     'hgtxDomainRangePushEx': 'nvtxDomainRangePushEx',
     'hgtxDomainRangePop': 'nvtxDomainRangePop',
     'use_hgtx_': 'use_nvtx_',
-    'HGGC error': 'CUDA error',
 }
 
-# Applied only on lines containing __CUDA_ARCH__ (after macro replacement)
-CONVERT_ARCH_VALUE = {
-    '>= 100': '>= 800',
-    '== 100': '== 800',
-    '== 150': '== 890',
+# Diagnostic strings, renamed together with the API they report on
+CONVERT_TEXT = {
+    'HGGC error': 'CUDA error',
 }
 
 
 def get_all_convert_maps():
     """Merge all maps."""
     merged = {}
-    merged.update(CONVERT_CUTLASS_SYMBOL)
     merged.update(CONVERT_RUNTIME_API)
     merged.update(CONVERT_HEADER)
     merged.update(CONVERT_MACRO)
+    merged.update(CONVERT_TEXT)
     return merged
 
 
@@ -112,18 +97,6 @@ def build_pattern(maps):
 def replace_content(content, maps, pattern):
     """Apply dict-based replacement."""
     return pattern.sub(lambda m: maps[m.group(0)], content)
-
-
-def apply_convert_arch_values(content):
-    """Replace arch values only on lines containing __CUDA_ARCH__."""
-    lines = content.split('\n')
-    new_lines = []
-    for line in lines:
-        if '__CUDA_ARCH__' in line:
-            for old, new in CONVERT_ARCH_VALUE.items():
-                line = line.replace(old, new)
-        new_lines.append(line)
-    return '\n'.join(new_lines)
 
 
 # =============================================================================
@@ -217,6 +190,17 @@ def find_source_files(directories):
     return files
 
 
+def transform_content(content, maps, pattern):
+    """Apply every conversion to one file's content."""
+    # Skip the hggc replacement if already in compat mode
+    if ('cudaStream_t' in content and '__CUDA_ARCH__' in content
+            and 'hggcStream_t' not in content):
+        return content
+
+    new_content = replace_content(content, maps, pattern)
+    return new_content
+
+
 def transform_file(filepath, maps, pattern):
     """Apply the conversions to a single file."""
     try:
@@ -225,13 +209,7 @@ def transform_file(filepath, maps, pattern):
     except (UnicodeDecodeError, UnicodeError):
         return False  # Skip binary or non-UTF-8 files
 
-    # Skip if already in compat mode
-    if 'cudaStream_t' in content and '__CUDA_ARCH__' in content and 'hggcStream_t' not in content:
-        return False
-
-    new_content = replace_content(content, maps, pattern)
-    new_content = apply_convert_arch_values(new_content)
-
+    new_content = transform_content(content, maps, pattern)
     if new_content == content:
         return False
 
@@ -280,9 +258,7 @@ def main():
     for f in files:
         if args.dry_run:
             content = open(f).read()
-            new = replace_content(content, maps, pattern)
-            new = apply_convert_arch_values(new)
-            if new != content:
+            if transform_content(content, maps, pattern) != content:
                 n_transformed += 1
                 if args.verbose:
                     print(f"    [dry-run] {f}")

@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-FlashMLA PPU-original → CUDA-Compatible Transformation Script.
+FlashMLA PPU-original -> CUDA-Compatible Transformation Script.
 
-Refactored with lookup-table approach for maintainability.
 Converts a FlashMLA ppu-original source tree into a CUDA-compatible one.
+Token conversion is a pure regex/dict replacement, mirroring the flash-attention
+scripts; the per-file rewrites, multi-line regexes and __HGGCCC__ guards are the
+FlashMLA-specific payload on top of that shared engine.
 
 Usage:
     python cuda_compat.py [TARGET_DIR] [--dry-run] [--verbose]
+
+Run from the FlashMLA root directory, or pass it as TARGET_DIR.
 """
 
 import argparse
@@ -14,535 +18,285 @@ import os
 import re
 import sys
 import time
-from typing import List, Tuple, Dict
 
 # =============================================================================
-# Lookup tables — organized by category.
-# Within each category, longer/more-specific patterns MUST come first
-# to avoid partial matches on shorter substrings.
+# Conversion maps (hggc/PPU -> cuda/CU/NV)
+# Sorted longest-first at runtime by build_pattern, so declaration order carries
+# no meaning and overlapping tokens resolve by length in a single pass.
+# __HGGC_ARCH__ is intentionally absent: the PPU hgcc frontend auto-defines it,
+# so the cuda-compatible build keeps the native arch guard as-is.
 # =============================================================================
 
-INCLUDE_REPLACEMENTS: List[Tuple[str, str]] = [
-    ('<hggc_runtime.h>', '<cuda_runtime.h>'),
-    ('<hggc_fp16.h>', '<cuda_fp16.h>'),
-    ('<hggc_bf16.h>', '<cuda_bf16.h>'),
-    ('<hggc_pipeline.h>', '<cuda_pipeline.h>'),
-    ('<hggc_awbarrier.h>', '<cuda_awbarrier.h>'),
-    ('<hggc_ad.h>', '"cuda_ad.h"'),
-    ('"hggc_runtime.h"', '"cuda_runtime.h"'),
-    ('<hgtx3/hgToolsExt.h>', '<nvtx3/nvToolsExt.h>'),
-]
+CONVERT_RUNTIME_API = {
+    # --- functions ---
+    'hggcOccupancyMaxPotentialBlockSize': 'cudaOccupancyMaxPotentialBlockSize',
+    'hggcTriggerProgrammaticLaunchCompletion': 'cudaTriggerProgrammaticLaunchCompletion',
+    'hggcGridDependencySynchronize': 'cudaGridDependencySynchronize',
+    'hggcDeviceGetAttribute': 'cudaDeviceGetAttribute',
+    'hggcGetDeviceProperties': 'cudaGetDeviceProperties',
+    'hggcGetFuncBySymbol': 'cudaGetFuncBySymbol',
+    'hggcFuncSetAttribute': 'cudaFuncSetAttribute',
+    'hggcFuncGetAttributes': 'cudaFuncGetAttributes',
+    'hggcGetErrorString': 'cudaGetErrorString',
+    'hggcGetLastError': 'cudaGetLastError',
+    'hggcGetErrorName': 'cudaGetErrorName',
+    'hggcPeekAtLastError': 'cudaPeekAtLastError',
+    'hggcGetDevice': 'cudaGetDevice',
+    'hggcLaunchKernelEx': 'cudaLaunchKernelEx',
+    'hggcLaunchKernel': 'cudaLaunchKernel',
+    'hggcThreadExchangeStreamCaptureMode': 'cudaThreadExchangeStreamCaptureMode',
+    'hggcStreamCreateWithFlags': 'cudaStreamCreateWithFlags',
+    'hggcStreamIsCapturing': 'cudaStreamIsCapturing',
+    'hggcStreamSynchronize': 'cudaStreamSynchronize',
+    'hggcStreamDestroy': 'cudaStreamDestroy',
+    'hggcMemcpyAsync': 'cudaMemcpyAsync',
+    'hggcMemsetAsync': 'cudaMemsetAsync',
+    'hggcDeviceSynchronize': 'cudaDeviceSynchronize',
+    'hggcSetDevice': 'cudaSetDevice',
+    'hggcMemGetInfo': 'cudaMemGetInfo',
+    'hggcMalloc': 'cudaMalloc',
+    'hggcFree': 'cudaFree',
+    'hggcMemcpy': 'cudaMemcpy',
+    'hggcEventElapsedTime': 'cudaEventElapsedTime',
+    'hggcEventSynchronize': 'cudaEventSynchronize',
+    'hggcEventCreate': 'cudaEventCreate',
+    'hggcEventDestroy': 'cudaEventDestroy',
+    'hggcEventRecord': 'cudaEventRecord',
+    'hgLaunchKernelExAD': 'cuLaunchKernelExAD',
+    'hgGetErrorName': 'cuGetErrorName',
+    'hgGetErrorString': 'cuGetErrorString',
 
-ENUM_REPLACEMENTS: List[Tuple[str, str]] = [
-    # Longer compound names first (may embed type/function prefixes)
-    ('hggcLaunchAttributeProgrammaticStreamSerialization', 'cudaLaunchAttributeProgrammaticStreamSerialization'),
-    ('hggcFuncAttributeMaxDynamicSharedMemorySize', 'cudaFuncAttributeMaxDynamicSharedMemorySize'),
-    ('hggcOccupancyMaxActiveBlocksPerMultiprocessor', 'cudaOccupancyMaxActiveBlocksPerMultiprocessor'),
-    ('hggcOccupancyDisableCachingOverride', 'cudaOccupancyDisableCachingOverride'),
-    ('hggcDevAttrMaxSharedMemoryPerMultiprocessor', 'cudaDevAttrMaxSharedMemoryPerMultiprocessor'),
-    ('hggcDevAttrMaxSharedMemoryPerBlockOptin', 'cudaDevAttrMaxSharedMemoryPerBlockOptin'),
-    ('hggcDevAttrMultiProcessorCount', 'cudaDevAttrMultiProcessorCount'),
-    ('hggcDevAttrComputeCapabilityMajor', 'cudaDevAttrComputeCapabilityMajor'),
-    ('hggcDevAttrComputeCapabilityMinor', 'cudaDevAttrComputeCapabilityMinor'),
-    ('hggcStreamCaptureModeRelaxed', 'cudaStreamCaptureModeRelaxed'),
-    ('hggcStreamCaptureModeNone', 'cudaStreamCaptureStatusNone'),
-    ('hggcStreamCaptureStatusNone', 'cudaStreamCaptureStatusNone'),
-    ('hggcStreamNonBlocking', 'cudaStreamNonBlocking'),
-    ('hggcStreamDefault', 'cudaStreamDefault'),
-    ('hggcMemcpyDeviceToHost', 'cudaMemcpyDeviceToHost'),
-    ('hggcMemcpyDeviceToDevice', 'cudaMemcpyDeviceToDevice'),
-    ('hggcMemcpyHostToDevice', 'cudaMemcpyHostToDevice'),
-    ('hggcMemcpyHostToHost', 'cudaMemcpyHostToHost'),
-    ('hggcErrorUnknown', 'cudaErrorUnknown'),
-    ('HGGC_SUCCESS', 'CUDA_SUCCESS'),
-    ('HGAD_LAUNCH_ATTRIBUTE_IGNORE', 'CUAD_LAUNCH_ATTRIBUTE_IGNORE'),
-    # Short patterns last
-    ('hggcSuccess', 'cudaSuccess'),
-    ('hggcError', 'cudaError'),
-]
+    # --- types ---
+    'hggcLaunchConfig_t': 'cudaLaunchConfig_t',
+    'hggcLaunchAttribute': 'cudaLaunchAttribute',
+    'hggcStream_t': 'cudaStream_t',
+    'hggcFunction_t': 'cudaFunction_t',
+    'hggcDataType_t': 'cudaDataType_t',
+    'hggcEvent_t': 'cudaEvent_t',
+    'hggcFuncAttributes': 'cudaFuncAttributes',
+    'hggcFuncAttribute': 'cudaFuncAttribute',
+    'hggcMemcpyKind': 'cudaMemcpyKind',
+    'hggcStreamCaptureStatus': 'cudaStreamCaptureStatus',
+    'hggcStreamCaptureMode': 'cudaStreamCaptureMode',
+    'HGlaunchAttributeAD': 'CUlaunchAttributeAD',
+    'HGlaunchConfigAD': 'CUlaunchConfigAD',
+    'HGfunction': 'CUfunction',
+    'HGresult': 'CUresult',
 
-TYPE_REPLACEMENTS: List[Tuple[str, str]] = [
-    ('hggcLaunchConfig_t', 'cudaLaunchConfig_t'),
-    ('hggcLaunchAttribute', 'cudaLaunchAttribute'),
-    ('hggcStream_t', 'cudaStream_t'),
-    ('hggcFunction_t', 'cudaFunction_t'),
-    ('hggcDataType_t', 'cudaDataType_t'),
-    ('hggcEvent_t', 'cudaEvent_t'),
-    ('hggcFuncAttributes', 'cudaFuncAttributes'),
-    ('hggcFuncAttribute', 'cudaFuncAttribute'),
-    ('hggcMemcpyKind', 'cudaMemcpyKind'),
-    ('hggcStreamCaptureStatus', 'cudaStreamCaptureStatus'),
-    ('hggcStreamCaptureMode', 'cudaStreamCaptureMode'),
-    ('HGlaunchAttributeAD', 'CUlaunchAttributeAD'),
-    ('HGlaunchConfigAD', 'CUlaunchConfigAD'),
-    ('HGfunction', 'CUfunction'),
-    ('HGresult', 'CUresult'),
-    ('__hg_fp8', '__nv_fp8'),
-]
+    # --- enums / constants ---
+    'hggcLaunchAttributeProgrammaticStreamSerialization': 'cudaLaunchAttributeProgrammaticStreamSerialization',
+    'hggcFuncAttributeMaxDynamicSharedMemorySize': 'cudaFuncAttributeMaxDynamicSharedMemorySize',
+    'hggcOccupancyMaxActiveBlocksPerMultiprocessor': 'cudaOccupancyMaxActiveBlocksPerMultiprocessor',
+    'hggcOccupancyDisableCachingOverride': 'cudaOccupancyDisableCachingOverride',
+    'hggcDevAttrMaxSharedMemoryPerMultiprocessor': 'cudaDevAttrMaxSharedMemoryPerMultiprocessor',
+    'hggcDevAttrMaxSharedMemoryPerBlockOptin': 'cudaDevAttrMaxSharedMemoryPerBlockOptin',
+    'hggcDevAttrMultiProcessorCount': 'cudaDevAttrMultiProcessorCount',
+    'hggcDevAttrComputeCapabilityMajor': 'cudaDevAttrComputeCapabilityMajor',
+    'hggcDevAttrComputeCapabilityMinor': 'cudaDevAttrComputeCapabilityMinor',
+    'hggcStreamCaptureModeRelaxed': 'cudaStreamCaptureModeRelaxed',
+    'hggcStreamCaptureStatusNone': 'cudaStreamCaptureStatusNone',
+    'hggcStreamNonBlocking': 'cudaStreamNonBlocking',
+    'hggcStreamDefault': 'cudaStreamDefault',
+    'hggcMemcpyDeviceToHost': 'cudaMemcpyDeviceToHost',
+    'hggcMemcpyDeviceToDevice': 'cudaMemcpyDeviceToDevice',
+    'hggcMemcpyHostToDevice': 'cudaMemcpyHostToDevice',
+    'hggcMemcpyHostToHost': 'cudaMemcpyHostToHost',
+    'hggcErrorUnknown': 'cudaErrorUnknown',
+    'hggcSuccess': 'cudaSuccess',
+    'hggcError': 'cudaError',
+    'HGGC_SUCCESS': 'CUDA_SUCCESS',
+    'HGAD_LAUNCH_ATTRIBUTE_IGNORE': 'CUAD_LAUNCH_ATTRIBUTE_IGNORE',
 
-# bfloat16 type names require word-boundary matching so that e.g.
-# __ppu_bfloat162 does not also match inside __ppu_bfloat162_raw.
-WORD_BOUNDARY_REPLACEMENTS: List[Tuple[str, str]] = [
-    ('__ppu_bfloat162', '__nv_bfloat162'),
-    ('__ppu_bfloat16_raw', '__nv_bfloat16_raw'),
-    ('__ppu_bfloat16', '__nv_bfloat16'),
-]
-
-FUNC_REPLACEMENTS: List[Tuple[str, str]] = [
-    ('hggcOccupancyMaxPotentialBlockSize', 'cudaOccupancyMaxPotentialBlockSize'),
-    ('hggcTriggerProgrammaticLaunchCompletion', 'cudaTriggerProgrammaticLaunchCompletion'),
-    ('hggcGridDependencySynchronize', 'cudaGridDependencySynchronize'),
-    ('hggcDeviceGetAttribute', 'cudaDeviceGetAttribute'),
-    ('hggcGetDeviceProperties', 'cudaGetDeviceProperties'),
-    ('hggcGetFuncBySymbol', 'cudaGetFuncBySymbol'),
-    ('hggcFuncSetAttribute', 'cudaFuncSetAttribute'),
-    ('hggcFuncGetAttributes', 'cudaFuncGetAttributes'),
-    ('hggcGetErrorString', 'cudaGetErrorString'),
-    ('hggcGetLastError', 'cudaGetLastError'),
-    ('hggcGetErrorName', 'cudaGetErrorName'),
-    ('hggcPeekAtLastError', 'cudaPeekAtLastError'),
-    ('hggcGetDevice', 'cudaGetDevice'),
-    ('hggcLaunchKernelExAD', 'cuLaunchKernelExAD'),
-    ('hggcLaunchKernelExC', 'cudaLaunchKernelEx'),
-    ('hggcLaunchKernelEx', 'cudaLaunchKernelEx'),
-    ('hggcLaunchKernel', 'cudaLaunchKernel'),
-    ('hggcThreadExchangeStreamCaptureMode', 'cudaThreadExchangeStreamCaptureMode'),
-    ('hggcStreamCreateWithFlags', 'cudaStreamCreateWithFlags'),
-    ('hggcStreamIsCapturing', 'cudaStreamIsCapturing'),
-    ('hggcStreamSynchronize', 'cudaStreamSynchronize'),
-    ('hggcStreamDestroy', 'cudaStreamDestroy'),
-    ('hggcMemcpyAsync', 'cudaMemcpyAsync'),
-    ('hggcMemsetAsync', 'cudaMemsetAsync'),
-    ('hggcDeviceSynchronize', 'cudaDeviceSynchronize'),
-    ('hggcSetDevice', 'cudaSetDevice'),
-    ('hggcMemGetInfo', 'cudaMemGetInfo'),
-    ('hggcMalloc', 'cudaMalloc'),
-    ('hggcFree', 'cudaFree'),
-    ('hggcMemcpy', 'cudaMemcpy'),
-    ('hggcEventElapsedTime', 'cudaEventElapsedTime'),
-    ('hggcEventSynchronize', 'cudaEventSynchronize'),
-    ('hggcEventCreate', 'cudaEventCreate'),
-    ('hggcEventDestroy', 'cudaEventDestroy'),
-    ('hggcEventRecord', 'cudaEventRecord'),
-    ('hgLaunchKernelExAD', 'cuLaunchKernelExAD'),
-    ('hgGetErrorName', 'cuGetErrorName'),
-    ('hgGetErrorString', 'cuGetErrorString'),
-]
-
-MACRO_REPLACEMENTS: List[Tuple[str, str]] = [
-    ('__HGGC_ARCH__', '__CUDA_ARCH__'),
-]
-
-NVTX_REPLACEMENTS: List[Tuple[str, str]] = [
-    ('hgtxEventAttributes_t', 'nvtxEventAttributes_t'),
-    ('hgtxDomainHandle_t', 'nvtxDomainHandle_t'),
-    ('hgtxDomainCreateA', 'nvtxDomainCreateA'),
-    ('hgtxDomainDestroy', 'nvtxDomainDestroy'),
-    ('hgtxDomainRangePushEx', 'nvtxDomainRangePushEx'),
-    ('hgtxDomainRangePop', 'nvtxDomainRangePop'),
-    ('HGTX_MESSAGE_TYPE_ASCII', 'NVTX_MESSAGE_TYPE_ASCII'),
-    ('HGTX_VERSION', 'NVTX_VERSION'),
-    ('use_hgtx_', 'use_nvtx_'),
-]
-
-# Processing order: include → enum → type → func → macro → nvtx
-ALL_CATEGORY_REPLACEMENTS = [
-    INCLUDE_REPLACEMENTS,
-    ENUM_REPLACEMENTS,
-    TYPE_REPLACEMENTS,
-    FUNC_REPLACEMENTS,
-    MACRO_REPLACEMENTS,
-    NVTX_REPLACEMENTS,
-]
-
-# Arch value reversals: applied only on lines containing __CUDA_ARCH__
-ARCH_VALUE_REPLACEMENTS = [
-    ('>= 100', '>= 800'),
-    ('== 100', '== 800'),
-    ('== 150', '== 890'),
-]
-
-# =============================================================================
-# Regex-based replacements: (pattern, replacement, file_glob)
-# file_glob is matched against filepath via endswith()
-# =============================================================================
-
-REGEX_REPLACEMENTS: List[Tuple[str, str, str]] = [
-    # combine.cuh: strip (const void*) and (void**)& casts from cudaLaunchKernelEx args
-    (r'cudaLaunchKernelEx\(([^,]+),\s*\(const void\*\)([^,]+),\s*\(void\*\*\)&([^)]+)\)',
-     r'cudaLaunchKernelEx(\1, \2, \3)', 'combine.cuh'),
-
-    # C10_CUDA_CHECK wrapping for cudaFuncSetAttribute (single-line)
-    (r'^([ \t]+)cudaFuncSetAttribute\(([^)]+)\);',
-     r'\1C10_CUDA_CHECK(cudaFuncSetAttribute(\2));', 'splitkv_mla.cuh'),
-    (r'^([ \t]+)cudaFuncSetAttribute\(([^)]+)\);',
-     r'\1C10_CUDA_CHECK(cudaFuncSetAttribute(\2));', 'splitkv_mla_kernel.cuh'),
-    (r'^([ \t]+)cudaFuncSetAttribute\(([^)]+)\);',
-     r'\1C10_CUDA_CHECK(cudaFuncSetAttribute(\2));', 'sparse_prefill_wg.cuh'),
-
-    # SM detection for splitkv_mla_kernel
-    (r'            int sm_count = get_num_sm\(get_current_device\(\)\);\s*\n'
-     r'            if \(sm_count == 64\) sm_count = 20;',
-     r'            auto dprops = at::cuda::getCurrentDeviceProperties();\n'
-     r'\n'
-     r'            int sm_count = dprops->multiProcessorCount;\n'
-     r'            if (std::string(dprops->name).find("810E") != std::string::npos) {\n'
-     r'                sm_count = 20;\n'
-     r'            }',
-     'splitkv_mla_kernel.cuh'),
-
-    # SM detection for sparse_prefill_wg
-    (r'        int sm_count = get_num_sm\(get_current_device\(\)\);\s*\n'
-     r'            if \(sm_count == 64\) sm_count = 20;',
-     r'        auto dprops = at::cuda::getCurrentDeviceProperties();\n'
-     r'\n'
-     r'            int sm_count = dprops->multiProcessorCount;\n'
-     r'            if (std::string(dprops->name).find("810E") != std::string::npos) {\n'
-     r'                sm_count = 20;\n'
-     r'            }',
-     'sparse_prefill_wg.cuh'),
-
-    # SM detection for splitkv_mla.h
-    (r'    \{\n'
-     r'        auto \[cap_major, cap_minor\] = get_compute_capability\(get_current_device\(\)\);\s*\n'
-     r'        if \(cap_major < 8 \|\| \(cap_major == 8 && cap_minor < 9\)\)\s*\n'
-     r'            warp_interleave = false;\s*\n'
-     r'    \}',
-     r'    auto dprops = at::cuda::getCurrentDeviceProperties();\n'
-     r'    if (std::string(dprops->name).find("610") != std::string::npos)\n'
-     r'        warp_interleave = false;',
-     'splitkv_mla.h'),
-
-    # SM detection for utils.h
-    (r'            int sm_count = get_num_sm\(get_current_device\(\)\);\s*\n'
-     r'            if \(sm_count == 64\) sm_count = 20;',
-     r'            auto dprops = at::cuda::getCurrentDeviceProperties();\n'
-     r'            int sm_count = dprops->multiProcessorCount == 64 ? 20 : dprops->multiProcessorCount;',
-     'utils.h'),
-
-    # kernel_traits.h: remove extra SmemCopyAtomQ/K fallback
-    (r'(using SmemCopyAtomTransposed = Copy_Atom<DefaultCopy, elem_type>;\n)'
-     r'    using SmemCopyAtomQ = SmemCopyAtom;\n'
-     r'    using SmemCopyAtomK = SmemCopyAtom;\n',
-     r'\1', 'kernel_traits.h'),
-]
-
-# =============================================================================
-# File-specific replacements: {relative_path: [(old, new), ...]}
-# Applied BEFORE category tables so they can override general patterns.
-# =============================================================================
-
-FILE_SPECIFIC_REPLACEMENTS: Dict[str, List[Tuple[str, str]]] = {
-
-    # --- kerutils host/host.h ---
-    'csrc/kerutils/include/kerutils/host/host.h': [
-        (
-            '#include <hggc_runtime.h>',
-            '#include <cuda_runtime_api.h>\n#include <ATen/cuda/CUDAContext.h>'
-        ),
-        (
-            'static inline bool is_sm89_or_newer() {\n'
-            '    int device = 0;\n'
-            '    hggcGetDevice(&device);\n'
-            '    int major = 0, minor = 0;\n'
-            '    hggcDeviceGetAttribute(&major, hggcDevAttrComputeCapabilityMajor, device);\n'
-            '    hggcDeviceGetAttribute(&minor, hggcDevAttrComputeCapabilityMinor, device);\n'
-            '    return (major > 8) || (major == 8 && minor >= 9);\n'
-            '}',
-            'static inline bool is_sm89_or_newer() {\n'
-            '    auto dprops = at::cuda::getCurrentDeviceProperties();\n'
-            '    return (dprops->major > 8) || (dprops->major == 8 && dprops->minor >= 9);\n'
-            '}'
-        ),
-    ],
-
-    # --- kerutils common/common.h ---
-    'csrc/kerutils/include/kerutils/common/common.h': [
-        (
-            '#include <hggc_runtime.h>',
-            '#if !defined(__CUDACC_RTC__)\n#include "cuda_runtime.h"\n#endif'
-        ),
-        (
-            'fprintf(stderr, "HGGC error (%s:%d): %s\\n", __FILE__, __LINE__,',
-            'fprintf(stderr, "CUDA error (%s:%d): %s\\n", __FILE__, __LINE__,'
-        ),
-    ],
-
-    # --- kerutils host/hardware_info.h ---
-    'csrc/kerutils/include/kerutils/host/hardware_info.h': [
-        ('#include <cstdio>\n#include <cstdlib>\n', ''),
-        (
-            '#include <hggc_runtime.h>',
-            '#if !defined(__CUDACC_RTC__)\n#include "cuda_runtime.h"\n#endif'
-        ),
-        # Drop the duplicate CHECK_CUDA definition, common.h already provides it
-        (
-            '#define CHECK_CUDA(call)                                                       \\\n'
-            '  do {                                                                         \\\n'
-            '    hggcError_t status_ = call;                                                \\\n'
-            '    if (status_ != hggcSuccess) {                                              \\\n'
-            '      fprintf(stderr, "HGGC error (%s:%d): %s\\n", __FILE__, __LINE__,          \\\n'
-            '              hggcGetErrorString(status_));                                    \\\n'
-            '      exit(1);                                                                 \\\n'
-            '    }                                                                          \\\n'
-            '  } while (0)\n'
-            '\n',
-            ''
-        ),
-    ],
-
-    # --- api/common.h ---
-    'csrc/api/common.h': [
-        # Remove hggcStream_t forward declaration
-        (
-            '#include <c10/cuda/CUDAStream.h>\n'
-            '// Forward-declare hggcStream_t so function signatures match between .cu and .cpp\n'
-            'typedef struct HGstream_st* hggcStream_t;',
-            '#include <c10/cuda/CUDAStream.h>'
-        ),
-    ],
-
-    # --- csrc/params.h (fp16/bf16/runtime headers handled by INCLUDE table) ---
-    'csrc/params.h': [
-        (
-            '#include <hggc_runtime.h>',
-            '#include <hggc_runtime.h>\n#include <ATen/cuda/CUDAContext.h>'
-        ),
-    ],
-
-    # --- csrc/utils.h (fp16/bf16 headers handled by INCLUDE table) ---
-    'csrc/utils.h': [
-        (
-            '        printf("HG driver error: %s: %s\\n",                \\\n'
-            '               (_name ? _name : "?"), (_str ? _str : "?")); \\\n',
-            '        TORCH_CHECK(false, "CUDA driver error ",            \\\n'
-            '        (_name ? _name : "?"), ": ", (_str ? _str : "?"));  \\\n'
-        ),
-    ],
-
-    # --- __HGGCCC__ guards around cuda_ad.h are applied post-conversion
-    #     (see apply_hggccc_guards) because the input uses <hggc_ad.h>. ---
+    # --- device built-in types ---
+    '__hg_fp8': '__nv_fp8',
+    '__ppu_bfloat162': '__nv_bfloat162',
+    '__ppu_bfloat16_raw': '__nv_bfloat16_raw',
+    '__ppu_bfloat16': '__nv_bfloat16',
 }
 
-# Files whose cuda_ad.h include must be wrapped in #ifdef __HGGCCC__ for nvcc.
-HGGCCC_GUARD_FILES = {
-    'csrc/ppu/decode/dense/splitkv_mla_kernel.cuh',
-    'csrc/ppu/decode/sparse/splitkv_mla.cuh',
-    'csrc/ppuxx/decode/combine/combine.cuh',
+CONVERT_HEADER = {
+    '<hggc_runtime.h>': '<cuda_runtime.h>',
+    '"hggc_runtime.h"': '"cuda_runtime.h"',
+    '<hggc_fp16.h>': '<cuda_fp16.h>',
+    '<hggc_bf16.h>': '<cuda_bf16.h>',
+    '<hggc_pipeline.h>': '<cuda_pipeline.h>',
+    '<hggc_awbarrier.h>': '<cuda_awbarrier.h>',
+    '<hggc_ad.h>': '"cuda_ad.h"',
+    '<hgtx3/hgToolsExt.h>': '<nvtx3/nvToolsExt.h>',
 }
 
+# The hgtx (profiling) family plus the RTC compiler macro. __HGGC_ARCH__ and
+# __HGGCCC__ are NOT converted: the PPU frontend auto-defines both, and the
+# sources use __HGGCCC__ as the platform discriminator for the driver-AD path.
+CONVERT_MACRO = {
+    '__HGGCCC_RTC__': '__CUDACC_RTC__',
+    'HGTX_MESSAGE_TYPE_ASCII': 'NVTX_MESSAGE_TYPE_ASCII',
+    'HGTX_VERSION': 'NVTX_VERSION',
+    'hgtxEventAttributes_t': 'nvtxEventAttributes_t',
+    'hgtxDomainHandle_t': 'nvtxDomainHandle_t',
+    'hgtxDomainCreateA': 'nvtxDomainCreateA',
+    'hgtxDomainDestroy': 'nvtxDomainDestroy',
+    'hgtxDomainRangePushEx': 'nvtxDomainRangePushEx',
+    'hgtxDomainRangePop': 'nvtxDomainRangePop',
+    'use_hgtx_': 'use_nvtx_',
+}
+
+# Diagnostic strings, renamed together with the API they report on, plus the one
+# declaration that has to disappear instead of being renamed: api/common.h
+# forward-declares hggcStream_t because the PPU SDK headers are not on the host
+# compiler's include path, while the compat build gets cudaStream_t from
+# cuda_runtime.h via torch -- renaming it would collide with that typedef.
+# Longest-first matching makes this block win over the bare hggcStream_t entry.
+CONVERT_TEXT = {
+    '// Forward-declare hggcStream_t so function signatures match between .cu and .cpp\n'
+    'typedef struct HGstream_st* hggcStream_t;\n': '',
+    'HG driver error': 'CUDA driver error',
+    'HGGC error': 'CUDA error',
+}
+
+
+def get_all_convert_maps():
+    """Merge all maps."""
+    merged = {}
+    merged.update(CONVERT_RUNTIME_API)
+    merged.update(CONVERT_HEADER)
+    merged.update(CONVERT_MACRO)
+    merged.update(CONVERT_TEXT)
+    return merged
+
+
 # =============================================================================
-# setup.py replacements
+# Replacement engine (acompute style)
 # =============================================================================
 
-SETUP_PY_REPLACEMENTS: List[Tuple[str, str]] = [
+def build_pattern(maps):
+    """Build compiled regex from maps dict, longest key first."""
+    sorted_keys = sorted(maps.keys(), key=lambda x: -len(x))
+    return re.compile("|".join(re.escape(k) for k in sorted_keys))
+
+
+def replace_content(content, maps, pattern):
+    """Apply dict-based replacement in a single pass."""
+    return pattern.sub(lambda m: maps[m.group(0)], content)
+
+
+def _rewrite_torch_ext_setup_py(content):
+    """Transform a setup.py that already uses torch BuildExtension/CUDAExtension.
+
+    Beyond the hgcc identifiers, the compat build also needs the ppu arch flag, the
+    cuda driver library and the ptxas resource report. The two insertions are guarded
+    so a second run does not duplicate them.
+    """
+    # --- hgcc -> nvcc identifiers ---
+    content = content.replace('hgcc', 'nvcc')
+
     # --- ppu arch flags -> gencode ---
-    ('cc_flag.append("-arch=ppu_10")\n'
-     'cc_flag.append("-arch=ppu_15")\n',
-     'cc_flag.append("-gencode")\n'
-     'cc_flag.append("arch=compute_80,code=sm_80")\n'),
+    content = content.replace(
+        'cc_flag.append("-arch=ppu_10")\n'
+        'cc_flag.append("-arch=ppu_15")\n',
+        'cc_flag.append("-gencode")\n'
+        'cc_flag.append("arch=compute_80,code=sm_80")\n')
 
-    # --- cuda driver library ---
-    ('        sources=get_sources(),\n'
-     '        extra_compile_args={\n',
-     '        sources=get_sources(),\n'
-     "        libraries=['cuda'],\n"
-     '        extra_compile_args={\n'),
+    # --- cuda driver library, needed by the driver-AD launch path ---
+    if "libraries=['cuda']" not in content:
+        content = content.replace(
+            '        sources=get_sources(),\n'
+            '        extra_compile_args={\n',
+            '        sources=get_sources(),\n'
+            "        libraries=['cuda'],\n"
+            '        extra_compile_args={\n')
 
     # --- ptxas resource report + register usage level ---
-    ('                    "--use_fast_math",\n'
-     '                    "-mllvm",\n',
-     '                    "--use_fast_math",\n'
-     '                    "--ptxas-options=-v,--register-usage-level=10",\n'
-     '                    "-mllvm",\n'),
-]
+    if '--ptxas-options' not in content:
+        content = content.replace(
+            '                    "--use_fast_math",\n'
+            '                    "-mllvm",\n',
+            '                    "--use_fast_math",\n'
+            '                    "--ptxas-options=-v,--register-usage-level=10",\n'
+            '                    "-mllvm",\n')
 
-
-def rewrite_setup_py(content: str) -> str:
-    """Convert setup.py from the ppu-original form to the cuda-compatible form."""
-    content = content.replace('hgcc', 'nvcc')
-    return apply_replacements(content, SETUP_PY_REPLACEMENTS)
-
-
-# =============================================================================
-# Files to skip entirely (no conversion needed)
-# =============================================================================
-
-EXCLUDE_FILES = [
-    'csrc/ppu/acc_vreg_fraga.h',  # uses __HGGC_ARCH__ in both modes
-]
-
-# =============================================================================
-# Helper functions
-# =============================================================================
-
-def apply_replacements(content: str, replacements: List[Tuple[str, str]]) -> str:
-    """Apply a list of (old, new) text replacements to content.
-
-    Idempotency guard: if old is a substring of new AND new is already in content,
-    skip the replacement (prevents double-insertion of guards/wrappers).
-    """
-    for old, new in replacements:
-        if old and old != new:
-            if old in new and new in content:
-                continue
-            content = content.replace(old, new)
     return content
 
 
-def apply_arch_value_replacements(content: str) -> str:
-    """Replace __CUDA_ARCH__ arch values: hggc arch → cuda arch.
-    Also handles the LDSM/SmemCopyAtom special case (>= 800 → >= 750).
-    """
-    lines = content.split('\n')
-    new_lines = []
-    for i, line in enumerate(lines):
-        if '__CUDA_ARCH__' in line:
-            for old, new in ARCH_VALUE_REPLACEMENTS:
-                line = line.replace(old, new)
-            next_line = lines[i + 1] if i + 1 < len(lines) else ''
-            if 'LDSM' in next_line or 'SmemCopyAtom' in next_line:
-                line = line.replace('>= 800', '>= 750')
-        new_lines.append(line)
-    return '\n'.join(new_lines)
+def rewrite_setup_py():
+    """Transform setup.py to the cuda-compatible CUDAExtension form.
 
-
-def apply_regex_replacements(content: str, regex_list: List[Tuple[str, str, str]],
-                             filepath: str) -> str:
-    """Apply regex-based replacements. Each entry is (pattern, replacement, file_glob).
-    file_glob is matched against filepath via endswith(); None means apply to all files.
+    setup.py is expected to already use torch CUDAExtension, so only the hgcc
+    identifiers, the ppu arch flags and the build-tuning args need converting.
+    The legacy hand-written HGCCBuildExtension shape is no longer converted.
     """
-    for pattern, replacement, file_glob in regex_list:
-        if file_glob and not filepath.endswith(file_glob):
+    targets = ['setup.py']
+    count = 0
+    for fp in targets:
+        if not os.path.isfile(fp):
             continue
-        content = re.sub(pattern, replacement, content, flags=re.MULTILINE | re.DOTALL)
-    return content
+        content = open(fp).read()
 
-
-def apply_word_boundary_replacements(content: str,
-                                     replacements: List[Tuple[str, str]]) -> str:
-    """Apply (old, new) replacements using word-boundary regex.
-
-    Required for type names such as __ppu_bfloat162 so they do not also match
-    inside __ppu_bfloat162_raw (which str.replace would do as a prefix match).
-    """
-    for old, new in replacements:
-        if old and old != new:
-            content = re.sub(r'\b' + re.escape(old) + r'\b', new, content)
-    return content
-
-
-def apply_hggccc_guards(content: str, rel_path: str) -> str:
-    """Wrap cuda_ad.h includes in #ifdef __HGGCCC__ guards for nvcc (nvcc does
-    not define __HGGCCC__). Must run after <hggc_ad.h> -> "cuda_ad.h" conversion.
-
-    Files that already contain an __HGGCCC__ guard elsewhere are left untouched,
-    matching the reference behaviour (combine.cuh / splitkv_mla.cuh already
-    guard other blocks, so their cuda_ad.h include stays unguarded)."""
-    if rel_path not in HGGCCC_GUARD_FILES:
-        return content
-    if '#ifdef __HGGCCC__' in content:
-        return content
-    content = content.replace(
-        '#include "cuda_ad.h"\n#include "utils.h"',
-        '#ifdef __HGGCCC__\n#include "cuda_ad.h"\n#include "utils.h"\n#endif')
-    content = content.replace(
-        '#include "cuda_ad.h"',
-        '#ifdef __HGGCCC__\n#include "cuda_ad.h"\n#endif')
-    return content
-
-
-def process_file(filepath: str, repo_dir: str,
-                 dry_run: bool = False, verbose: bool = False) -> int:
-    """Process a single file through the replacement pipeline. Returns change count."""
-    # realpath on both sides: main() chdir's into repo_dir, so a symlink anywhere in
-    # the path would otherwise make relpath climb out and every rel_path key miss.
-    rel_path = os.path.relpath(os.path.realpath(filepath), os.path.realpath(repo_dir))
-
-    # --- setup.py ---
-    if rel_path == 'setup.py':
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                content = f.read()
-        except (IOError, OSError):
-            return 0
         if 'HGCCBuildExtension' in content:
-            print("  WARNING: setup.py uses the legacy HGCCBuildExtension, which this "
-                  "script no longer converts, left untouched")
-            return 0
+            print(f"  WARNING: {fp} uses the legacy HGCCBuildExtension, which this "
+                  f"script no longer converts, left untouched")
+            continue
         if 'CUDAExtension' not in content:
-            print("  WARNING: setup.py matches no known shape, left untouched")
-            return 0
-        new_content = rewrite_setup_py(content)
+            print(f"  WARNING: {fp} matches no known shape, left untouched")
+            continue
+
+        new_content = _rewrite_torch_ext_setup_py(content)
         if '-arch=ppu_' in new_content or 'hgcc' in new_content:
-            print("  WARNING: setup.py still has PPU-only build flags after rewrite")
-        if new_content == content:
-            return 0
-        if dry_run:
-            if verbose:
-                print(f"    [dry-run] {rel_path}")
-            return 1
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(new_content)
-        if verbose:
-            print(f"    {rel_path}")
-        return 1
+            print(f"  WARNING: {fp} still has PPU-only build flags after rewrite")
+        if new_content != content:
+            open(fp, 'w').write(new_content)
+            count += 1
+    return count
 
-    # --- Excluded files ---
-    if rel_path in EXCLUDE_FILES:
-        return 0
 
-    # --- Read content ---
+# =============================================================================
+# Bulk file transformation
+# =============================================================================
+
+SUFFIXES = ('.h', '.hpp', '.cu', '.cuh', '.cpp', '.inl')
+
+
+def find_source_files(directories):
+    """Find all source files in given directories."""
+    files = []
+    for d in directories:
+        if not os.path.isdir(d):
+            continue
+        for root, _, filenames in os.walk(d):
+            # Skip the actlize submodule, converted by the actlize script
+            if 'actlize' in root:
+                continue
+            for f in filenames:
+                if f.endswith(SUFFIXES):
+                    files.append(os.path.join(root, f))
+    return files
+
+
+def transform_content(content, maps, pattern):
+    """Apply every conversion to one file's content."""
+    # Skip files that carry no ppu-original token
+    if not re.search(r'\bhggc|\bPPU10_|__hg_fp8|__ppu_bfloat16|<hgtx3/|<hggc_', content):
+        return content
+
+    new_content = replace_content(content, maps, pattern)
+    return new_content
+
+
+def transform_file(filepath, maps, pattern):
+    """Apply the conversions to a single file."""
     try:
         with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
             content = f.read()
     except (IOError, OSError):
-        return 0
-    original = content
+        return False
 
-    # --- Check relevance ---
-    has_file_specific = rel_path in FILE_SPECIFIC_REPLACEMENTS
-    has_hggc_patterns = bool(re.search(
-        r'\bhggc|\b__HGGC_ARCH__\b|\bPPU10_|__hg_fp8|__ppu_bfloat16|<hgtx3/|<hggc_',
-        content))
-    if not has_file_specific and not has_hggc_patterns:
-        return 0
-
-    # --- Pipeline ---
-    # 1. File-specific replacements (highest priority)
-    if has_file_specific:
-        content = apply_replacements(content, FILE_SPECIFIC_REPLACEMENTS[rel_path])
-
-    # 2. Category replacements (include → enum → type → func → macro → nvtx)
-    for table in ALL_CATEGORY_REPLACEMENTS:
-        content = apply_replacements(content, table)
-
-    # 3. Word-boundary type replacements (FP8/bfloat16 — \b prevents prefix matches)
-    content = apply_word_boundary_replacements(content, WORD_BOUNDARY_REPLACEMENTS)
-
-    # 4. Arch value replacements (line-by-line on __CUDA_ARCH__ lines)
-    content = apply_arch_value_replacements(content)
-
-    # 5. Regex replacements (complex multi-line patterns)
-    content = apply_regex_replacements(content, REGEX_REPLACEMENTS, filepath)
-
-    # 6. __HGGCCC__ guards around cuda_ad.h (after <hggc_ad.h> → "cuda_ad.h")
-    content = apply_hggccc_guards(content, rel_path)
-
-    # --- Check and write ---
-    if content == original:
-        return 0
-
-    if dry_run:
-        if verbose:
-            print(f"    [dry-run] {rel_path}")
-        return 1
+    new_content = transform_content(content, maps, pattern)
+    if new_content == content:
+        return False
 
     with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(content)
-    if verbose:
-        print(f"    {rel_path}")
-    return 1
+        f.write(new_content)
+    return True
 
 
 # =============================================================================
@@ -551,11 +305,11 @@ def process_file(filepath: str, repo_dir: str,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='FlashMLA PPU-original → CUDA-Compatible Transform (lookup-table refactored)')
+        description='FlashMLA PPU-original -> CUDA-Compatible Transform (no git dependency)')
     parser.add_argument('target_dir', nargs='?', default='.',
                         help='Target FlashMLA root directory')
     parser.add_argument('--dry-run', action='store_true',
-                        help='Show what would be done without making changes')
+                        help='Preview without modifying files')
     parser.add_argument('--verbose', action='store_true',
                         help='Print each modified file')
     args = parser.parse_args()
@@ -568,46 +322,56 @@ def main():
     os.chdir(target_dir)
 
     print("=" * 60)
-    print("FlashMLA PPU-original → CUDA-Compatible Transform (lookup-table)")
+    print("FlashMLA PPU-original -> CUDA-Compatible Transform")
     print(f"Target: {target_dir}")
-    print(f"Mode: {'DRY-RUN' if args.dry_run else 'APPLY'}")
     print("=" * 60)
 
     t0 = time.time()
 
-    # Collect all target files
-    all_files = []
-    for root, dirs, files in os.walk('csrc'):
-        if 'actlize' in root:
-            continue
-        for f in files:
-            if f.endswith(('.cu', '.cuh', '.h', '.hpp', '.cpp')):
-                all_files.append(os.path.join(root, f))
+    # Step 1: Bulk replacement over the whole source tree (hggc->cuda, hgtx->nvtx,
+    # the per-file rewrites and the __HGGCCC__ guards).
+    print("\n[1/2] Bulk HGGC/HGTX -> CUDA/NVTX replacement...")
+    maps = get_all_convert_maps()
+    pattern = build_pattern(maps)
 
-    # Also include setup.py
-    setup_path = os.path.join(target_dir, 'setup.py')
-    if os.path.isfile(setup_path):
-        all_files.append(setup_path)
+    source_dirs = ['csrc']
+    files = find_source_files(source_dirs)
+    print(f"  Found {len(files)} source files")
 
-    print(f"\nFound {len(all_files)} target files to process\n")
+    n_transformed = 0
+    for f in sorted(files):
+        if args.dry_run:
+            content = open(f, encoding='utf-8', errors='replace').read()
+            if transform_content(content, maps, pattern) != content:
+                n_transformed += 1
+                if args.verbose:
+                    print(f"    [dry-run] {f}")
+        else:
+            if transform_file(f, maps, pattern):
+                n_transformed += 1
+                if args.verbose:
+                    print(f"    {f}")
+    print(f"  Transformed {n_transformed} files")
 
-    # Process all files through the unified pipeline
-    files_modified = 0
-    for fp in sorted(all_files):
-        changes = process_file(fp, target_dir, dry_run=args.dry_run, verbose=args.verbose)
-        if changes > 0:
-            files_modified += 1
+    # Step 2: setup.py build-flag transformation
+    print("\n[2/2] Setup.py transformation...")
+    n_setup = 0
+    if not args.dry_run:
+        n_setup = rewrite_setup_py()
+    else:
+        print("  [dry-run] Would modify setup.py")
+    print(f"  Modified {n_setup} files")
 
     # Summary
     t1 = time.time()
     print(f"\nDone in {t1 - t0:.1f}s")
     print("=" * 60)
-    print(f"  Files scanned:   {len(all_files)}")
-    print(f"  Files modified:  {files_modified}")
+    print(f"  Bulk replace:  {n_transformed}")
+    print(f"  Setup.py:      {n_setup}")
     print("=" * 60)
 
     if args.dry_run:
-        print("\n  [DRY RUN — no files modified]")
+        print("\n  [DRY RUN - no files modified]")
     else:
         print("\n  Next steps:")
         print("  1. Build: python setup.py bdist_wheel")
