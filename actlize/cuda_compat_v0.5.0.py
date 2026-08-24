@@ -55,6 +55,7 @@ NAMING_REPLACEMENTS = [
     # === Category 3: CUDA Runtime API functions (longer patterns first) ===
     (r'\bhggcOccupancyMaxActiveBlocksPerMultiprocessorWithFlags\b', 'cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags'),
     (r'\bhggcOccupancyMaxActiveBlocksPerMultiprocessor\b', 'cudaOccupancyMaxActiveBlocksPerMultiprocessor'),
+    (r'\bhggcFuncAttributePreferredSharedMemoryCarveout\b', 'cudaFuncAttributePreferredSharedMemoryCarveout'),
     (r'\bhggcFuncAttributeMaxDynamicSharedMemorySize\b', 'cudaFuncAttributeMaxDynamicSharedMemorySize'),
     (r'\bhggcLaunchAttributeProgrammaticStreamSerialization\b', 'cudaLaunchAttributeProgrammaticStreamSerialization'),
     (r'\bhggcGetDriverEntryPointByVersion\b', 'cudaGetDriverEntryPointByVersion'),
@@ -69,7 +70,10 @@ NAMING_REPLACEMENTS = [
     (r'\bhggcGetLastError\b', 'cudaGetLastError'),
     (r'\bhggcPeekAtLastError\b', 'cudaPeekAtLastError'),
     (r'\bhggcFuncSetAttribute\b', 'cudaFuncSetAttribute'),
+    (r'\bhggcFuncGetAttributes\b', 'cudaFuncGetAttributes'),
+    (r'\bhggcFuncAttributes\b', 'cudaFuncAttributes'),
     (r'\bhggcDevAttrMultiProcessorCount\b', 'cudaDevAttrMultiProcessorCount'),
+    (r'\bhggcDevAttrClockRate\b', 'cudaDevAttrClockRate'),
     (r'\bhggcMemsetAsync\b', 'cudaMemsetAsync'),
     (r'\bhggcLaunchKernelEx\b', 'cudaLaunchKernelEx'),
     (r'\bhggcLaunchKernel\b', 'cudaLaunchKernel'),

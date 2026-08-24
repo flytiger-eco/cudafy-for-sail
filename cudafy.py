@@ -27,6 +27,9 @@ SCRIPT_REGISTRY = {
         "2.8.2": REPO_ROOT / "flash-attention" / "cuda_compat_v2.8.2.py",
     },
     "flashmla": REPO_ROOT / "flashmla" / "cuda_compat.py",
+    "xformers": {
+        "0.0.27": REPO_ROOT / "xformers" / "cuda_compat_v0.0.27.py",
+    },
 }
 
 
@@ -123,6 +126,18 @@ def run_flashmla(args: argparse.Namespace) -> int:
     return _run_with_argv(script_path, argv)
 
 
+def run_xformers(args: argparse.Namespace) -> int:
+    script_path = SCRIPT_REGISTRY["xformers"][args.version]
+    argv = []
+    if args.target:
+        argv.append(args.target)
+    if args.dry_run:
+        argv.append("--dry-run")
+    if args.verbose:
+        argv.append("--verbose")
+    return _run_with_argv(script_path, argv)
+
+
 def add_common_repo_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("target", nargs="?", help="Target repository root directory")
     parser.add_argument("--dry-run", action="store_true", help="Preview changes without modifying files")
@@ -163,6 +178,16 @@ def build_parser() -> argparse.ArgumentParser:
     flashmla = subparsers.add_parser("flashmla", help="Convert a FlashMLA repository")
     add_common_repo_args(flashmla)
     flashmla.set_defaults(func=run_flashmla)
+
+    xformers = subparsers.add_parser("xformers", help="Convert an xFormers repository")
+    xformers.add_argument(
+        "--version",
+        choices=sorted(SCRIPT_REGISTRY["xformers"].keys()),
+        default="0.0.27",
+        help="xFormers compatibility script version",
+    )
+    add_common_repo_args(xformers)
+    xformers.set_defaults(func=run_xformers)
 
     return parser
 

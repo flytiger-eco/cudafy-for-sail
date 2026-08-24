@@ -8,6 +8,7 @@ A small toolkit for converting PPU original HGGC-based repositories to CUDA-comp
 - `deepgemm`: dispatches the DeepGEMM conversion script.
 - `flash-attention`: dispatches versioned Flash-Attention conversion scripts.
 - `flashmla`: dispatches the FlashMLA conversion script.
+- `xformers`: dispatches versioned xFormers conversion scripts.
 
 
 ## Usage
@@ -45,4 +46,12 @@ Supported versions: `2.7.2`, `2.7.4`, `2.8.2`.
 ```bash
 python3 cudafy.py flashmla /path/to/FlashMLA
 ```
+
+### xFormers
+
+```bash
+python3 cudafy.py xformers --version=0.0.27 /path/to/xformers
+```
+
+Supported versions: `0.0.27`.
 
