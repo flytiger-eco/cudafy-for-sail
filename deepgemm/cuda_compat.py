@@ -69,6 +69,16 @@ INCLUDE_REPLACEMENTS = [
     # NOTE: '#include <torch/torch.h>' → ATen/cuda/CUDAContext.h is NOT a global rule.
     # common_fp4.hpp legitimately uses torch/torch.h in both versions.
     # File-specific handling in device_runtime.hpp if needed.
+
+    # NOTE: '<acblasLt.h>' needs no entry -- BLAS_REPLACEMENTS' 'acblas' -> 'cublas' covers it.
+]
+
+# --- acBLAS/acBLASLt -> cuBLAS/cuBLASLt ---
+BLAS_REPLACEMENTS = [
+    ('ACBLAS', 'CUBLAS'),
+    ('acBLAS', 'cuBLAS'),
+    ('Acblas', 'Cublas'),
+    ('acblas', 'cublas'),
 ]
 
 # --- Macro definitions and checks ---
@@ -96,6 +106,10 @@ TYPE_REPLACEMENTS = [
     ('HGresult', 'CUresult'),
     ('HGlaunchConfig', 'CUlaunchConfig'),
     ('HGlaunchAttribute', 'CUlaunchAttribute'),
+    # Driver API library/kernel handles (handle.hpp's DG_JIT_USE_LIBRARY_ENUM_KERNELS path)
+    ('HGlibrary', 'CUlibrary'),
+    ('HGkernel', 'CUkernel'),
+    ('hg_kernel', 'cu_kernel'),
     # Runtime API types
     ('hggcDeviceProp', 'cudaDeviceProp'),
     ('hggcStream_t', 'cudaStream_t'),
@@ -115,6 +129,9 @@ TYPE_REPLACEMENTS = [
     ('hggcFuncAttributes', 'cudaFuncAttributes'),
     ('hggcFuncGetAttributes', 'cudaFuncGetAttributes'),
     ('hggcOccupancyMaxActiveBlocksPerMultiprocessor', 'cudaOccupancyMaxActiveBlocksPerMultiprocessor'),
+    # BLAS scalar-type plumbing (smxx_acblaslt.hpp); `hggc_type_` keeps the trailing `_`
+    ('hggcDataType', 'cudaDataType'),
+    ('hggc_type_', 'cuda_type_'),
 ]
 
 # --- Enum/constant replacements ---
@@ -155,6 +172,8 @@ ENUM_REPLACEMENTS = [
     ('hggcDevAttrMaxRegistersPerMultiprocessor', 'cudaDevAttrMaxRegistersPerMultiprocessor'),
     ('hggcDevAttrMaxThreadsPerBlock', 'cudaDevAttrMaxThreadsPerBlock'),
     ('hggcDevAttrWarpSize', 'cudaDevAttrWarpSize'),
+    # Data-type enums (HGGC_R_32F, HGGC_R_16BF, ...).
+    ('HGGC_R_', 'CUDA_R_'),
 ]
 
 # --- Function/API name replacements ---
@@ -181,6 +200,12 @@ FUNC_REPLACEMENTS = [
     ('hgOccupancyMaxActiveBlocksPerMultiprocessor', 'cuOccupancyMaxActiveBlocksPerMultiprocessor'),
     ('hgModuleLoadData', 'cuModuleLoadData'),
     ('hgModuleGetFunction', 'cuModuleGetFunction'),
+    # Driver API library/kernel enumeration (handle.hpp); the bare names also fix `lazy_*`
+    ('hgLibraryLoadFromFile', 'cuLibraryLoadFromFile'),
+    ('hgLibraryUnload', 'cuLibraryUnload'),
+    ('hgLibraryGetKernelCount', 'cuLibraryGetKernelCount'),
+    ('hgLibraryEnumerateKernels', 'cuLibraryEnumerateKernels'),
+    ('hgKernelGetFunction', 'cuKernelGetFunction'),
     # Runtime API
     ('hggcGetDevice', 'cudaGetDevice'),
     ('hggcGetDeviceProperties', 'cudaGetDeviceProperties'),
@@ -255,6 +280,7 @@ PYTHON_REPLACEMENTS = [
 # Files to handle: if .cpp exists and .cu does not, rename; if both exist, remove .cpp
 FILE_RENAMES = [
     ('csrc/python_api.cpp', 'csrc/python_api.cu'),
+    ('csrc/jit_kernels/impls/smxx_acblaslt.hpp', 'csrc/jit_kernels/impls/smxx_cublaslt.hpp'),
 ]
 
 # Files to restore (were deleted in ppu-original; provide content to recreate)
@@ -286,15 +312,6 @@ REGEX_REPLACEMENTS: List[Tuple[str, str, str]] = [
     (r'cudaStream_t stream = at::cuda::getCurrentCUDAStream\(\)',
      'at::cuda::CUDAStream stream = at::cuda::getDefaultCUDAStream()', None),
 
-    # nv_bfloat16 (without __) — REMOVED: this regex would incorrectly modify files
-    # where nv_bfloat16 is used intentionally (e.g., m_grouped_int8_gemm.hpp, cutlass headers)
-    # The indexing/main.cu case is handled via FILE_SPECIFIC_REPLACEMENTS instead.
-
-    # Remove the entire fused_permute function block from einsum.py
-    # NOTE: Removed — einsum.py is handled entirely via FULL_FILE_COPY_LIST in reference-dir mode.
-    # Text-replacement-only mode will leave einsum.py differences (acceptable trade-off for stability).
-    # (r'\n# --- Fused permute\(1,0,2\) kernel.*return out_a, out_sfa\n\n', '\n', 'einsum.py'),
-
     # --- utils_rtc.cuh ---
     # One generic rule for both `#if defined(__HGGC__)` regions (atomic_add_release_global
     # and computeBlockInfoKernel): keep the body, drop the guard. nvcc does not define
@@ -309,13 +326,13 @@ REGEX_REPLACEMENTS: List[Tuple[str, str, str]] = [
     # NOTE: next_power_of_two needs no rule -- in utils_rtc.cuh it sits outside every
     # guard and is valid for both backends, so it simply survives conversion.
 
-    # --- profiling_interface.hpp ---
+    # --- profiling_interface.cuh ---
     # The DG_USE_HGTX guards used to be stripped here by 9 positional regexes that
     # depended on \s+ indentation and on the HGTX->NVTX rename having already run.
     # DG_USE_HGTX was never defined anywhere, so the guarded code was dead on the PPU
     # side while the CUDA side needs the nvtx calls unguarded; the PPU source now simply
     # has no guards, and conversion is pure token renaming. Only this include drop remains.
-    (r'#include <cuda_runtime.h>\n', '', 'profiling_interface.hpp'),
+    (r'#include <cuda_runtime.h>\n', '', 'profiling_interface.cuh'),
 
     # --- scheduler_cutlass3.cuh: resolve the #if defined(__HGGC__) guards ---
     # Remove orphaned #endif after pragma lines (left over from #ifdef __clang__ removal)
@@ -408,39 +425,12 @@ FILE_SPECIFIC_REPLACEMENTS: Dict[str, List[Tuple[str, str]]] = {
 
     # --- csrc/jit/device_runtime.hpp ---
     'csrc/jit/device_runtime.hpp': [
-        ('#include <hggc_runtime_api.h>', '#include <cublasLt.h>'),
+        ('#include <hggc_runtime_api.h>', '#include <cuda_runtime.h>'),
         ('#include <torch/torch.h>', '#include <ATen/cuda/CUDAContext.h>'),
-        # Add cublasLt workspace size and full constructor/member block
-        ('    std::shared_ptr<hggcDeviceProp> cached_prop;\n\npublic:\n    explicit DeviceRuntime() = default;\n    ~DeviceRuntime() = default;',
-         '    std::shared_ptr<cudaDeviceProp> cached_prop;\n\n    // cuBLASLt utils\n    static constexpr size_t kCublasLtWorkspaceSize = 32 * 1024 * 1024;\n\npublic:\n#if TORCH_VERSION_MAJOR > 2 or (TORCH_VERSION_MAJOR == 2 and TORCH_VERSION_MINOR >= 3)\n    // For PyTorch 2.3+, share the PyTorch cuBLASLt handle\n    DeviceRuntime() = default;\n\n    static cublasLtHandle_t get_cublaslt_handle() {\n        return at::cuda::getCurrentCUDABlasLtHandle();\n    }\n\n    static torch::Tensor get_cublaslt_workspace() {\n        return torch::empty({kCublasLtWorkspaceSize}, dtype(torch::kByte).device(at::kCUDA));\n    }\n#else\n    // Otherwise, create the cuBLASLt handle ourselves\n    cublasLtHandle_t cublaslt_handle{};\n    std::shared_ptr<torch::Tensor> cublaslt_workspace;\n\n    explicit DeviceRuntime() {\n        cublaslt_workspace = std::make_shared<torch::Tensor>(torch::empty({kCublasLtWorkspaceSize}, dtype(torch::kByte).device(at::kCUDA)));\n        DG_CUBLASLT_CHECK(cublasLtCreate(&cublaslt_handle));\n    }\n\n    ~DeviceRuntime() noexcept(false) {\n        DG_CUBLASLT_CHECK(cublasLtDestroy(cublaslt_handle));\n    }\n\n    cublasLtHandle_t get_cublaslt_handle() const {\n        return cublaslt_handle;\n    }\n\n    torch::Tensor get_cublaslt_workspace() const {\n        return *cublaslt_workspace;\n    }\n#endif'),
     ],
 
-    # --- csrc/utils/exception.hpp ---
-    'csrc/utils/exception.hpp': [
-        # Add cublasLt include at top of includes
-        ('#pragma once\n\n#include <exception>', '#pragma once\n\n#include <cublasLt.h>\n#include <exception>'),
-        # Add DG_CUBLASLT_CHECK macro after the DG_CUDA_RUNTIME_CHECK block
-        ('} while (0)\n#endif\n\n} // namespace deep_gemm',
-         '} while (0)\n#endif\n\n#ifndef DG_CUBLASLT_CHECK\n#define DG_CUBLASLT_CHECK(cmd) \\\n'
-         'do { \\\n'
-         '    const auto& e = (cmd); \\\n'
-         '    if (e != CUBLAS_STATUS_SUCCESS) { \\\n'
-         '        std::ostringstream ss; \\\n'
-         '        ss << static_cast<int>(e) << " (" << cublasGetStatusString(e) << ")"; \\\n'
-         '        throw DGException("cuBLASLt", __FILE__, __LINE__, ss.str()); \\\n'
-         '    } \\\n'
-         '} while (0)\n#endif\n\n} // namespace deep_gemm'),
-    ],
-
-    # --- deep_gemm/include/deep_gemm/bf16_gemm_cutlass3.cuh ---
-    'deep_gemm/include/deep_gemm/bf16_gemm_cutlass3.cuh': [
-        # Remove the #include "utils.cuh" / #else / #include "utils_rtc.cuh" block
-        ('#include "profiling_interface.hpp"\n    #include "utils.cuh"\n#else\n    #include "utils_rtc.cuh"\n#endif',
-         '#include "profiling_interface.hpp"\n#endif'),
-    ],
-
-    # --- deep_gemm/include/deep_gemm/w4a16_gemm_cutlass3.cuh ---
-    'deep_gemm/include/deep_gemm/w4a16_gemm_cutlass3.cuh': [
+    # --- deep_gemm/include/deep_gemm/impls/w4a16_gemm_cutlass3.cuh ---
+    'deep_gemm/include/deep_gemm/impls/w4a16_gemm_cutlass3.cuh': [
         # Add #pragma clang diagnostic ignored after push
         ('#pragma clang diagnostic push\n#pragma clang diagnostic ignored "-Wunknown-attributes"',
          '#pragma clang diagnostic push\n#pragma clang diagnostic ignored "-Wunknown-attributes"\n#pragma clang diagnostic ignored "-Wcuda-compat"'),
@@ -664,28 +654,14 @@ REQUIRED_AFTER_CONVERSION: Dict[str, List[str]] = {
         'nvcc_flags',
         'nvcc.tmp.',
     ],
-    # 3.1: a 5-line match injects ~39 lines of cuBLASLt support. If it ever fails to match,
-    # the conversion used to succeed silently and only blow up much later at compile time.
+    # 3.1: guards the RENAME
     'csrc/jit/device_runtime.hpp': [
-        '#include <cublasLt.h>',
         '#include <ATen/cuda/CUDAContext.h>',
         'std::shared_ptr<cudaDeviceProp> cached_prop;',
-        'static constexpr size_t kCublasLtWorkspaceSize = 32 * 1024 * 1024;',
-        '#if TORCH_VERSION_MAJOR > 2 or (TORCH_VERSION_MAJOR == 2 and TORCH_VERSION_MINOR >= 3)',
-        'at::cuda::getCurrentCUDABlasLtHandle()',
-        'get_cublaslt_handle',
-        'get_cublaslt_workspace',
-        'cublasLtCreate(&cublaslt_handle)',
-        'cublasLtDestroy(cublaslt_handle)',
     ],
-    # 3.2: the DG_CUBLASLT_CHECK macro is injected by matching the very generic
-    # "} while (0) / #endif / } // namespace deep_gemm" tail.
+    # 3.2: the "HGGC*" labels are asserted on purpose -- they must NOT be renamed, so this
+    # catches an over-eager rule.
     'csrc/utils/exception.hpp': [
-        '#include <cublasLt.h>',
-        '#define DG_CUBLASLT_CHECK(cmd)',
-        'CUBLAS_STATUS_SUCCESS',
-        'cublasGetStatusString(e)',
-        'DGException("cuBLASLt"',
         '"HGGCRTC"',
         '"HGGC driver"',
         '"HGGC runtime"',
@@ -697,7 +673,7 @@ REQUIRED_AFTER_CONVERSION: Dict[str, List[str]] = {
         'from torch.utils.cpp_extension import CppExtension, CUDA_HOME, CUDAExtension, BuildExtension',
         "sources = ['csrc/python_api.cu']",
         "f'{CUDA_HOME}/include',",
-        "build_libraries = ['cuda', 'cudart', 'nvrtc']",
+        "build_libraries = ['cuda', 'cudart', 'nvrtc'",
         "f'{CUDA_HOME}/lib64',",
         "f'{CUDA_HOME}/lib64/stub'",
         'extra_nvcc_args = ["-O3", "-std=c++17", "--use_fast_math"]',
@@ -714,47 +690,6 @@ REQUIRED_AFTER_CONVERSION: Dict[str, List[str]] = {
         'CUDA_HOME         #',
     ],
 }
-
-
-# =============================================================================
-# LEVEL 4: Full file copy from reference directory
-# Files with structural differences too large for string replacement.
-# These files will be copied verbatim from the reference (original) DeepGemm.
-# =============================================================================
-
-# List of files that need to be copied wholesale from the reference directory
-FULL_FILE_COPY_LIST = [
-    # Python layer
-    'deep_gemm/jit/compiler.py',
-    'deep_gemm/jit/interleave_ffma.py',
-    'deep_gemm/__init__.py',
-
-    # C++ JIT infrastructure
-    'csrc/jit/compiler.hpp',
-    'csrc/jit/device_runtime.hpp',
-
-    # C++ utilities
-    'csrc/utils/exception.hpp',
-    'csrc/utils/utils.hpp',
-
-    # C++ JIT kernel implementations
-    'csrc/jit_kernels/impls/m_grouped_int8_gemm.hpp',
-
-    # CUDA kernel headers
-    'deep_gemm/include/deep_gemm/bf16_gemm_cutlass3.cuh',
-    'deep_gemm/include/deep_gemm/w4a16_gemm_cutlass3.cuh',
-
-]
-
-# Default reference directory: NONE (script is self-contained via text replacement rules)
-# Use --reference-dir CLI option only when you have an explicit reference copy available.
-DEFAULT_REFERENCE_DIR = None
-
-
-# =============================================================================
-# Helper Functions
-# =============================================================================
-
 
 # =============================================================================
 # Helper Functions
@@ -963,6 +898,9 @@ def process_file(filepath: str, repo_dir: str, dry_run: bool = False, verbose: b
 
     # 2. Apply include replacements
     content = apply_replacements(content, INCLUDE_REPLACEMENTS)
+
+    # 2b. Apply acBLAS -> cuBLAS replacements
+    content = apply_replacements(content, BLAS_REPLACEMENTS)
 
     # 3. Apply enum/constant replacements (before shorter patterns)
     content = apply_replacements(content, ENUM_REPLACEMENTS)
