@@ -9,7 +9,7 @@ import runpy
 import sys
 from pathlib import Path
 from types import ModuleType
-from typing import Sequence
+from typing import List, Optional, Sequence, Tuple
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -29,6 +29,22 @@ SCRIPT_REGISTRY = {
     "flashmla": REPO_ROOT / "flashmla" / "cuda_compat.py",
     "xformers": {
         "0.0.27": REPO_ROOT / "xformers" / "cuda_compat_v0.0.27.py",
+    },
+}
+
+ACTLIZE_DEPENDENCIES = {
+    "deepgemm": [
+        ("third-party/actlize_v0.5.0/include", "0.5.0"),
+        ("third-party/actlize_v1.0.0/include", "1.0.0"),
+    ],
+    "flash-attention": {
+        "2.7.2": [("csrc/actlize/include", "0.8.0")],
+        "2.7.4": [("csrc/actlize/include", "1.0.0")],
+        "2.8.2": [("csrc/actlize/include", "1.0.0")],
+    },
+    "flashmla": [("csrc/actlize/include", "0.8.0")],
+    "xformers": {
+        "0.0.27": [("third_party/actlize/include", "0.5.0")],
     },
 }
 
@@ -82,6 +98,36 @@ def _require_target(value, name: str) -> str:
     return value
 
 
+def _actlize_dependencies(command: str, version: Optional[str]) -> List[Tuple[str, str]]:
+    entry = ACTLIZE_DEPENDENCIES.get(command, [])
+    if isinstance(entry, dict):
+        return entry.get(version, [])
+    return entry
+
+
+def _convert_actlize(command: str, version: Optional[str], target: str, dry_run: bool) -> int:
+    dependencies = _actlize_dependencies(command, version)
+    if not dependencies:
+        return 0
+
+    repo_root = Path(target).resolve()
+    for relative_include, actlize_version in dependencies:
+        include_dir = repo_root / relative_include
+        if not include_dir.is_dir():
+            print(f"WARNING: ACTLIZE include directory not found, skipped: {include_dir}")
+            continue
+
+        print(f"\n[cudafy] Convert ACTLIZE v{actlize_version}: {include_dir}")
+        if dry_run:
+            print("  [dry-run] Would convert this ACTLIZE include directory")
+            continue
+
+        code = _run_with_argv(SCRIPT_REGISTRY["actlize"][actlize_version], [str(include_dir)])
+        if code:
+            return code
+    return 0
+
+
 def run_actlize(args: argparse.Namespace) -> int:
     script_path = SCRIPT_REGISTRY["actlize"][args.version]
     target = _require_target(args.target, "actlize include directory")
@@ -90,6 +136,10 @@ def run_actlize(args: argparse.Namespace) -> int:
 
 def run_deepgemm(args: argparse.Namespace) -> int:
     script_path = SCRIPT_REGISTRY["deepgemm"]
+    if not args.skip_actlize:
+        code = _convert_actlize("deepgemm", None, args.target or ".", args.dry_run)
+        if code:
+            return code
     argv = []
     if args.target:
         argv.append(args.target)
@@ -104,6 +154,10 @@ def run_deepgemm(args: argparse.Namespace) -> int:
 
 def run_flash_attention(args: argparse.Namespace) -> int:
     script_path = SCRIPT_REGISTRY["flash-attention"][args.version]
+    if not args.skip_actlize:
+        code = _convert_actlize("flash-attention", args.version, args.target or ".", args.dry_run)
+        if code:
+            return code
     argv = []
     if args.target:
         argv.append(args.target)
@@ -116,6 +170,10 @@ def run_flash_attention(args: argparse.Namespace) -> int:
 
 def run_flashmla(args: argparse.Namespace) -> int:
     script_path = SCRIPT_REGISTRY["flashmla"]
+    if not args.skip_actlize:
+        code = _convert_actlize("flashmla", None, args.target or ".", args.dry_run)
+        if code:
+            return code
     argv = []
     if args.target:
         argv.append(args.target)
@@ -128,6 +186,10 @@ def run_flashmla(args: argparse.Namespace) -> int:
 
 def run_xformers(args: argparse.Namespace) -> int:
     script_path = SCRIPT_REGISTRY["xformers"][args.version]
+    if not args.skip_actlize:
+        code = _convert_actlize("xformers", args.version, args.target or ".", args.dry_run)
+        if code:
+            return code
     argv = []
     if args.target:
         argv.append(args.target)
@@ -142,6 +204,11 @@ def add_common_repo_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("target", nargs="?", help="Target repository root directory")
     parser.add_argument("--dry-run", action="store_true", help="Preview changes without modifying files")
     parser.add_argument("--verbose", action="store_true", help="Print detailed output")
+    parser.add_argument(
+        "--skip-actlize",
+        action="store_true",
+        help="Do not convert the ACTLIZE copies bundled in the target repository",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
