@@ -151,7 +151,8 @@ NAMING_REPLACEMENTS = [
     (r'\bHGGC_ERROR_UNKNOWN\b', 'CUDA_ERROR_UNKNOWN'),
     (r'\bhggcErrorUnknown\b', 'cudaErrorUnknown'),
 
-    # Compiler macros (HGGCCC → CUDACC, longer patterns first)
+    # Compiler/runtime version macros (HGGC → CUDA, longer patterns first)
+    (r'\bHGGCRT_VERSION\b', 'CUDART_VERSION'),
     (r'\b__HGGCCC_RTC__\b', '__CUDACC_RTC__'),
     (r'\b__HGGCCC_VER_MAJOR__\b', '__CUDACC_VER_MAJOR__'),
     (r'\b__HGGCCC_VER_MINOR__\b', '__CUDACC_VER_MINOR__'),

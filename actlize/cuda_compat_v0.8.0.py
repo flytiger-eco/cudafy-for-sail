@@ -182,9 +182,10 @@ NAMING_REPLACEMENTS = [
     (r'\bHGGC_R_16F\b', 'CUDA_R_16F'),
     (r'\bHGGC_R_8I\b', 'CUDA_R_8I'),
 
-    # Compiler macros (HGGCCC → CUDACC, longer patterns first)
+    # Compiler/runtime version macros (HGGC → CUDA, longer patterns first)
     (r'\b__HGGC_NO_HALF2_OPERATORS__\b', '__CUDA_NO_HALF2_OPERATORS__'),
     (r'\b__HGGC_NO_HALF_OPERATORS__\b', '__CUDA_NO_HALF_OPERATORS__'),
+    (r'\bHGGCRT_VERSION\b', 'CUDART_VERSION'),
     (r'\b__HGGCCC_RTC__\b', '__CUDACC_RTC__'),
     (r'\b__HGGCCC_VER_MAJOR__\b', '__CUDACC_VER_MAJOR__'),
     (r'\b__HGGCCC_VER_MINOR__\b', '__CUDACC_VER_MINOR__'),
