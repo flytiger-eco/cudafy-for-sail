@@ -26,6 +26,9 @@ SCRIPT_REGISTRY = {
         "2.7.4": REPO_ROOT / "flash-attention" / "cuda_compat_v2.7.4.py",
         "2.8.2": REPO_ROOT / "flash-attention" / "cuda_compat_v2.8.2.py",
     },
+    "flex-flash-attention": {
+        "2.8.2": REPO_ROOT / "flex-flash-attention" / "cuda_compat_v2.8.2.py",
+    },
     "flashmla": REPO_ROOT / "flashmla" / "cuda_compat.py",
 }
 
@@ -111,6 +114,18 @@ def run_flash_attention(args: argparse.Namespace) -> int:
     return _run_with_argv(script_path, argv)
 
 
+def run_flex_flash_attention(args: argparse.Namespace) -> int:
+    script_path = SCRIPT_REGISTRY["flex-flash-attention"][args.version]
+    argv = []
+    if args.target:
+        argv.append(args.target)
+    if args.dry_run:
+        argv.append("--dry-run")
+    if args.verbose:
+        argv.append("--verbose")
+    return _run_with_argv(script_path, argv)
+
+
 def run_flashmla(args: argparse.Namespace) -> int:
     script_path = SCRIPT_REGISTRY["flashmla"]
     argv = []
@@ -159,6 +174,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_common_repo_args(flash_attention)
     flash_attention.set_defaults(func=run_flash_attention)
+
+    flex_flash_attention = subparsers.add_parser(
+        "flex-flash-attention",
+        help="Convert a Flash-Attention repository including the flex_flash_attention module",
+    )
+    flex_flash_attention.add_argument(
+        "--version",
+        choices=sorted(SCRIPT_REGISTRY["flex-flash-attention"].keys()),
+        default="2.8.2",
+        help="Flex Flash-Attention compatibility script version",
+    )
+    add_common_repo_args(flex_flash_attention)
+    flex_flash_attention.set_defaults(func=run_flex_flash_attention)
 
     flashmla = subparsers.add_parser("flashmla", help="Convert a FlashMLA repository")
     add_common_repo_args(flashmla)
