@@ -293,24 +293,12 @@ FILE_RENAMES = [
 
 # Regex-based replacements: (pattern, replacement, file_glob_or_None)
 REGEX_REPLACEMENTS: List[Tuple[str, str, str]] = [
-    # Stream replacement: (hggcStream_t)0 -> at::cuda::getCurrentCUDAStream()
-    # This pattern appears in many C++ files where streams were replaced
-    # NOTE: After TYPE_REPLACEMENTS, hggcStream_t becomes cudaStream_t, so match both forms
-    (r'\(hggcStream_t\)0\s*/\*\s*default stream\s*\*/', 'at::cuda::getCurrentCUDAStream()', None),
-    (r'\(hggcStream_t\)0', 'at::cuda::getCurrentCUDAStream()', None),
-    (r'\(cudaStream_t\)0;\s*//\s*default stream', 'at::cuda::getCurrentCUDAStream();', None),
-    (r'\(cudaStream_t\)0', 'at::cuda::getCurrentCUDAStream()', None),
 
     # In impls/fp4_gemm.hpp ONLY: expand launch_kernel to direct API call
     # Other impls files (bf16, fp8, int8) keep launch_kernel as-is in the target
     (r'DG_CUDA_UNIFIED_CHECK\(launch_kernel\(kernel, configs, args\.kernel_params\)\);',
      'void* ptr_args[] = {(void*)&args.kernel_params};\n        DG_CUDA_UNIFIED_CHECK(lazy_cuLaunchKernelEx(&configs, kernel, ptr_args, nullptr));', 'fp4_gemm.hpp'),
 
-    # Stream type fix for impls/*.hpp: function default param / local var
-    # ppu-original uses (hggcStream_t)0 which becomes cudaStream_t stream = at::cuda::getCurrentCUDAStream()
-    # but target uses at::cuda::CUDAStream stream = at::cuda::getDefaultCUDAStream()
-    (r'cudaStream_t stream = at::cuda::getCurrentCUDAStream\(\)',
-     'at::cuda::CUDAStream stream = at::cuda::getDefaultCUDAStream()', None),
 
     # --- utils_rtc.cuh ---
     # One generic rule for both `#if defined(__HGGC__)` regions (atomic_add_release_global
@@ -415,12 +403,6 @@ FILE_SPECIFIC_REPLACEMENTS: Dict[str, List[Tuple[str, str]]] = {
         ('-Xcompiler -Wno-deprecated-declarations -Xcompiler -Wno-abi ', '-Xcompiler -O3,-Wno-deprecated-declarations,-Wno-abi '),
         # PPU LLVM backend flag prefix
         ('-Xllvm', '-mllvm'),
-    ],
-
-    # --- csrc/jit/kernel_runtime.hpp ---
-    'csrc/jit/kernel_runtime.hpp': [
-        # Stream usage: (uintptr_t)stream -> stream.id()
-        ('(uintptr_t)stream', 'stream.id()'),
     ],
 
     # --- csrc/jit/device_runtime.hpp ---
