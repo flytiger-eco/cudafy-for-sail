@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
-"""Unified CUDA compatibility dispatcher for cudafy-for-sail."""
+"""Unified CUDA compatibility dispatcher for cudafy-for-sail.
+
+Three ways to run a conversion:
+
+  python3 cudafy.py general <path>
+      Convert ANY tree with the general rules only (full SDK naming map +
+      compile-chain rules). Bundled actlize copies under the path are
+      converted together with the tree, so no separate actlize step is needed.
+
+  python3 cudafy.py <repo> [--version=X] <path>
+      actlize, flash-attention and xformers are fully covered by the
+      general rules (their per-repo scripts are gone); the command runs the
+      general engine directly, keeping the historical CLI shape. deepgemm /
+      flashmla additionally apply their residual rules via the per-repo
+      scripts under <repo>/.
+
+      An unknown <repo> name falls back to `general <path>`: the name is
+      dropped and the path is converted with the general rules.
+"""
 
 import argparse
 import importlib.util
@@ -9,44 +27,22 @@ import runpy
 import sys
 from pathlib import Path
 from types import ModuleType
-from typing import List, Optional, Sequence, Tuple
+from typing import Optional, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO_ROOT))
 
-SCRIPT_REGISTRY = {
-    "actlize": {
-        "0.5.0": REPO_ROOT / "actlize" / "cuda_compat_v0.5.0.py",
-        "0.8.0": REPO_ROOT / "actlize" / "cuda_compat_v0.8.0.py",
-        "1.0.0": REPO_ROOT / "actlize" / "cuda_compat_v1.0.0.py",
-    },
+# Repositories whose conversion still carries residual rules; everything else
+# is fully covered by the general engine.
+RESIDUAL_REGISTRY = {
     "deepgemm": REPO_ROOT / "deepgemm" / "cuda_compat.py",
-    "flash-attention": {
-        "2.7.2": REPO_ROOT / "flash-attention" / "cuda_compat_v2.7.2.py",
-        "2.7.4": REPO_ROOT / "flash-attention" / "cuda_compat_v2.7.4.py",
-        "2.8.2": REPO_ROOT / "flash-attention" / "cuda_compat_v2.8.2.py",
-    },
     "flashmla": REPO_ROOT / "flashmla" / "cuda_compat.py",
-    "xformers": {
-        "0.0.27": REPO_ROOT / "xformers" / "cuda_compat_v0.0.27.py",
-    },
 }
 
-ACTLIZE_DEPENDENCIES = {
-    "deepgemm": [
-        ("third-party/actlize_v0.5.0/include", "0.5.0"),
-        ("third-party/actlize_v1.0.0/include", "1.0.0"),
-    ],
-    "flash-attention": {
-        "2.7.2": [("csrc/actlize/include", "0.8.0")],
-        "2.7.4": [("csrc/actlize/include", "1.0.0")],
-        "2.8.2": [("csrc/actlize/include", "1.0.0")],
-    },
-    "flashmla": [("csrc/actlize/include", "0.8.0")],
-    "xformers": {
-        "0.0.27": [("third_party/actlize/include", "0.5.0")],
-    },
-}
+KNOWN_COMMANDS = {
+    "general", "actlize", "flash-attention", "xformers",
+} | set(RESIDUAL_REGISTRY)
 
 
 def _module_name(script_path: Path) -> str:
@@ -98,101 +94,67 @@ def _require_target(value, name: str) -> str:
     return value
 
 
-def _actlize_dependencies(command: str, version: Optional[str]) -> List[Tuple[str, str]]:
-    entry = ACTLIZE_DEPENDENCIES.get(command, [])
-    if isinstance(entry, dict):
-        return entry.get(version, [])
-    return entry
+def _run_general(target: str, dry_run: bool, verbose: bool,
+                 version: Optional[str] = None, label: str = "general") -> int:
+    """Convert a path with the general engine (SDK map + compile chain)."""
+    from general import convert_path
 
+    if not os.path.exists(target):
+        raise SystemExit(f"ERROR: path not found: {target}")
 
-def _convert_actlize(command: str, version: Optional[str], target: str, dry_run: bool) -> int:
-    dependencies = _actlize_dependencies(command, version)
-    if not dependencies:
-        return 0
+    print("=" * 60)
+    print(f"{label}: PPU -> CUDA conversion (general rules)")
+    print(f"Target: {os.path.abspath(target)}")
+    if version:
+        print(f"Version: {version} (informational; the general rules are "
+              f"version-independent)")
+    print("=" * 60)
 
-    repo_root = Path(target).resolve()
-    for relative_include, actlize_version in dependencies:
-        include_dir = repo_root / relative_include
-        if not include_dir.is_dir():
-            print(f"WARNING: ACTLIZE include directory not found, skipped: {include_dir}")
-            continue
-
-        print(f"\n[cudafy] Convert ACTLIZE v{actlize_version}: {include_dir}")
-        if dry_run:
-            print("  [dry-run] Would convert this ACTLIZE include directory")
-            continue
-
-        code = _run_with_argv(SCRIPT_REGISTRY["actlize"][actlize_version], [str(include_dir)])
-        if code:
-            return code
+    scanned, changed, renamed, _ = convert_path(target, dry_run=dry_run, verbose=verbose)
+    print(f"  Files scanned: {scanned}")
+    print(f"  Files changed: {changed}")
+    print(f"  Renames:       {renamed}")
+    if dry_run:
+        print("\n  [DRY RUN - no files modified]")
     return 0
 
 
+def run_general(args: argparse.Namespace) -> int:
+    target = _require_target(args.target, "target path")
+    return _run_general(target, args.dry_run, args.verbose)
+
+
 def run_actlize(args: argparse.Namespace) -> int:
-    script_path = SCRIPT_REGISTRY["actlize"][args.version]
     target = _require_target(args.target, "actlize include directory")
-    return _run_with_argv(script_path, [target])
-
-
-def run_deepgemm(args: argparse.Namespace) -> int:
-    script_path = SCRIPT_REGISTRY["deepgemm"]
-    if not args.skip_actlize:
-        code = _convert_actlize("deepgemm", None, args.target or ".", args.dry_run)
-        if code:
-            return code
-    argv = []
-    if args.target:
-        argv.append(args.target)
-    if args.dry_run:
-        argv.append("--dry-run")
-    if args.verbose:
-        argv.append("--verbose")
-    if args.reference_dir:
-        argv.extend(["--reference-dir", args.reference_dir])
-    return _run_with_argv(script_path, argv)
-
-
-def run_flash_attention(args: argparse.Namespace) -> int:
-    script_path = SCRIPT_REGISTRY["flash-attention"][args.version]
-    if not args.skip_actlize:
-        code = _convert_actlize("flash-attention", args.version, args.target or ".", args.dry_run)
-        if code:
-            return code
-    argv = []
-    if args.target:
-        argv.append(args.target)
-    if args.dry_run:
-        argv.append("--dry-run")
-    if args.verbose:
-        argv.append("--verbose")
-    return _run_with_argv(script_path, argv)
-
-
-def run_flashmla(args: argparse.Namespace) -> int:
-    script_path = SCRIPT_REGISTRY["flashmla"]
-    if not args.skip_actlize:
-        code = _convert_actlize("flashmla", None, args.target or ".", args.dry_run)
-        if code:
-            return code
-    argv = []
-    if args.target:
-        argv.append(args.target)
-    if args.dry_run:
-        argv.append("--dry-run")
-    if args.verbose:
-        argv.append("--verbose")
-    return _run_with_argv(script_path, argv)
+    if not os.path.isdir(target):
+        raise SystemExit(f"ERROR: directory not found: {target}")
+    return _run_general(target, args.dry_run, args.verbose,
+                        version=args.version, label="actlize")
 
 
 def run_xformers(args: argparse.Namespace) -> int:
-    script_path = SCRIPT_REGISTRY["xformers"][args.version]
-    if not args.skip_actlize:
-        code = _convert_actlize("xformers", args.version, args.target or ".", args.dry_run)
-        if code:
-            return code
-    argv = []
-    if args.target:
-        argv.append(args.target)
+    target = _require_target(args.target, "target xformers directory")
+    if (not os.path.isfile(os.path.join(target, "setup.py")) or
+            not os.path.isdir(os.path.join(
+                target, "xformers/csrc/attention/cuda/fmha"))):
+        raise SystemExit(f"ERROR: {target} is not an xformers root directory.")
+    return _run_general(target, args.dry_run, args.verbose,
+                        version=args.version, label="xformers")
+
+
+def run_flash_attention(args: argparse.Namespace) -> int:
+    target = _require_target(args.target, "target flash-attention directory")
+    if (not os.path.isfile(os.path.join(target, "setup.py")) or
+            not os.path.isdir(os.path.join(target, "csrc/flash_attn"))):
+        raise SystemExit(f"ERROR: {target} is not a flash-attention root directory.")
+    return _run_general(target, args.dry_run, args.verbose,
+                        version=args.version, label="flash-attention")
+
+
+def run_residual(command: str, args: argparse.Namespace) -> int:
+    script_path = RESIDUAL_REGISTRY[command]
+    target = _require_target(args.target, "target repository directory")
+    argv = [target]
     if args.dry_run:
         argv.append("--dry-run")
     if args.verbose:
@@ -201,14 +163,9 @@ def run_xformers(args: argparse.Namespace) -> int:
 
 
 def add_common_repo_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("target", nargs="?", help="Target repository root directory")
+    parser.add_argument("target", help="Target repository root directory")
     parser.add_argument("--dry-run", action="store_true", help="Preview changes without modifying files")
     parser.add_argument("--verbose", action="store_true", help="Print detailed output")
-    parser.add_argument(
-        "--skip-actlize",
-        action="store_true",
-        help="Do not convert the ACTLIZE copies bundled in the target repository",
-    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -217,42 +174,45 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    actlize = subparsers.add_parser("actlize", help="Convert ACTLIZE include files")
+    general = subparsers.add_parser(
+        "general", help="Convert any path with the general rules (SDK map + compile chain)")
+    add_common_repo_args(general)
+    # Accepted (and ignored) so that an unknown-repo fallback carrying
+    # --version=X still parses.
+    general.add_argument("--version", default=None, help=argparse.SUPPRESS)
+    general.set_defaults(func=run_general)
+
+    actlize = subparsers.add_parser(
+        "actlize", help="Convert ACTLIZE include files (general rules only)")
     actlize.add_argument(
-        "--version",
-        choices=sorted(SCRIPT_REGISTRY["actlize"].keys()),
-        default="1.0.0",
-        help="ACTLIZE compatibility script version",
-    )
+        "--version", choices=["0.5.0", "0.8.0", "1.0.0"], default="1.0.0",
+        help="Informational only; the general rules are version-independent")
     actlize.add_argument("target", help="Target ACTLIZE include directory")
+    actlize.add_argument("--dry-run", action="store_true", help="Preview changes without modifying files")
+    actlize.add_argument("--verbose", action="store_true", help="Print detailed output")
     actlize.set_defaults(func=run_actlize)
 
-    deepgemm = subparsers.add_parser("deepgemm", help="Convert a DeepGEMM repository")
-    add_common_repo_args(deepgemm)
-    deepgemm.add_argument("--reference-dir", help="Optional original CUDA reference directory")
-    deepgemm.set_defaults(func=run_deepgemm)
-
-    flash_attention = subparsers.add_parser("flash-attention", help="Convert a Flash-Attention repository")
+    flash_attention = subparsers.add_parser(
+        "flash-attention", help="Convert a Flash-Attention repository (general rules only)")
     flash_attention.add_argument(
-        "--version",
-        choices=sorted(SCRIPT_REGISTRY["flash-attention"].keys()),
-        default="2.8.2",
-        help="Flash-Attention compatibility script version",
-    )
+        "--version", choices=["2.7.2", "2.7.4", "2.8.2"], default="2.8.2",
+        help="Informational only; the general rules are version-independent")
     add_common_repo_args(flash_attention)
     flash_attention.set_defaults(func=run_flash_attention)
 
+    deepgemm = subparsers.add_parser("deepgemm", help="Convert a DeepGEMM repository")
+    add_common_repo_args(deepgemm)
+    deepgemm.set_defaults(func=lambda args: run_residual("deepgemm", args))
+
     flashmla = subparsers.add_parser("flashmla", help="Convert a FlashMLA repository")
     add_common_repo_args(flashmla)
-    flashmla.set_defaults(func=run_flashmla)
+    flashmla.set_defaults(func=lambda args: run_residual("flashmla", args))
 
-    xformers = subparsers.add_parser("xformers", help="Convert an xFormers repository")
+    xformers = subparsers.add_parser(
+        "xformers", help="Convert an xFormers repository (general rules only)")
     xformers.add_argument(
-        "--version",
-        choices=sorted(SCRIPT_REGISTRY["xformers"].keys()),
-        default="0.0.27",
-        help="xFormers compatibility script version",
-    )
+        "--version", choices=["0.0.27"], default="0.0.27",
+        help="Informational only; the general rules are version-independent")
     add_common_repo_args(xformers)
     xformers.set_defaults(func=run_xformers)
 
@@ -260,8 +220,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    argv = sys.argv[1:]
+    # Unknown repo name: `cudafy.py <repo> [--version=X] <path>` falls back to
+    # `cudafy.py general <path>` (the name is dropped).
+    if argv and not argv[0].startswith("-") and argv[0] not in KNOWN_COMMANDS:
+        print(f"NOTE: '{argv[0]}' is not a known repository; "
+              f"falling back to `general` mode.")
+        argv = ["general", *argv[1:]]
+
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if not hasattr(args, "func"):
         parser.print_help()
         return 2

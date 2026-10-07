@@ -1,311 +1,141 @@
 #!/usr/bin/env python3
-"""
-FlashMLA PPU-original -> CUDA-Compatible Transformation Script.
+"""FlashMLA conversion -- general engine + FlashMLA-specific residuals.
 
-Converts a FlashMLA ppu-original source tree into a CUDA-compatible one.
-Token conversion is a pure regex/dict replacement, mirroring the flash-attention
-scripts; the per-file rewrites, multi-line regexes and __HGGCCC__ guards are the
-FlashMLA-specific payload on top of that shared engine.
+The general engine (full SDK naming map + compile-chain rules) covers
+everything the old FlashMLA script did except three structural rules that
+cannot be expressed as token renames; they are applied AFTER the general
+conversion and are the complete residual rule set:
 
-Usage:
+  1. csrc/api/common.h forward-declares hggcStream_t because the PPU SDK
+     headers are not on the host compiler's include path; the compat build
+     gets cudaStream_t from cuda_runtime.h via torch, so the (converted)
+     typedef must be removed instead of renamed -- renaming it would collide.
+  2. setup.py must link the CUDA driver library (libraries=['cuda']) for the
+     driver-AD launch path.
+  3. setup.py enables the ptxas resource report and the register-usage-level
+     build tuning.
+
+Everything else (hggc/hgtx/HGAD token renames, arch flags -> single
+compute_80/sm_80 gencode, hgcc -> nvcc identifiers) is handled by the
+general engine.
+
+Usage (unchanged):
     python cuda_compat.py [TARGET_DIR] [--dry-run] [--verbose]
-
-Run from the FlashMLA root directory, or pass it as TARGET_DIR.
 """
 
 import argparse
 import os
-import re
+import shutil
 import sys
+import tempfile
 import time
 
-# =============================================================================
-# Conversion maps (hggc/PPU -> cuda/CU/NV)
-# Sorted longest-first at runtime by build_pattern, so declaration order carries
-# no meaning and overlapping tokens resolve by length in a single pass.
-# __HGGC_ARCH__ is intentionally absent: the PPU hgcc frontend auto-defines it,
-# so the cuda-compatible build keeps the native arch guard as-is.
-# =============================================================================
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
-CONVERT_RUNTIME_API = {
-    # --- functions ---
-    'hggcOccupancyMaxPotentialBlockSize': 'cudaOccupancyMaxPotentialBlockSize',
-    'hggcTriggerProgrammaticLaunchCompletion': 'cudaTriggerProgrammaticLaunchCompletion',
-    'hggcGridDependencySynchronize': 'cudaGridDependencySynchronize',
-    'hggcDeviceGetAttribute': 'cudaDeviceGetAttribute',
-    'hggcGetDeviceProperties': 'cudaGetDeviceProperties',
-    'hggcGetFuncBySymbol': 'cudaGetFuncBySymbol',
-    'hggcFuncSetAttribute': 'cudaFuncSetAttribute',
-    'hggcFuncGetAttributes': 'cudaFuncGetAttributes',
-    'hggcGetErrorString': 'cudaGetErrorString',
-    'hggcGetLastError': 'cudaGetLastError',
-    'hggcGetErrorName': 'cudaGetErrorName',
-    'hggcPeekAtLastError': 'cudaPeekAtLastError',
-    'hggcGetDevice': 'cudaGetDevice',
-    'hggcLaunchKernelEx': 'cudaLaunchKernelEx',
-    'hggcLaunchKernel': 'cudaLaunchKernel',
-    'hggcThreadExchangeStreamCaptureMode': 'cudaThreadExchangeStreamCaptureMode',
-    'hggcStreamCreateWithFlags': 'cudaStreamCreateWithFlags',
-    'hggcStreamIsCapturing': 'cudaStreamIsCapturing',
-    'hggcStreamSynchronize': 'cudaStreamSynchronize',
-    'hggcStreamDestroy': 'cudaStreamDestroy',
-    'hggcMemcpyAsync': 'cudaMemcpyAsync',
-    'hggcMemsetAsync': 'cudaMemsetAsync',
-    'hggcDeviceSynchronize': 'cudaDeviceSynchronize',
-    'hggcSetDevice': 'cudaSetDevice',
-    'hggcMemGetInfo': 'cudaMemGetInfo',
-    'hggcMalloc': 'cudaMalloc',
-    'hggcFree': 'cudaFree',
-    'hggcMemcpy': 'cudaMemcpy',
-    'hggcEventElapsedTime': 'cudaEventElapsedTime',
-    'hggcEventSynchronize': 'cudaEventSynchronize',
-    'hggcEventCreate': 'cudaEventCreate',
-    'hggcEventDestroy': 'cudaEventDestroy',
-    'hggcEventRecord': 'cudaEventRecord',
-    'hgLaunchKernelExAD': 'cuLaunchKernelExAD',
-    'hgGetErrorName': 'cuGetErrorName',
-    'hgGetErrorString': 'cuGetErrorString',
+from general import convert_path  # noqa: E402
 
-    # --- types ---
-    'hggcLaunchConfig_t': 'cudaLaunchConfig_t',
-    'hggcLaunchAttribute': 'cudaLaunchAttribute',
-    'hggcStream_t': 'cudaStream_t',
-    'hggcFunction_t': 'cudaFunction_t',
-    'hggcDataType_t': 'cudaDataType_t',
-    'hggcEvent_t': 'cudaEvent_t',
-    'hggcFuncAttributes': 'cudaFuncAttributes',
-    'hggcFuncAttribute': 'cudaFuncAttribute',
-    'hggcMemcpyKind': 'cudaMemcpyKind',
-    'hggcStreamCaptureStatus': 'cudaStreamCaptureStatus',
-    'hggcStreamCaptureMode': 'cudaStreamCaptureMode',
-    'HGlaunchAttributeAD': 'CUlaunchAttributeAD',
-    'HGlaunchConfigAD': 'CUlaunchConfigAD',
-    'HGfunction': 'CUfunction',
-    'HGresult': 'CUresult',
+# --- residual 1: the forward-declared stream typedef must disappear --------
+# Anchored on the post-general text (the general engine already renamed
+# hggcStream_t -> cudaStream_t and HGstream_st -> CUstream_st).
+FORWARD_DECLARE = (
+    "// Forward-declare cudaStream_t so function signatures match between .cu and .cpp\n"
+    "typedef struct CUstream_st* cudaStream_t;\n"
+)
 
-    # --- enums / constants ---
-    'hggcLaunchAttributeProgrammaticStreamSerialization': 'cudaLaunchAttributeProgrammaticStreamSerialization',
-    'hggcFuncAttributeMaxDynamicSharedMemorySize': 'cudaFuncAttributeMaxDynamicSharedMemorySize',
-    'hggcOccupancyMaxActiveBlocksPerMultiprocessor': 'cudaOccupancyMaxActiveBlocksPerMultiprocessor',
-    'hggcOccupancyDisableCachingOverride': 'cudaOccupancyDisableCachingOverride',
-    'hggcDevAttrMaxSharedMemoryPerMultiprocessor': 'cudaDevAttrMaxSharedMemoryPerMultiprocessor',
-    'hggcDevAttrMaxSharedMemoryPerBlockOptin': 'cudaDevAttrMaxSharedMemoryPerBlockOptin',
-    'hggcDevAttrMultiProcessorCount': 'cudaDevAttrMultiProcessorCount',
-    'hggcDevAttrComputeCapabilityMajor': 'cudaDevAttrComputeCapabilityMajor',
-    'hggcDevAttrComputeCapabilityMinor': 'cudaDevAttrComputeCapabilityMinor',
-    'hggcStreamCaptureModeRelaxed': 'cudaStreamCaptureModeRelaxed',
-    'hggcStreamCaptureStatusNone': 'cudaStreamCaptureStatusNone',
-    'hggcStreamNonBlocking': 'cudaStreamNonBlocking',
-    'hggcStreamDefault': 'cudaStreamDefault',
-    'hggcMemcpyDeviceToHost': 'cudaMemcpyDeviceToHost',
-    'hggcMemcpyDeviceToDevice': 'cudaMemcpyDeviceToDevice',
-    'hggcMemcpyHostToDevice': 'cudaMemcpyHostToDevice',
-    'hggcMemcpyHostToHost': 'cudaMemcpyHostToHost',
-    'hggcErrorUnknown': 'cudaErrorUnknown',
-    'hggcSuccess': 'cudaSuccess',
-    'hggcError': 'cudaError',
-    'HGGC_SUCCESS': 'CUDA_SUCCESS',
-    'HGAD_LAUNCH_ATTRIBUTE_IGNORE': 'CUAD_LAUNCH_ATTRIBUTE_IGNORE',
-
-    # --- device built-in types ---
-    '__hg_fp8': '__nv_fp8',
-    '__ppu_bfloat162': '__nv_bfloat162',
-    '__ppu_bfloat16_raw': '__nv_bfloat16_raw',
-    '__ppu_bfloat16': '__nv_bfloat16',
-}
-
-CONVERT_HEADER = {
-    '<hggc_runtime.h>': '<cuda_runtime.h>',
-    '"hggc_runtime.h"': '"cuda_runtime.h"',
-    '<hggc_fp16.h>': '<cuda_fp16.h>',
-    '<hggc_bf16.h>': '<cuda_bf16.h>',
-    '<hggc_pipeline.h>': '<cuda_pipeline.h>',
-    '<hggc_awbarrier.h>': '<cuda_awbarrier.h>',
-    '<hggc_ad.h>': '"cuda_ad.h"',
-    '<hgtx3/hgToolsExt.h>': '<nvtx3/nvToolsExt.h>',
-}
-
-# The hgtx (profiling) family plus the RTC compiler macro. __HGGC_ARCH__ and
-# __HGGCCC__ are NOT converted: the PPU frontend auto-defines both, and the
-# sources use __HGGCCC__ as the platform discriminator for the driver-AD path.
-CONVERT_MACRO = {
-    '__HGGCCC_RTC__': '__CUDACC_RTC__',
-    'HGTX_MESSAGE_TYPE_ASCII': 'NVTX_MESSAGE_TYPE_ASCII',
-    'HGTX_VERSION': 'NVTX_VERSION',
-    'hgtxEventAttributes_t': 'nvtxEventAttributes_t',
-    'hgtxDomainHandle_t': 'nvtxDomainHandle_t',
-    'hgtxDomainCreateA': 'nvtxDomainCreateA',
-    'hgtxDomainDestroy': 'nvtxDomainDestroy',
-    'hgtxDomainRangePushEx': 'nvtxDomainRangePushEx',
-    'hgtxDomainRangePop': 'nvtxDomainRangePop',
-    'use_hgtx_': 'use_nvtx_',
-}
-
-# Diagnostic strings, renamed together with the API they report on, plus the one
-# declaration that has to disappear instead of being renamed: api/common.h
-# forward-declares hggcStream_t because the PPU SDK headers are not on the host
-# compiler's include path, while the compat build gets cudaStream_t from
-# cuda_runtime.h via torch -- renaming it would collide with that typedef.
-# Longest-first matching makes this block win over the bare hggcStream_t entry.
-CONVERT_TEXT = {
-    '// Forward-declare hggcStream_t so function signatures match between .cu and .cpp\n'
-    'typedef struct HGstream_st* hggcStream_t;\n': '',
-    'HG driver error': 'CUDA driver error',
-    'HGGC error': 'CUDA error',
-}
+# --- residual 2/3: setup.py build additions (idempotent) -------------------
+DRIVER_LIB_ANCHOR = (
+    "        sources=get_sources(),\n"
+    "        extra_compile_args={\n"
+)
+DRIVER_LIB_INSERT = (
+    "        sources=get_sources(),\n"
+    "        libraries=['cuda'],\n"
+    "        extra_compile_args={\n"
+)
+PTXAS_ANCHOR = (
+    '                    "--use_fast_math",\n'
+    '                    "-mllvm",\n'
+)
+PTXAS_INSERT = (
+    '                    "--use_fast_math",\n'
+    '                    "--ptxas-options=-v,--register-usage-level=10",\n'
+    '                    "-mllvm",\n'
+)
 
 
-def get_all_convert_maps():
-    """Merge all maps."""
-    merged = {}
-    merged.update(CONVERT_RUNTIME_API)
-    merged.update(CONVERT_HEADER)
-    merged.update(CONVERT_MACRO)
-    merged.update(CONVERT_TEXT)
-    return merged
-
-
-# =============================================================================
-# Replacement engine (acompute style)
-# =============================================================================
-
-def build_pattern(maps):
-    """Build compiled regex from maps dict, longest key first."""
-    sorted_keys = sorted(maps.keys(), key=lambda x: -len(x))
-    return re.compile("|".join(re.escape(k) for k in sorted_keys))
-
-
-def replace_content(content, maps, pattern):
-    """Apply dict-based replacement in a single pass."""
-    return pattern.sub(lambda m: maps[m.group(0)], content)
-
-
-def _rewrite_torch_ext_setup_py(content):
-    """Transform a setup.py that already uses torch BuildExtension/CUDAExtension.
-
-    Beyond the hgcc identifiers, the compat build also needs the ppu arch flag, the
-    cuda driver library and the ptxas resource report. The two insertions are guarded
-    so a second run does not duplicate them.
-    """
-    # --- hgcc -> nvcc identifiers ---
-    content = content.replace('hgcc', 'nvcc')
-
-    # --- ppu arch flags -> gencode ---
-    content = content.replace(
-        'cc_flag.append("-arch=ppu_10")\n'
-        'cc_flag.append("-arch=ppu_15")\n',
-        'cc_flag.append("-gencode")\n'
-        'cc_flag.append("arch=compute_80,code=sm_80")\n')
-
-    # --- cuda driver library, needed by the driver-AD launch path ---
-    if "libraries=['cuda']" not in content:
-        content = content.replace(
-            '        sources=get_sources(),\n'
-            '        extra_compile_args={\n',
-            '        sources=get_sources(),\n'
-            "        libraries=['cuda'],\n"
-            '        extra_compile_args={\n')
-
-    # --- ptxas resource report + register usage level ---
-    if '--ptxas-options' not in content:
-        content = content.replace(
-            '                    "--use_fast_math",\n'
-            '                    "-mllvm",\n',
-            '                    "--use_fast_math",\n'
-            '                    "--ptxas-options=-v,--register-usage-level=10",\n'
-            '                    "-mllvm",\n')
-
-    return content
-
-
-def rewrite_setup_py():
-    """Transform setup.py to the cuda-compatible CUDAExtension form.
-
-    setup.py is expected to already use torch CUDAExtension, so only the hgcc
-    identifiers, the ppu arch flags and the build-tuning args need converting.
-    The legacy hand-written HGCCBuildExtension shape is no longer converted.
-    """
-    targets = ['setup.py']
-    count = 0
-    for fp in targets:
-        if not os.path.isfile(fp):
-            continue
-        content = open(fp).read()
-
-        if 'HGCCBuildExtension' in content:
-            print(f"  WARNING: {fp} uses the legacy HGCCBuildExtension, which this "
-                  f"script no longer converts, left untouched")
-            continue
-        if 'CUDAExtension' not in content:
-            print(f"  WARNING: {fp} matches no known shape, left untouched")
-            continue
-
-        new_content = _rewrite_torch_ext_setup_py(content)
-        if '-arch=ppu_' in new_content or 'hgcc' in new_content:
-            print(f"  WARNING: {fp} still has PPU-only build flags after rewrite")
-        if new_content != content:
-            open(fp, 'w').write(new_content)
-            count += 1
-    return count
-
-
-# =============================================================================
-# Bulk file transformation
-# =============================================================================
-
-SUFFIXES = ('.h', '.hpp', '.cu', '.cuh', '.cpp', '.inl')
-
-
-def find_source_files(directories):
-    """Find all source files in given directories."""
-    files = []
-    for d in directories:
-        if not os.path.isdir(d):
-            continue
-        for root, _, filenames in os.walk(d):
-            # Skip the actlize submodule, converted by the actlize script
-            if 'actlize' in root:
-                continue
-            for f in filenames:
-                if f.endswith(SUFFIXES):
-                    files.append(os.path.join(root, f))
-    return files
-
-
-def transform_content(content, maps, pattern):
-    """Apply every conversion to one file's content."""
-    # Skip files that carry no ppu-original token
-    if not re.search(r'\bhggc|\bPPU10_|__hg_fp8|__ppu_bfloat16|<hgtx3/|<hggc_', content):
-        return content
-
-    new_content = replace_content(content, maps, pattern)
-    return new_content
-
-
-def transform_file(filepath, maps, pattern):
-    """Apply the conversions to a single file."""
+def _read_text(filepath: str):
     try:
-        with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-            content = f.read()
-    except (IOError, OSError):
-        return False
+        with open(filepath, "r", encoding="utf-8", errors="surrogateescape",
+                  newline="") as f:
+            return f.read()
+    except OSError as exc:
+        print(f"  [residual] WARNING: cannot read {filepath}: {exc}")
+        return None
 
-    new_content = transform_content(content, maps, pattern)
-    if new_content == content:
-        return False
 
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(new_content)
+def _write_text(filepath: str, content: str) -> bool:
+    try:
+        with open(filepath, "w", encoding="utf-8", errors="surrogateescape",
+                  newline="") as f:
+            f.write(content)
+    except OSError as exc:
+        print(f"  [residual] WARNING: cannot write {filepath}: {exc}")
+        return False
     return True
 
 
-# =============================================================================
-# Main
-# =============================================================================
+def apply_residuals(target_dir: str, dry_run: bool, verbose: bool) -> int:
+    """Apply the FlashMLA-specific residual rules; returns files changed."""
+    changed = 0
+
+    common_h = os.path.join(target_dir, "csrc", "api", "common.h")
+    if os.path.isfile(common_h):
+        content = _read_text(common_h)
+        if content is not None and FORWARD_DECLARE in content:
+            if verbose:
+                print("  [residual] drop forward-declared cudaStream_t "
+                      "(csrc/api/common.h)")
+            converted = content.replace(FORWARD_DECLARE, "")
+            if dry_run or _write_text(common_h, converted):
+                changed += 1
+
+    setup_py = os.path.join(target_dir, "setup.py")
+    if os.path.isfile(setup_py):
+        content = _read_text(setup_py)
+        if content is None:
+            return changed
+        original = content
+        if "libraries=['cuda']" not in content and DRIVER_LIB_ANCHOR in content:
+            if verbose:
+                print("  [residual] link the CUDA driver library (setup.py)")
+            content = content.replace(DRIVER_LIB_ANCHOR, DRIVER_LIB_INSERT)
+        if "--ptxas-options" not in content and PTXAS_ANCHOR in content:
+            if verbose:
+                print("  [residual] enable ptxas resource report (setup.py)")
+            content = content.replace(PTXAS_ANCHOR, PTXAS_INSERT)
+        if content != original and (dry_run or _write_text(setup_py, content)):
+            changed += 1
+
+    return changed
+
+
+def _preview_tree(target_dir: str):
+    preview = tempfile.TemporaryDirectory(prefix="cudafy-flashmla-")
+    work_dir = os.path.join(preview.name, "repo")
+    shutil.copytree(
+        target_dir, work_dir,
+        ignore=shutil.ignore_patterns(".git", "__pycache__", "build", "dist",
+                                      ".eggs", "*.egg-info"),
+    )
+    return preview, work_dir
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description='FlashMLA PPU-original -> CUDA-Compatible Transform (no git dependency)')
+        description='FlashMLA PPU-original -> CUDA-Compatible Transform '
+                    '(general engine + residuals)')
     parser.add_argument('target_dir', nargs='?', default='.',
                         help='Target FlashMLA root directory')
     parser.add_argument('--dry-run', action='store_true',
@@ -318,8 +148,7 @@ def main():
     if (not os.path.isfile(os.path.join(target_dir, 'setup.py')) or
             not os.path.isdir(os.path.join(target_dir, 'csrc'))):
         print(f"ERROR: {target_dir} is not a FlashMLA root directory.")
-        sys.exit(1)
-    os.chdir(target_dir)
+        return 1
 
     print("=" * 60)
     print("FlashMLA PPU-original -> CUDA-Compatible Transform")
@@ -327,57 +156,39 @@ def main():
     print("=" * 60)
 
     t0 = time.time()
-
-    # Step 1: Bulk replacement over the whole source tree (hggc->cuda, hgtx->nvtx,
-    # the per-file rewrites and the __HGGCCC__ guards).
-    print("\n[1/2] Bulk HGGC/HGTX -> CUDA/NVTX replacement...")
-    maps = get_all_convert_maps()
-    pattern = build_pattern(maps)
-
-    source_dirs = ['csrc']
-    files = find_source_files(source_dirs)
-    print(f"  Found {len(files)} source files")
-
-    n_transformed = 0
-    for f in sorted(files):
-        if args.dry_run:
-            content = open(f, encoding='utf-8', errors='replace').read()
-            if transform_content(content, maps, pattern) != content:
-                n_transformed += 1
-                if args.verbose:
-                    print(f"    [dry-run] {f}")
-        else:
-            if transform_file(f, maps, pattern):
-                n_transformed += 1
-                if args.verbose:
-                    print(f"    {f}")
-    print(f"  Transformed {n_transformed} files")
-
-    # Step 2: setup.py build-flag transformation
-    print("\n[2/2] Setup.py transformation...")
-    n_setup = 0
-    if not args.dry_run:
-        n_setup = rewrite_setup_py()
-    else:
-        print("  [dry-run] Would modify setup.py")
-    print(f"  Modified {n_setup} files")
-
-    # Summary
-    t1 = time.time()
-    print(f"\nDone in {t1 - t0:.1f}s")
-    print("=" * 60)
-    print(f"  Bulk replace:  {n_transformed}")
-    print(f"  Setup.py:      {n_setup}")
-    print("=" * 60)
-
+    preview = None
+    work_dir = target_dir
     if args.dry_run:
-        print("\n  [DRY RUN - no files modified]")
-    else:
-        print("\n  Next steps:")
-        print("  1. Build: python setup.py bdist_wheel")
-        print("  2. Install: pip install dist/flash_mla-*.whl --force-reinstall --no-deps")
-        print("  3. Test: python -m pytest tests/test_flash_mla.py -v")
+        preview, work_dir = _preview_tree(target_dir)
+        print("  Preview runs against an isolated temporary copy.")
+
+    try:
+        print("\n[1/2] General engine (full SDK map + compile chain)...")
+        scanned, changed, renamed, _ = convert_path(
+            work_dir, dry_run=False, verbose=args.verbose)
+        print(f"  Files scanned: {scanned}")
+        print(f"  Files changed: {changed}")
+        print(f"  Renames:       {renamed}")
+
+        print("\n[2/2] FlashMLA residual rules...")
+        n_residual = apply_residuals(work_dir, False, args.verbose)
+        print(f"  Residual changes: {n_residual}")
+
+        print(f"\nDone in {time.time() - t0:.1f}s")
+        print("=" * 60)
+
+        if args.dry_run:
+            print("\n  [DRY RUN - no source files modified]")
+        else:
+            print("\n  Next steps:")
+            print("  1. Build: python setup.py bdist_wheel")
+            print("  2. Install: pip install dist/flash_mla-*.whl --force-reinstall --no-deps")
+            print("  3. Test: python -m pytest tests/test_flash_mla.py -v")
+        return 0
+    finally:
+        if preview is not None:
+            preview.cleanup()
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
