@@ -17097,6 +17097,24 @@ SDK_FUNCTION_MAP = {
     'hgpps': 'npps',
     'hggc': 'cuda',
     'hgml': 'nvml',
+    '__hg_cvt_bfloat162raw_to_e8m0x2': '__nv_cvt_bfloat162raw_to_e8m0x2',
+    '__hg_cvt_bfloat16raw2_to_fp8x2': '__nv_cvt_bfloat16raw2_to_fp8x2',
+    '__hg_cvt_bfloat16raw_to_e8m0': '__nv_cvt_bfloat16raw_to_e8m0',
+    '__hg_cvt_bfloat16raw_to_fp8': '__nv_cvt_bfloat16raw_to_fp8',
+    '__hg_cvt_e8m0x2_to_bf162raw': '__nv_cvt_e8m0x2_to_bf162raw',
+    '__hg_cvt_double2_to_e8m0x2': '__nv_cvt_double2_to_e8m0x2',
+    '__hg_cvt_fp8x2_to_halfraw2': '__nv_cvt_fp8x2_to_halfraw2',
+    '__hg_cvt_halfraw2_to_fp8x2': '__nv_cvt_halfraw2_to_fp8x2',
+    '__hg_cvt_double2_to_fp8x2': '__nv_cvt_double2_to_fp8x2',
+    '__hg_cvt_float2_to_e8m0x2': '__nv_cvt_float2_to_e8m0x2',
+    '__hg_cvt_e8m0_to_bf16raw': '__nv_cvt_e8m0_to_bf16raw',
+    '__hg_cvt_float2_to_fp8x2': '__nv_cvt_float2_to_fp8x2',
+    '__hg_cvt_double_to_e8m0': '__nv_cvt_double_to_e8m0',
+    '__hg_cvt_fp8_to_halfraw': '__nv_cvt_fp8_to_halfraw',
+    '__hg_cvt_halfraw_to_fp8': '__nv_cvt_halfraw_to_fp8',
+    '__hg_cvt_double_to_fp8': '__nv_cvt_double_to_fp8',
+    '__hg_cvt_float_to_e8m0': '__nv_cvt_float_to_e8m0',
+    '__hg_cvt_float_to_fp8': '__nv_cvt_float_to_fp8',
 }
 
 # Category 4 -- types, handles and device builtins.
@@ -20682,6 +20700,21 @@ SDK_MACRO_MAP = {
     'HGGCRT': 'CUDART',
     'HGGC': 'CUDA',
     'HGTX': 'NVTX',
+    '__hg_is_extended_device_lambda_with_preserved_return_type': '__nv_is_extended_device_lambda_with_preserved_return_type',
+    '__hg_is_extended_host_device_lambda_closure_type': '__nv_is_extended_host_device_lambda_closure_type',
+    '__hg_is_extended_device_lambda_closure_type': '__nv_is_extended_device_lambda_closure_type',
+    '__HG_THREAD_SCOPE_CLUSTER': '__NV_THREAD_SCOPE_CLUSTER',
+    '__HG_THREAD_SCOPE_DEVICE': '__NV_THREAD_SCOPE_DEVICE',
+    '__HG_THREAD_SCOPE_SYSTEM': '__NV_THREAD_SCOPE_SYSTEM',
+    '__HG_THREAD_SCOPE_THREAD': '__NV_THREAD_SCOPE_THREAD',
+    '__HG_THREAD_SCOPE_BLOCK': '__NV_THREAD_SCOPE_BLOCK',
+    '__hg_tex_surf_handler': '__nv_tex_surf_handler',
+    '__hg_saturation_t': '__nv_saturation_t',
+    '__hg_itex_trait': '__nv_itex_trait',
+    '__HG_SATFINITE': '__NV_SATFINITE',
+    '__HG_NOSAT': '__NV_NOSAT',
+    '__HG_E4M3': '__NV_E4M3',
+    '__HG_E5M2': '__NV_E5M2',
 }
 
 # Category 6 -- compiler-predefined macros (not in SDK headers).
@@ -20711,6 +20744,7 @@ NON_SDK_TEXT_MAP = {
 # Category 9 -- repo-local identifiers (e.g. DG_JIT_USE_HGRTC).
 NON_SDK_TOKEN_MAP = {
     'lazy_hgTensorMapEncodeTiled': 'lazy_cuTensorMapEncodeTiled',
+    'hggc_device_runtime_api.h': 'cuda_device_runtime_api.h',
     'lazy_hgModuleGetFunction': 'lazy_cuModuleGetFunction',
     'lazy_hgFuncSetAttribute': 'lazy_cuFuncSetAttribute',
     'lazy_hgGetErrorString': 'lazy_cuGetErrorString',
@@ -20730,6 +20764,7 @@ NON_SDK_TOKEN_MAP = {
     'is_acComplex': 'is_cuComplex',
     'BF16_HGRTC': 'BF16_NVRTC',
     'INT8_HGRTC': 'INT8_NVRTC',
+    'hggc_fp4.h': 'cuda_fp4.h',
     'hggc_type_': 'cuda_type_',
     'FP8_HGRTC': 'FP8_NVRTC',
     'hg_kernel': 'cu_kernel',
@@ -20741,6 +20776,9 @@ NON_SDK_TOKEN_MAP = {
 # Category 10 -- SAILify platform naming (COMPATIBLE_ARCH family).
 NON_SDK_SAILIFY_MAP = {
     '__COMPATIBLECC_VER_MAJOR__': '__CUDACC_VER_MAJOR__',
+    '__COMPATIBLECC_VER_MINOR__': '__CUDACC_VER_MINOR__',
+    '__COMPATIBLECC_VER_BUILD__': '__CUDACC_VER_BUILD__',
+    'COMPATIBLE_VERSION': 'CUDA_VERSION',
     'COMPATIBLE_ARCH': '__CUDA_ARCH__',
 }
 
@@ -20763,5 +20801,6 @@ NON_SDK_PREFIX_OPEN = {
     'ACBLAS': 'CUBLAS',
     'Acblas': 'Cublas',
     'HGBIN': 'CUBIN',
+    '__hg_': '__nv_',
 }
 
