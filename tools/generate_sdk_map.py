@@ -103,6 +103,13 @@ PREFIX_SUBS = [
     ("__ppu", "__nv"),
     ("__PPU", "__NV"),
     ("__hg_fp8", "__nv_fp8"),
+    # Remaining __hg_-prefixed SDK symbols: fp8/fp6/e8m0 conversion
+    # intrinsics (__hg_cvt_*), saturation/interpretation enum constants
+    # (__HG_SATFINITE, __HG_E4M3, ...) and the __hg_saturation_t enum type.
+    # Must precede the generic HG/hg driver rules, which would otherwise
+    # produce __CU_* / __cu_* garbage for these tokens.
+    ("__hg_", "__nv_"),
+    ("__HG_", "__NV_"),
     ("ppu_bfloat16", "nv_bfloat16"),
     # fatbin artifact naming
     ("HGBIN", "CUBIN"),
@@ -137,6 +144,8 @@ TOKEN_REGEXES = [
     r"\b__ppu\w*",
     r"\b__PPU\w*",
     r"\b__hg_fp8\w*",
+    r"\b__hg_\w*",
+    r"\b__HG_\w*",
     r"\bppu_bfloat16\w*",
 ]
 
@@ -174,6 +183,9 @@ DIAGNOSTIC_TEXT = [
 SAILIFY_TOKENS = [
     ("COMPATIBLE_ARCH", "__CUDA_ARCH__"),
     ("__COMPATIBLECC_VER_MAJOR__", "__CUDACC_VER_MAJOR__"),
+    ("__COMPATIBLECC_VER_MINOR__", "__CUDACC_VER_MINOR__"),
+    ("__COMPATIBLECC_VER_BUILD__", "__CUDACC_VER_BUILD__"),
+    ("COMPATIBLE_VERSION", "CUDA_VERSION"),
 ]
 
 # Directory-name / include-path-fragment mappings.
@@ -203,6 +215,7 @@ CURATED_PREFIX_OPEN = [
     ("acblasCgemm", "cublasCgemm"),
     ("acblasZgemm", "cublasZgemm"),
     ("__HGGC_STD_", "__NV_STD_"),
+    ("__hg_", "__nv_"),
 ]
 
 # Tokens that must never be mapped:
@@ -256,6 +269,8 @@ HISTORICAL_TOKENS = [
     ("hggcTypedefs", "cudaTypedefs"),
     ("hggc_type_", "cuda_type_"),
     ("hggc_vector_types.h", "vector_types.h"),
+    ("hggc_device_runtime_api.h", "cuda_device_runtime_api.h"),
+    ("hggc_fp4.h", "cuda_fp4.h"),
     ("hgobjdump_path", "cuobjdump_path"),
     ("kernel.hgbin", "kernel.cubin"),
     ("lazy_hgFuncSetAttribute", "lazy_cuFuncSetAttribute"),
@@ -373,6 +388,8 @@ def classify_sdk_token(token: str) -> str:
         return "SDK_HEADER_MAP"
     if token.startswith(("__ppu", "__PPU", "__hg_fp8")) or token.startswith("ppu_bfloat16"):
         return "SDK_TYPE_MAP"       # device builtin types
+    if token.startswith("__hg_cvt"):
+        return "SDK_FUNCTION_MAP"   # fp8/fp6/e8m0 conversion intrinsics
     if token.startswith("__") or re.fullmatch(r"[A-Z][A-Z0-9_]*", token):
         return "SDK_MACRO_MAP"      # macros and enum constants
     if token.endswith("_t"):

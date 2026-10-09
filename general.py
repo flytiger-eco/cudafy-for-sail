@@ -162,7 +162,7 @@ def convert_text(content: str) -> str:
 
 TEXT_EXTENSIONS = {
     ".h", ".hpp", ".cuh", ".cu", ".c", ".cpp", ".cc", ".cxx", ".inl", ".inc",
-    ".py", ".sh", ".cmake", ".md",
+    ".py", ".sh", ".cmake", ".md", ".jinja",
 }
 TEXT_FILENAMES = {"CMakeLists.txt", "Makefile"}
 

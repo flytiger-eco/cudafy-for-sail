@@ -66,6 +66,30 @@ DROP_DEFINE_TEXT_RE = re.compile(
 DROP_XHG_LIST_RE = re.compile(r"(?m)^[ \t]*\w+\.extend\(\['-x', 'hg'\]\)\r?\n")
 DROP_XHG_TEXT_RE = re.compile(r"[ ]+-x hg\b")
 
+_FSTR_FIELD = r"\{[^{}\n]*\}"
+_FSTR_FIELD_COMPAT = r"\{[^{}\n]*\.ppu_compat[^{}\n]*\}"
+_SUBST_FIELD = r"\$\([^()\n]*\)"
+_PATH_CHAR = r"[^\s\"'{}\[\]();,<>|&#`]"
+_FLAG_PATH = (
+    r"(?:" + _FSTR_FIELD + r"|" + _SUBST_FIELD + r"|" + _PATH_CHAR + r")*"
+)
+_COMPAT_I_PATH = (
+    _FLAG_PATH + r"(?:\.ppu_compat|" + _FSTR_FIELD_COMPAT + r")" + _FLAG_PATH
+)
+_COMPAT_I_ELEMENT = r"[fF]?(?P<q>['\"])-I" + _COMPAT_I_PATH + r"(?P=q)"
+
+# Whole-line matches only: the sole shape in the conversion targets is a list
+# literal with one flag per line. Inline shapes (.append() arguments, conditional
+# elements, tuples, "-include=...") are left intact -- a partial edit there yields
+# SyntaxError/TypeError, while an unconverted flag merely stays visible.
+DROP_PPU_COMPAT_I_RE = re.compile(
+    r"^[ \t]*" + _COMPAT_I_ELEMENT + r",?[ \t]*\r?\n", re.M
+)
+DROP_COMPAT_WRAPPER_RE = re.compile(
+    r"(?m)^[ \t]*['\"]-include['\"],[ \t]*['\"]compatible_wrapper\.h['\"],?[ \t]*\r?\n"
+    r"|^[ \t]*-include[ \t=]+(['\"]?)compatible_wrapper\.h\1,?[ \t]*\r?\n"
+)
+
 
 def apply_compile_chain(content: str) -> str:
     """Apply the general compile-chain rules to one file's content."""
@@ -77,6 +101,8 @@ def apply_compile_chain(content: str) -> str:
     content = DROP_DEFINE_TEXT_RE.sub("", content)
     content = DROP_XHG_LIST_RE.sub("", content)
     content = DROP_XHG_TEXT_RE.sub("", content)
+    content = DROP_PPU_COMPAT_I_RE.sub("", content)
+    content = DROP_COMPAT_WRAPPER_RE.sub("", content)
 
     for old, new in COMPILER_IDENTITY_SUBS:
         if old in content:
