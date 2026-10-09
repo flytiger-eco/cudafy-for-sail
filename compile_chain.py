@@ -4,9 +4,8 @@ These rules run on every text file the general engine processes. They cover
 the build-chain differences shared by all upper repositories:
 
   - compiler identity: hgcc -> nvcc (identifiers, paths, dict keys, labels)
-  - arch flags: -arch=ppu_10 / -arch=ppu_15 -> a single
-    -gencode=arch=compute_80,code=sm_80 (the sm_80 gencode compiles device
-    code for both PPU generations)
+  - arch flags: -arch=ppu_10 -> compute_80a/sm_80a and
+    -arch=ppu_15 -> compute_89/sm_89, preserving both flags when present
   - fatbin artifact naming: hgbin -> cubin (flag and file suffix)
   - PPU-only -D defines that no converted source consumes
   - -x hg language override and the PPU LLVM backend flag prefix
@@ -32,20 +31,13 @@ COMPILER_IDENTITY_SUBS = [
 # ---------------------------------------------------------------------------
 # Arch flags.
 # ---------------------------------------------------------------------------
-GENCODE_SM80 = "-gencode=arch=compute_80,code=sm_80"
-
-# The common setup.py shape: two adjacent append() calls selecting ppu_10 and
-# ppu_15. Collapsed into ONE gencode appends, mirroring the FlashMLA
-# conversion (any receiver variable name, either arch order).
-ARCH_BLOCK_RE = re.compile(
-    r"(?P<indent>[ \t]*)(?P<recv>\w+)\.append\((?P<q1>[\"'])-arch=ppu_(?:10|15)(?P=q1)\)\r?\n"
-    r"[ \t]*(?P=recv)\.append\((?P<q2>[\"'])-arch=ppu_(?:10|15)(?P=q2)\)"
-)
+GENCODE_SM80a = "-gencode=arch=compute_80a,code=sm_80a"
+GENCODE_SM89 = "-gencode=arch=compute_89,code=sm_89"
 
 # Any remaining single arch flag, in any quoting style.
 ARCH_FLAG_SUBS = [
-    ("-arch=ppu_10", GENCODE_SM80),
-    ("-arch=ppu_15", GENCODE_SM80),
+    ("-arch=ppu_10", GENCODE_SM80a),
+    ("-arch=ppu_15", GENCODE_SM89),
 ]
 
 # ---------------------------------------------------------------------------
@@ -77,11 +69,6 @@ DROP_XHG_TEXT_RE = re.compile(r"[ ]+-x hg\b")
 
 def apply_compile_chain(content: str) -> str:
     """Apply the general compile-chain rules to one file's content."""
-    # Arch block first so the two-line pattern wins over per-flag subs.
-    content = ARCH_BLOCK_RE.sub(
-        lambda m: f"{m.group('indent')}{m.group('recv')}.append(\"{GENCODE_SM80}\")",
-        content,
-    )
     for old, new in ARCH_FLAG_SUBS + FLAG_SUBS:
         if old in content:
             content = content.replace(old, new)

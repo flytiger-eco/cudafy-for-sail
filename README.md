@@ -17,8 +17,9 @@ Every conversion is the sum of two layers:
      `DG_JIT_USE_HGRTC`, SAILify platform naming); categories 11-12 are
      prefix-open maps.
    - `compile_chain.py` -- the shared compile-chain translation: `hgcc` ->
-     `nvcc`, PPU arch flags -> a single `-gencode=arch=compute_80,code=sm_80`
-     (device code for both PPU generations), `hgbin` -> `cubin`, removal of
+     `nvcc`, `-arch=ppu_10` -> `-gencode=arch=compute_80a,code=sm_80a`,
+     `-arch=ppu_15` -> `-gencode=arch=compute_89,code=sm_89`
+     (both flags are preserved when requested), `hgbin` -> `cubin`, removal of
      PPU-only `-D` defines.
    - `general.py` (the conversion engine) -- applies the above, renames
      files and directories whose names the map converts (so rewritten
