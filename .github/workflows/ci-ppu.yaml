@@ -1,0 +1,70 @@
+name: cudafy checkin
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: ci-ppu-cudafy-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  precheck:
+    name: Pre-check
+    uses: flytiger-eco/.github/.github/workflows/user-precheck.yml@main
+    secrets: inherit
+
+  ai-code-review:
+    name: AI Code Review (Copilot Gate)
+    needs: precheck
+    uses: flytiger-eco/.github/.github/workflows/ai-code-review.yml@main
+    secrets: inherit
+
+  human-review:
+    name: Human Review Gate
+    needs: precheck
+    uses: flytiger-eco/.github/.github/workflows/human-review.yml@main
+    secrets: inherit
+
+  deepgemm-ut-tests:
+    name: DeepGEMM conversion and UT
+    needs: precheck
+    uses: ./.github/workflows/pr-deepgemm-ut.yaml
+    secrets: inherit
+
+  flash-attention-ut-272:
+    name: FlashAttention 2.7.2 conversion and UT
+    needs: precheck
+    uses: ./.github/workflows/pr-fa-ut.yaml
+    with:
+      version: '2.7.2'
+    secrets: inherit
+
+  flash-attention-ut-274:
+    name: FlashAttention 2.7.4 conversion and UT
+    needs: precheck
+    uses: ./.github/workflows/pr-fa-ut.yaml
+    with:
+      version: '2.7.4'
+    secrets: inherit
+
+  flash-attention-ut-282:
+    name: FlashAttention 2.8.2 conversion and UT
+    needs: precheck
+    uses: ./.github/workflows/pr-fa-ut.yaml
+    with:
+      version: '2.8.2'
+    secrets: inherit
+
+  flashmla-ut-tests:
+    name: FlashMLA conversion and UT
+    needs: precheck
+    uses: ./.github/workflows/pr-flashmla.yaml
+    secrets: inherit

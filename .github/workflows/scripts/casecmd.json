@@ -1,0 +1,62 @@
+{
+  "fa2": [
+    "tests/test_flash_attn.py::test_flash_attn_bwd_overflow",
+    "tests/test_flash_attn.py::test_flash_attn_bwd_transpose",
+    "tests/test_flash_attn.py::test_flash_attn_bwd_varlen_overflow",
+    "tests/test_flash_attn.py::test_flash_attn_causal",
+    "tests/test_flash_attn.py::test_flash_attn_deterministic",
+    "tests/test_flash_attn.py::test_flash_attn_kvcache",
+    "# tests/test_flash_attn.py::test_flash_attn_output # expect 4 failures",
+    "tests/test_flash_attn.py::test_flash_attn_qkvpacked",
+    "tests/test_flash_attn.py::test_flash_attn_race_condition",
+    "# tests/test_flash_attn.py::test_flash_attn_splitkv # expect 8 failures",
+    "tests/test_flash_attn.py::test_flash_attn_varlen_causal",
+    "tests/test_flash_attn.py::test_flash_attn_varlen_deterministic",
+    "tests/test_flash_attn.py::test_flash_attn_varlen_output",
+    "tests/test_flash_attn.py::test_flash_attn_varlen_qkvpacked"
+  ],
+  "fa3": [
+    "# hopper/test_flash_attn.py::test_flash_attn_output # expect 2 failures",
+    "# hopper/test_flash_attn.py::test_flash_attn_varlen_output # expect 10 failures",
+    "hopper/test_flash_attn.py::test_flash_attn_kvcache",
+    "hopper/test_flash_attn.py::test_flash_attn_cluster",
+    "# hopper/test_flash_attn.py::test_flash_attn_race_condition # expect 60 failures",
+    "hopper/test_flash_attn.py::test_flash_attn_combine"
+  ],
+  "deepgemm_810e": [
+    "python ./tests/test_core.py",
+    "python ./tests/test_attention.py",
+    "python ./tests/test_jit.py",
+    "python ./tests/run_deep_gemm.py --format=DenseGemm,data_type:tf32,m:8192,n:24,k:16384",
+    "python ./tests/tile_scan_with_test.py --format=GroupedNoPad,data_type:int8,groups:32,m:4096,n:4096,k:7168,em:128,distribution:uniform --thread_count=2",
+    "python ./tests/tile_scan_with_test.py --format=GroupedNoPad,data_type:bf16,groups:16,m:4096,n:1024,k:2048,em:256,distribution:uniform --thread_count=2",
+    "python ./tests/run_deep_gemm.py --format=GroupedFused,data_type:int8,groups:256,num_token:256,topk:8,n:256,k:6144",
+    "python ./tests/run_deep_gemm.py --format=GroupedFused,data_type:int8,groups:256,num_token:2048,topk:8,n:6144,k:128",
+    "python ./tests/run_deep_gemm.py --format=GroupedFused,data_type:bf16,groups:256,num_token:64,topk:8,n:256,k:6144",
+    "python ./tests/run_deep_gemm.py --format=GroupedFused,data_type:bf16,groups:256,num_token:256,topk:8,n:6144,k:128",
+    "python ./tests/run_deep_gemm.py --format=GroupedNoPad,data_type:w4a16,groups:384,m:3072,n:512,k:7168,quant_type:group,group_size:32"
+  ],
+  "deepgemm_890p": [
+    "python ./tests/test_core.py",
+    "python ./tests/test_fp4_core.py",
+    "python ./tests/test_fp8_core.py",
+    "python ./tests/test_attention.py",
+    "python ./tests/test_jit.py",
+    "python ./tests/run_deep_gemm.py --format=DenseGemm,data_type:tf32,m:8192,n:24,k:16384",
+    "python ./tests/tile_scan_with_test.py --format=GroupedNoPad,data_type:int8,groups:32,m:4096,n:4096,k:7168,em:128,distribution:uniform --thread_count=2",
+    "python ./tests/tile_scan_with_test.py --format=GroupedNoPad,data_type:bf16,groups:16,m:4096,n:1024,k:2048,em:256,distribution:uniform --thread_count=2",
+    "python ./tests/run_deep_gemm.py --format=GroupedFused,data_type:int8,groups:256,num_token:256,topk:8,n:256,k:6144",
+    "python ./tests/run_deep_gemm.py --format=GroupedFused,data_type:int8,groups:256,num_token:2048,topk:8,n:6144,k:128",
+    "python ./tests/run_deep_gemm.py --format=GroupedFused,data_type:bf16,groups:256,num_token:64,topk:8,n:256,k:6144",
+    "python ./tests/run_deep_gemm.py --format=GroupedFused,data_type:bf16,groups:256,num_token:256,topk:8,n:6144,k:128",
+    "python ./tests/run_deep_gemm.py --format=GroupedNoPad,data_type:w4a16,groups:384,m:3072,n:512,k:7168,quant_type:group,group_size:32"
+  ],
+  "flashmla": [
+    "python ./tests/test_flash_mla_dense_decoding.py",
+    "python ./tests/test_flash_mla_dense_decoding.py --dtype=fp16",
+    "python ./tests/test_flash_mla_sparse_decoding.py",
+    "python ./tests/test_flash_mla_sparse_prefill.py",
+    "pytest ./tests/test_flash_mla_hggc_graph.py::test_metadata_lazy_gen_and_runtime_refresh_inside_graph_capture -v",
+    "pytest ./tests/test_flash_mla_supplemental.py -v -o console_output_style=classic"
+  ]
+}

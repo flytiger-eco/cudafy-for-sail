@@ -1,0 +1,195 @@
+name: FlashAttention CUDA compatibility UT
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'FA version to convert and test (2.7.2 / 2.7.4 / 2.8.2): job names, NAS paths, the cloned FA branch and the build variants.'
+        required: true
+        type: string
+      matrix:
+        description: Board matrix as a JSON array
+        required: false
+        type: string
+        default: '["OAM-810E", "ZW-M890P"]'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'FA version to convert and test (2.7.2 / 2.7.4 / 2.8.2).'
+        required: true
+        type: string
+        default: '2.8.2'
+      matrix:
+        description: Board matrix as a JSON array
+        required: false
+        type: string
+        default: '["OAM-810E", "ZW-M890P"]'
+
+permissions:
+  contents: read
+
+# ci-ppu.yaml calls this workflow once per FA version inside a single run, so the
+# group must include the version or the three calls cancel each other.
+concurrency:
+  group: cudafy-flash-attention-${{ inputs.version }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  SAIL_IMAGE: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-eic-20261010
+
+jobs:
+  build-test:
+    name: FA ${{ inputs.version }} ${{ matrix.variant }} (${{ matrix.runner }})
+    runs-on: k8s-runner-group-cpu-thead
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 420
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJson(inputs.matrix || '["OAM-810E", "ZW-M890P"]') }}
+        # Only fa2.8.2 converts and tests fa3 in addition to fa2; other versions run fa2 only.
+        variant: ${{ fromJson(inputs.version == '2.8.2' && '["fa2", "fa3"]' || '["fa2"]') }}
+    # Job-level group isolates the variant x runner matrix legs (workflow-level
+    # concurrency cannot reference matrix). The version must be kept here too:
+    # the fa2 legs of the 2.7.2/2.7.4/2.8.2 calls live in the same caller run and
+    # would share a group otherwise.
+    concurrency:
+      group: cudafy-flash-attention-${{ inputs.version }}-${{ matrix.variant }}-${{ matrix.runner }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout cudafy
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Convert, build and test FlashAttention
+        id: ppu-test
+        uses: t-head/ppu-scheduler-action@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          container_options: |
+            cpus: '${{ inputs.version == '2.7.4' && '40' || '30' }}'
+            memory: '240g'
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: board-type=${{ matrix.runner }}
+          namespace: ppu-sched
+          timeout_minutes: ${{ inputs.version == '2.7.2' && 300 || (inputs.version == '2.7.4' && 360 || 420) }}
+          command: |
+            set -ex
+            unset PIP_INDEX_URL
+            git config --global --unset-all url.https://ai-gerrit.eng.t-head.cn/Public/Github/.insteadOf 2>/dev/null || true
+            git config --global --add safe.directory '*'
+
+            CUDAFY_ROOT=/workspace/source
+            TARGET_ROOT=/workspace/target
+            CI_SCRIPTS=/workspace/ci-scripts
+            FA_VERSION='${{ inputs.version }}'
+            # Derive the FA branch from the version (2.7.2 -> feature/add-ci-fa2.7.2).
+            FA_BRANCH="feature/add-ci-fa${FA_VERSION}"
+            VARIANT='${{ matrix.variant }}'
+            VARIANT_UPPER="${VARIANT^^}"
+            git clone --recurse-submodules -b "$FA_BRANCH" \
+              https://github.com/t-head/flash-attention-for-sail.git "$TARGET_ROOT"
+            cp -a "$TARGET_ROOT/.github/workflows/scripts" "$CI_SCRIPTS"
+
+            # The repo-level conversion also converts the bundled actlize copy
+            # (csrc/actlize) together with the tree: 2.7.2 embeds actlize 0.8.0,
+            # 2.7.4/2.8.2 embed actlize 1.0.0.
+            python3 "$CUDAFY_ROOT/cudafy.py" flash-attention \
+              --version="$FA_VERSION" "$TARGET_ROOT"
+            cd "$TARGET_ROOT"
+
+            source /usr/local/PPU_SDK/envsetup.sh || true
+            pip uninstall -y flash-attn flash-attn-3 || true
+            export MAX_JOBS=20
+            export PYTORCH_SAIL_ARCH='ppu_10;ppu_15'
+            export FLASH_ATTENTION_FORCE_BUILD=TRUE
+            pip install 'setuptools==75.8.0' 'packaging==24.2' psutil ninja
+
+            if [[ "$VARIANT" == fa3 ]]; then
+              BUILD_DIR="$TARGET_ROOT/hopper"
+            else
+              BUILD_DIR="$TARGET_ROOT"
+            fi
+            LOG_FILE="$BUILD_DIR/build_${VARIANT}.log"
+            ERROR_LOG="$BUILD_DIR/error_${VARIANT}.log"
+            cd "$BUILD_DIR"
+            python ./setup.py bdist_wheel > "$LOG_FILE" 2> "$ERROR_LOG" &
+            BUILD_PID=$!
+            set +x
+            ELAPSED=0
+            while kill -0 "$BUILD_PID" 2>/dev/null; do
+              sleep 10
+              ELAPSED=$((ELAPSED + 10))
+              if (( ELAPSED % 600 == 0 )); then
+                echo "[$(date '+%F %T')] ${VARIANT_UPPER} build is still running ($((ELAPSED / 60)) min)"
+                tail -n 100 "$LOG_FILE" || true
+              fi
+            done
+            set -x
+            BUILD_EXIT_CODE=0
+            wait "$BUILD_PID" || BUILD_EXIT_CODE=$?
+            if [[ "$BUILD_EXIT_CODE" -ne 0 ]]; then
+              cat "$ERROR_LOG"
+              tail -n 1000 "$LOG_FILE"
+              exit "$BUILD_EXIT_CODE"
+            fi
+            tail -n 200 "$LOG_FILE"
+
+            rm -rf "$BUILD_DIR"/*.egg-info
+            pip install "$BUILD_DIR"/dist/*.whl
+            if [[ "$VARIANT" == fa3 ]]; then
+              pip show -f flash-attn-3 || true
+              export PYTHONPATH="$TARGET_ROOT/hopper${PYTHONPATH:+:$PYTHONPATH}"
+              (cd /tmp && python -c 'import torch, flash_attn_3._C; print(flash_attn_3._C.__file__)')
+            else
+              pip show -f flash-attn || true
+            fi
+
+            pip install numpy==1.26.4 junit-xml einops
+            pip install --upgrade pytest
+            RESULT_FILE="test-results-${VARIANT}.xml"
+            set +e
+            cd "$TARGET_ROOT"
+            # Newer FA branches ship casecmd.json (suite-keyed, requires --suite);
+            # the fa2.8.2 branch still ships per-variant .list files. Pick whichever
+            # exists on the cloned branch.
+            if [[ -f "$CI_SCRIPTS/casecmd.json" ]]; then
+              python "$CI_SCRIPTS/pr-run-fa-ut.py" \
+                --caselist "$CI_SCRIPTS/casecmd.json" --suite "$VARIANT" \
+                --output "$RESULT_FILE"
+            else
+              python "$CI_SCRIPTS/pr-run-fa-ut.py" \
+                --caselist "$CI_SCRIPTS/${VARIANT}_pytest.list" \
+                --output "$RESULT_FILE"
+            fi
+            TEST_EXIT_CODE=$?
+            python3 "$CI_SCRIPTS/generate-env-info.py" \
+              --docker-image '${{ env.SAIL_IMAGE }}' \
+              --output env_info.json
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/cudafy-ci/flash-attention/${FA_VERSION}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${VARIANT}"
+            mkdir -p "$NAS_RESULT_DIR"
+            cp "$RESULT_FILE" "$NAS_RESULT_DIR/" 2>/dev/null || true
+            cp env_info.json "$NAS_RESULT_DIR/" 2>/dev/null || true
+            cp "$CI_SCRIPTS/display-test-summary.py" "$NAS_RESULT_DIR/"
+            exit "$TEST_EXIT_CODE"
+          cleanup_policy: on_success
+
+      - name: Test summary
+        if: always()
+        shell: bash
+        run: |
+          VARIANT='${{ matrix.variant }}'
+          NAS_RESULT_DIR="/wl_nas/devops/cudafy-ci/flash-attention/${{ inputs.version }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${VARIANT}"
+          XML_FILE="$NAS_RESULT_DIR/test-results-${VARIANT}.xml"
+          ENV_FILE="$NAS_RESULT_DIR/env_info.json"
+          echo "## FA ${{ inputs.version }} ${{ matrix.variant }} results (${{ matrix.runner }})" >> "$GITHUB_STEP_SUMMARY"
+          if [[ ! -f "$XML_FILE" ]]; then
+            echo "JUnit report not found: $XML_FILE" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          python3 "$NAS_RESULT_DIR/display-test-summary.py" \
+            "$XML_FILE" --env-info "$ENV_FILE"
