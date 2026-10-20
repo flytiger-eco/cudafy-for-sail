@@ -1,0 +1,137 @@
+name: DeepGEMM CUDA compatibility UT
+
+on:
+  workflow_call:
+    inputs:
+      matrix:
+        description: Board matrix as a JSON array
+        required: false
+        type: string
+        default: '["ZW-M890P", "OAM-810E"]'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cudafy-deepgemm-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  SAIL_IMAGE: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-eic-20261010
+
+jobs:
+  build-test:
+    name: test (${{ matrix.runner }})
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 480
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P", "OAM-810E"]') }}
+    # Job-level group isolates the runner matrix legs (workflow-level concurrency
+    # cancels the whole run and cannot distinguish individual legs).
+    concurrency:
+      group: cudafy-deepgemm-${{ matrix.runner }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout cudafy
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Convert, build and test DeepGEMM
+        id: ppu-test
+        uses: flytiger-eco/ppu-distributed-action@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: board-type=${{ matrix.runner }}
+          namespace: ppu-sched
+          timeout_minutes: 420
+          command: |
+            set -ex
+            unset PIP_INDEX_URL
+            # Drop any URL rewrites the image baked into the global git config:
+            # they redirect github.com to the unreachable internal gerrit mirror.
+            for key in $(git config --global --name-only --get-regexp '^url\.'); do
+              git config --global --unset-all "$key"
+            done
+            git config --global --add safe.directory '*'
+
+            CUDAFY_ROOT=/workspace/source
+            TARGET_ROOT=/workspace/target
+            CI_SCRIPTS=/workspace/ci-scripts
+            git clone --recurse-submodules -b main \
+              https://github.com/t-head/DeepGEMM-for-sail.git "$TARGET_ROOT"
+
+            # The target repo ships its own UT runner and per-board
+            # testcase.json caselist; copy them out BEFORE the conversion
+            # (cudafy rewrites .py contents in place).
+            cp -a "$TARGET_ROOT/.github/workflows/scripts" "$CI_SCRIPTS"
+            # Shared summary/env-info helpers are maintained in this repository.
+            cp -a "$CUDAFY_ROOT/.github/workflows/scripts/display-test-summary.py" \
+                  "$CUDAFY_ROOT/.github/workflows/scripts/generate-env-info.py" \
+              "$CI_SCRIPTS/"
+
+            # The repo-level conversion also converts the bundled actlize copies
+            # (third-party/actlize_v0.5.0 and actlize_v1.0.0) together with the tree.
+            python3 "$CUDAFY_ROOT/cudafy.py" deepgemm "$TARGET_ROOT"
+            cd "$TARGET_ROOT"
+
+            source /usr/local/PPU_SDK/envsetup.sh || true
+            pip install 'ray[adag]==2.40.0' --no-deps
+            pip install setuptools==69.5.1 setuptools-scm==9.2.2
+            pip install numpy==1.26.4 junit-xml rich
+            pip install --upgrade pytest
+            export MAX_JOBS=20
+            export PYTORCH_SAIL_ARCH='ppu_10;ppu_15'
+
+            LOG_FILE=build.log
+            ERROR_LOG=error.log
+            set +e
+            python ./setup.py bdist_wheel > "$LOG_FILE" 2> "$ERROR_LOG"
+            BUILD_EXIT_CODE=$?
+            set -e
+            if [[ "$BUILD_EXIT_CODE" -ne 0 ]]; then
+              cat "$ERROR_LOG"
+              tail -n 1000 "$LOG_FILE"
+              exit "$BUILD_EXIT_CODE"
+            fi
+            tail -n 200 "$LOG_FILE"
+            pip install ./dist/*.whl --force-reinstall
+
+            set +e
+            python "$CI_SCRIPTS/pr-deepgemm-ut.py" \
+              --caselist "$CI_SCRIPTS/testcase.json" --suite '${{ matrix.runner }}' \
+              --build-dir "$TARGET_ROOT"
+            TEST_EXIT_CODE=$?
+            python3 "$CI_SCRIPTS/generate-env-info.py" \
+              --docker-image '${{ env.SAIL_IMAGE }}' \
+              --output env_info.json
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/cudafy-ci/deepgemm/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+            mkdir -p "$NAS_RESULT_DIR"
+            cp test-results.xml "$NAS_RESULT_DIR/" 2>/dev/null || true
+            cp env_info.json "$NAS_RESULT_DIR/" 2>/dev/null || true
+            cp "$CI_SCRIPTS/display-test-summary.py" "$NAS_RESULT_DIR/"
+            exit "$TEST_EXIT_CODE"
+          cleanup_policy: on_success
+
+      - name: Test summary (${{ matrix.runner }})
+        if: always()
+        shell: bash
+        run: |
+          NAS_RESULT_DIR="/wl_nas/devops/cudafy-ci/deepgemm/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+          XML_FILE="$NAS_RESULT_DIR/test-results.xml"
+          ENV_FILE="$NAS_RESULT_DIR/env_info.json"
+          echo '## DeepGEMM results (${{ matrix.runner }})' >> "$GITHUB_STEP_SUMMARY"
+          if [[ ! -f "$XML_FILE" ]]; then
+            echo "JUnit report not found: $XML_FILE" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          python3 "$NAS_RESULT_DIR/display-test-summary.py" \
+            "$XML_FILE" --env-info "$ENV_FILE"
