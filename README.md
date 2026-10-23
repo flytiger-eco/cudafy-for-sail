@@ -38,7 +38,7 @@ Every conversion is the sum of two layers:
    | `flash-attention` (2.7.2 / 2.7.4 / 2.8.2) | none -- fully covered by the general rules |
    | `xformers` (0.0.27) | none -- the `COMPATIBLE_ARCH` / `__COMPATIBLECC_VER_*` SAILify platform naming lives in the general map (`NON_SDK_SAILIFY_MAP`) |
    | `flashmla` | drop the forward-declared `cudaStream_t` typedef; link `libcuda`; enable the ptxas resource report |
-   | `deepgemm` | JIT compiler rewrites (nvcc discovery, version query, flag-set translation, RTC include paths); `python_api.cpp` -> `.cu`; `#if defined(__HGGC__)` guard removal; setup.py / `__init__.py` SDK-root plumbing; CMakeLists.txt restoration |
+   | `deepgemm` | none -- fully covered by the general rules |
 
    Repositories with no residual rules have no directory or script left; the
    goal is to shrink the residual set over time until every repository is
@@ -99,7 +99,9 @@ python3 cudafy.py deepgemm /path/to/DeepGEMM
 python3 cudafy.py flashmla /path/to/FlashMLA
 ```
 
-These run the general rules plus the per-repo residual scripts listed above.
+DeepGEMM uses the general engine only, equivalent to
+`python3 cudafy.py general /path/to/DeepGEMM`. FlashMLA runs the general
+rules plus its residual script.
 
 ### Regenerating the SDK map
 
