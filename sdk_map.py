@@ -20730,6 +20730,8 @@ NON_SDK_ARTIFACT_MAP = {
     'kernel.hgbin': 'kernel.cubin',
     'hgbin_path': 'cubin_path',
     'libhggc.so': 'libcuda.so.1',
+    'hggcrt1': 'cudart',
+    'hgrtc': 'nvrtc',
 }
 
 # Category 8 -- diagnostic text.

@@ -9,11 +9,10 @@ Three ways to run a conversion:
       converted together with the tree, so no separate actlize step is needed.
 
   python3 cudafy.py <repo> [--version=X] <path>
-      actlize, flash-attention and xformers are fully covered by the
+      actlize, flash-attention, xformers and deepgemm are fully covered by the
       general rules (their per-repo scripts are gone); the command runs the
-      general engine directly, keeping the historical CLI shape. deepgemm /
-      flashmla additionally apply their residual rules via the per-repo
-      scripts under <repo>/.
+      general engine directly, keeping the historical CLI shape. flashmla
+      additionally applies its residual rules via the script under flashmla/.
 
       An unknown <repo> name falls back to `general <path>`: the name is
       dropped and the path is converted with the general rules.
@@ -36,12 +35,11 @@ sys.path.insert(0, str(REPO_ROOT))
 # Repositories whose conversion still carries residual rules; everything else
 # is fully covered by the general engine.
 RESIDUAL_REGISTRY = {
-    "deepgemm": REPO_ROOT / "deepgemm" / "cuda_compat.py",
     "flashmla": REPO_ROOT / "flashmla" / "cuda_compat.py",
 }
 
 KNOWN_COMMANDS = {
-    "general", "actlize", "flash-attention", "xformers",
+    "general", "actlize", "flash-attention", "xformers", "deepgemm",
 } | set(RESIDUAL_REGISTRY)
 
 
@@ -132,6 +130,11 @@ def run_actlize(args: argparse.Namespace) -> int:
                         version=args.version, label="actlize")
 
 
+def run_deepgemm(args: argparse.Namespace) -> int:
+    target = _require_target(args.target, "target DeepGEMM directory")
+    return _run_general(target, args.dry_run, args.verbose, label="deepgemm")
+
+
 def run_xformers(args: argparse.Namespace) -> int:
     target = _require_target(args.target, "target xformers directory")
     if (not os.path.isfile(os.path.join(target, "setup.py")) or
@@ -200,9 +203,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_repo_args(flash_attention)
     flash_attention.set_defaults(func=run_flash_attention)
 
-    deepgemm = subparsers.add_parser("deepgemm", help="Convert a DeepGEMM repository")
+    deepgemm = subparsers.add_parser(
+        "deepgemm", help="Convert a DeepGEMM repository (general rules only)")
     add_common_repo_args(deepgemm)
-    deepgemm.set_defaults(func=lambda args: run_residual("deepgemm", args))
+    deepgemm.set_defaults(func=run_deepgemm)
 
     flashmla = subparsers.add_parser("flashmla", help="Convert a FlashMLA repository")
     add_common_repo_args(flashmla)
