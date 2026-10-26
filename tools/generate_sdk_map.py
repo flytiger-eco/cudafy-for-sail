@@ -263,6 +263,8 @@ HISTORICAL_TOKENS = [
     ("get_hgcc_compiler", "get_nvcc_compiler"),
     ("hg_kernel", "cu_kernel"),
     ("hgbin_path", "cubin_path"),
+    ("hggcrt1", "cudart"),
+    ("hgrtc", "nvrtc"),
     ("hggcErrorHggcrtUnloading", "cudaErrorCudartUnloading"),
     ("hggcEventElapsed", "cudaEventElapsed"),
     ("hggcGetDeviceProp", "cudaGetDeviceProp"),
