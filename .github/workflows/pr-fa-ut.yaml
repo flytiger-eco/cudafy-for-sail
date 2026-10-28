@@ -11,7 +11,7 @@ on:
         description: Board matrix as a JSON array
         required: false
         type: string
-        default: '["ZW-810E", "ZW-M890P"]'
+        default: '["OAM-810E", "ZW-M890P"]'
   workflow_dispatch:
     inputs:
       branch:
@@ -23,7 +23,7 @@ on:
         description: Board matrix as a JSON array
         required: false
         type: string
-        default: '["ZW-810E", "ZW-M890P"]'
+        default: '["OAM-810E", "ZW-M890P"]'
 
 permissions:
   contents: read
@@ -49,7 +49,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJson(inputs.matrix || '["ZW-810E", "ZW-M890P"]') }}
+        runner: ${{ fromJson(inputs.matrix || '["OAM-810E", "ZW-M890P"]') }}
         # Only fa2.8.2 converts and tests fa3 in addition to fa2; other versions run fa2 only.
         variant: ${{ fromJson(contains(inputs.branch, '2.8.2') && '["fa2", "fa3"]' || '["fa2"]') }}
     # Job-level group isolates the variant x runner matrix legs (workflow-level

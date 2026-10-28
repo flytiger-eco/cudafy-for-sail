@@ -7,7 +7,7 @@ on:
         description: Board matrix as a JSON array
         required: false
         type: string
-        default: '["ZW-M890P", "ZW-810E"]'
+        default: '["ZW-M890P", "OAM-810E"]'
   workflow_dispatch:
 
 permissions:
@@ -30,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P", "ZW-810E"]') }}
+        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P", "OAM-810E"]') }}
     # Job-level group isolates the runner matrix legs (workflow-level concurrency
     # cancels the whole run and cannot distinguish individual legs).
     concurrency:
