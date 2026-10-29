@@ -13,9 +13,9 @@ verified pairs are emitted; the rest is reported as unverified candidates.
 
 Pairs that the conversion needs but the SDK trees cannot derive are carried
 by the frozen curated constants below (HISTORICAL_TOKENS, COMPILER_MACROS,
-DIAGNOSTIC_TEXT, SAILIFY_TOKENS, CURATED_PREFIX_OPEN, ...). The residual
-cuda_compat scripts of the supported repositories own any further
-repo-specific, non-SDK naming rules; this generator never reads them.
+DIAGNOSTIC_TEXT, SAILIFY_TOKENS, CURATED_PREFIX_OPEN, ...). All supported
+repositories use the shared engine; compile-chain rules live in
+compile_chain.py and are maintained separately from this naming map.
 
 Emitted categories in sdk_map.py:
 
