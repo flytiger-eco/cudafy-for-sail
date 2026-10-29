@@ -9,81 +9,27 @@ Three ways to run a conversion:
       converted together with the tree, so no separate actlize step is needed.
 
   python3 cudafy.py <repo> [--version=X] <path>
-      actlize, flash-attention, xformers and deepgemm are fully covered by the
-      general rules (their per-repo scripts are gone); the command runs the
-      general engine directly, keeping the historical CLI shape. flashmla
-      additionally applies its residual rules via the script under flashmla/.
+      actlize, flash-attention, xformers, deepgemm and flashmla are fully
+      covered by the general rules (their per-repo scripts are gone); the
+      command runs the general engine directly, keeping the historical CLI shape.
 
       An unknown <repo> name falls back to `general <path>`: the name is
       dropped and the path is converted with the general rules.
 """
 
 import argparse
-import importlib.util
 import os
-import re
-import runpy
 import sys
 from pathlib import Path
-from types import ModuleType
-from typing import Optional, Sequence
+from typing import Optional
 
 
 REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 
-# Repositories whose conversion still carries residual rules; everything else
-# is fully covered by the general engine.
-RESIDUAL_REGISTRY = {
-    "flashmla": REPO_ROOT / "flashmla" / "cuda_compat.py",
-}
-
 KNOWN_COMMANDS = {
-    "general", "actlize", "flash-attention", "xformers", "deepgemm",
-} | set(RESIDUAL_REGISTRY)
-
-
-def _module_name(script_path: Path) -> str:
-    safe_name = re.sub(r"\W+", "_", str(script_path.relative_to(REPO_ROOT)))
-    return f"cudafy_for_sail_{safe_name}"
-
-
-def _load_module(script_path: Path) -> ModuleType:
-    if not script_path.is_file():
-        raise FileNotFoundError(f"Compatibility script not found: {script_path}")
-
-    spec = importlib.util.spec_from_file_location(_module_name(script_path), script_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Cannot load compatibility script: {script_path}")
-
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _run_with_argv(script_path: Path, argv: Sequence[str]) -> int:
-    old_argv = sys.argv[:]
-    old_cwd = os.getcwd()
-    sys.argv = [str(script_path), *argv]
-    try:
-        module = _load_module(script_path)
-        if hasattr(module, "main"):
-            result = module.main()
-        else:
-            result = runpy.run_path(str(script_path), run_name="__main__")
-    except SystemExit as exc:
-        code = exc.code
-        if code is None:
-            return 0
-        if isinstance(code, int):
-            return code
-        print(code, file=sys.stderr)
-        return 1
-    finally:
-        sys.argv = old_argv
-        os.chdir(old_cwd)
-
-    return result if isinstance(result, int) else 0
+    "general", "actlize", "flash-attention", "xformers", "deepgemm", "flashmla",
+}
 
 
 def _require_target(value, name: str) -> str:
@@ -154,15 +100,12 @@ def run_flash_attention(args: argparse.Namespace) -> int:
                         version=args.version, label="flash-attention")
 
 
-def run_residual(command: str, args: argparse.Namespace) -> int:
-    script_path = RESIDUAL_REGISTRY[command]
+def run_flashmla(args: argparse.Namespace) -> int:
     target = _require_target(args.target, "target repository directory")
-    argv = [target]
-    if args.dry_run:
-        argv.append("--dry-run")
-    if args.verbose:
-        argv.append("--verbose")
-    return _run_with_argv(script_path, argv)
+    if (not os.path.isfile(os.path.join(target, "setup.py")) or
+            not os.path.isdir(os.path.join(target, "csrc"))):
+        raise SystemExit(f"ERROR: {target} is not a FlashMLA root directory.")
+    return _run_general(target, args.dry_run, args.verbose, label="flashmla")
 
 
 def add_common_repo_args(parser: argparse.ArgumentParser) -> None:
@@ -208,9 +151,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_repo_args(deepgemm)
     deepgemm.set_defaults(func=run_deepgemm)
 
-    flashmla = subparsers.add_parser("flashmla", help="Convert a FlashMLA repository")
+    flashmla = subparsers.add_parser(
+        "flashmla", help="Convert a FlashMLA repository (general rules only)")
     add_common_repo_args(flashmla)
-    flashmla.set_defaults(func=lambda args: run_residual("flashmla", args))
+    flashmla.set_defaults(func=run_flashmla)
 
     xformers = subparsers.add_parser(
         "xformers", help="Convert an xFormers repository (general rules only)")

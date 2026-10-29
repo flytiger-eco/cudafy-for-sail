@@ -10,8 +10,8 @@ the build-chain differences shared by all upper repositories:
   - PPU-only -D defines that no converted source consumes
   - -x hg language override and the PPU LLVM backend flag prefix
 
-Repo-specific flag-set surgery (e.g. DeepGEMM's JIT flag translation) stays
-in the per-repo residual scripts.
+Build dependencies and reporting options are declared by the source
+repositories; this module does not inject repository-specific build settings.
 """
 
 import re

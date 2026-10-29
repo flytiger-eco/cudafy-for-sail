@@ -5,7 +5,7 @@ CUDA-compatible source trees.
 
 ## How it works
 
-Every conversion is the sum of two layers:
+All supported repositories use the shared conversion engine:
 
 1. **The general rules** (repository root)
    - `sdk_map.py` -- the full PPU -> CUDA naming map, generated from the
@@ -27,24 +27,25 @@ Every conversion is the sum of two layers:
      (e.g. `-no-hggc-embed-bc`) verbatim: the CUDA-compatible nvcc still
      honors them under their original spelling.
 
-2. **Per-repo residual scripts** (`<repo>/cuda_compat*.py`) -- the rules the
-   general engine cannot express. Each script runs the general engine first
-   and then applies only its residual rules, so the residual file shows
-   exactly what is still specific to that repository:
+2. **Repository coverage** -- all supported repositories are covered by
+   the general rules, with no per-repository residual scripts:
 
    | Repository | Residual rules |
    |---|---|
    | `actlize` (0.5.0 / 0.8.0 / 1.0.0) | none -- fully covered by the general rules |
    | `flash-attention` (2.7.2 / 2.7.4 / 2.8.2) | none -- fully covered by the general rules |
    | `xformers` (0.0.27) | none -- the `COMPATIBLE_ARCH` / `__COMPATIBLECC_VER_*` SAILify platform naming lives in the general map (`NON_SDK_SAILIFY_MAP`) |
-   | `flashmla` | drop the forward-declared `cudaStream_t` typedef; link `libcuda`; enable the ptxas resource report |
+   | `flashmla` | none -- fully covered by the general rules |
    | `deepgemm` | none -- fully covered by the general rules |
 
-   Repositories with no residual rules have no directory or script left; the
-   goal is to shrink the residual set over time until every repository is
-   covered by the general rules alone.
+   Repository-specific commands retain their historical CLI shape and run
+   the general engine directly.
 
 ## Usage
+
+Use `general` as the recommended entry point for all repositories.
+Existing repository-specific commands remain supported and use the same
+general engine.
 
 Run from the repository root:
 
@@ -59,6 +60,7 @@ python3 cudafy.py general <path> [--dry-run] [--verbose]
 ```
 
 Converts any path with the general rules only (SDK map + compile chain).
+The general engine is also expected to work with other PPU libraries.
 Bundled actlize copies under the path are converted together with the tree,
 so no separate actlize step is needed.
 
@@ -99,9 +101,8 @@ python3 cudafy.py deepgemm /path/to/DeepGEMM
 python3 cudafy.py flashmla /path/to/FlashMLA
 ```
 
-DeepGEMM uses the general engine only, equivalent to
-`python3 cudafy.py general /path/to/DeepGEMM`. FlashMLA runs the general
-rules plus its residual script.
+Both commands use the general engine only, equivalent to
+`python3 cudafy.py general <path>`.
 
 ### Regenerating the SDK map
 
