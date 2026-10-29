@@ -68,7 +68,7 @@ jobs:
 
       - name: Convert, build and test FlashAttention
         id: ppu-test
-        uses: flytiger-eco/ppu-distributed-action@main
+        uses: flytiger-eco/shared-workflows/cluster-task@main
         with:
           image: ${{ env.SAIL_IMAGE }}
           container_options: |
