@@ -69,6 +69,12 @@ jobs:
     uses: ./.github/workflows/pr-flashmla.yaml
     secrets: inherit
 
+  pla-ut-tests:
+    name: PLA
+    needs: human-review
+    uses: ./.github/workflows/pr-pla.yaml
+    secrets: inherit
+
   # Roll-up gate for branch rulesets: require only this single check
   # ("CI passed") instead of enumerating every matrix leg. It fails when any
   # job above failed, was cancelled or was skipped.
@@ -83,6 +89,7 @@ jobs:
       - flash-attention-ut-274
       - flash-attention-ut-282
       - flashmla-ut-tests
+      - pla-ut-tests
     if: always()          # Evaluate the roll-up even when some jobs failed
     runs-on: k8s-runner-group-cpu-flytiger
     # This runner group requires every job to run in a container.
@@ -100,9 +107,10 @@ jobs:
           FA_274: ${{ needs.flash-attention-ut-274.result }}
           FA_282: ${{ needs.flash-attention-ut-282.result }}
           FLASHMLA: ${{ needs.flashmla-ut-tests.result }}
+          PLA: ${{ needs.pla-ut-tests.result }}
         run: |
           status=0
-          for job in PRECHECK AI_CODE_REVIEW HUMAN_REVIEW DEEPGEMM FA_272 FA_274 FA_282 FLASHMLA; do
+          for job in PRECHECK AI_CODE_REVIEW HUMAN_REVIEW DEEPGEMM FA_272 FA_274 FA_282 FLASHMLA PLA; do
             # The runner executes this step with plain POSIX sh, which has no
             # bash-style "${!job}" indirect expansion; emulate it with eval.
             eval "result=\${$job}"
