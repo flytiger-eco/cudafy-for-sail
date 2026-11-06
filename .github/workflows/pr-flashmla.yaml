@@ -7,7 +7,7 @@ on:
         description: Board matrix as a JSON array
         required: false
         type: string
-        default: '["ZW-M890P", "OAM-810E"]'
+        default: '["ZW-M890P", "ZW-810E"]'
   workflow_dispatch:
 
 permissions:
@@ -30,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P", "OAM-810E"]') }}
+        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P", "ZW-810E"]') }}
     # Job-level group isolates the runner matrix legs (workflow-level concurrency
     # cancels the whole run and cannot distinguish individual legs).
     concurrency:
@@ -102,6 +102,9 @@ jobs:
               exit "$BUILD_EXIT_CODE"
             fi
             tail -n 200 "$LOG_FILE"
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/cudafy-ci/flashmla/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+            mkdir -p "$NAS_RESULT_DIR/wheels"
+            cp ./dist/*.whl "$NAS_RESULT_DIR/wheels/"
             pip install ./dist/*.whl
 
             set +e
@@ -112,13 +115,22 @@ jobs:
             python3 "$CI_SCRIPTS/generate-env-info.py" \
               --docker-image '${{ env.SAIL_IMAGE }}' \
               --output env_info.json
-            NAS_RESULT_DIR="/mnt/wl_nas/devops/cudafy-ci/flashmla/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
-            mkdir -p "$NAS_RESULT_DIR"
             cp test-results.xml "$NAS_RESULT_DIR/" 2>/dev/null || true
             cp env_info.json "$NAS_RESULT_DIR/" 2>/dev/null || true
             cp "$CI_SCRIPTS/display-test-summary.py" "$NAS_RESULT_DIR/"
             exit "$TEST_EXIT_CODE"
           cleanup_policy: on_success
+
+      - name: Upload wheel artifact (${{ matrix.runner }})
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: flashmla-checkin-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}
+          path: /wl_nas/devops/cudafy-ci/flashmla/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/wheels/*.whl
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          overwrite: true
 
       - name: Test summary (${{ matrix.runner }})
         if: always()
