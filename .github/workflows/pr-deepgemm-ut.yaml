@@ -7,7 +7,7 @@ on:
         description: Board matrix as a JSON array
         required: false
         type: string
-        default: '["ZW-M890P", "OAM-810E"]'
+        default: '["ZW-M890P", "ZW-810E"]'
   workflow_dispatch:
 
 permissions:
@@ -26,11 +26,11 @@ jobs:
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 480
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P", "OAM-810E"]') }}
+        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P", "ZW-810E"]') }}
     # Job-level group isolates the runner matrix legs (workflow-level concurrency
     # cancels the whole run and cannot distinguish individual legs).
     concurrency:
@@ -52,7 +52,7 @@ jobs:
           nproc_per_node: 1
           node_selector: board-type=${{ matrix.runner }}
           namespace: ppu-sched
-          timeout_minutes: 420
+          timeout_minutes: 360
           command: |
             set -ex
             unset PIP_INDEX_URL
@@ -66,14 +66,11 @@ jobs:
             CUDAFY_ROOT=/workspace/source
             TARGET_ROOT=/workspace/target
             CI_SCRIPTS=/workspace/ci-scripts
-            git clone --recurse-submodules -b main \
-              https://github.com/t-head/DeepGEMM-for-sail.git "$TARGET_ROOT"
+            git clone --recurse-submodules -b main https://github.com/t-head/DeepGEMM-for-sail.git "$TARGET_ROOT"
 
-            # The target repo ships its own UT runner and per-board
-            # testcase.json caselist; copy them out BEFORE the conversion
-            # (cudafy rewrites .py contents in place).
-            cp -a "$TARGET_ROOT/.github/workflows/scripts" "$CI_SCRIPTS"
-            # Shared summary/env-info helpers are maintained in this repository.
+            # Shared summary/env-info helpers are maintained in this repository;
+            # the check-in runner stays in the converted tree (tests/checkin/).
+            mkdir -p "$CI_SCRIPTS"
             cp -a "$CUDAFY_ROOT/.github/workflows/scripts/display-test-summary.py" \
                   "$CUDAFY_ROOT/.github/workflows/scripts/generate-env-info.py" \
               "$CI_SCRIPTS/"
@@ -103,23 +100,35 @@ jobs:
               exit "$BUILD_EXIT_CODE"
             fi
             tail -n 200 "$LOG_FILE"
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/cudafy-ci/deepgemm/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+            mkdir -p "$NAS_RESULT_DIR/wheels"
+            cp ./dist/*.whl "$NAS_RESULT_DIR/wheels/"
             pip install ./dist/*.whl --force-reinstall
 
             set +e
-            python "$CI_SCRIPTS/pr-deepgemm-ut.py" \
-              --caselist "$CI_SCRIPTS/testcase.json" --suite '${{ matrix.runner }}' \
-              --build-dir "$TARGET_ROOT"
+            python tests/checkin/run_checkin.py \
+              --suite '${{ matrix.runner }}' --compile-workers 16
             TEST_EXIT_CODE=$?
             python3 "$CI_SCRIPTS/generate-env-info.py" \
               --docker-image '${{ env.SAIL_IMAGE }}' \
               --output env_info.json
-            NAS_RESULT_DIR="/mnt/wl_nas/devops/cudafy-ci/deepgemm/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
-            mkdir -p "$NAS_RESULT_DIR"
             cp test-results.xml "$NAS_RESULT_DIR/" 2>/dev/null || true
             cp env_info.json "$NAS_RESULT_DIR/" 2>/dev/null || true
+            cp -r checkin-logs "$NAS_RESULT_DIR/" 2>/dev/null || true
             cp "$CI_SCRIPTS/display-test-summary.py" "$NAS_RESULT_DIR/"
             exit "$TEST_EXIT_CODE"
           cleanup_policy: on_success
+
+      - name: Upload wheel artifact (${{ matrix.runner }})
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepgemm-checkin-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}
+          path: /wl_nas/devops/cudafy-ci/deepgemm/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/wheels/*.whl
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          overwrite: true
 
       - name: Test summary (${{ matrix.runner }})
         if: always()
