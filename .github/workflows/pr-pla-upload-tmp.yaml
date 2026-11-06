@@ -1,0 +1,287 @@
+name: PLA CUDAFY temporary wheel upload
+
+# Convert with cudafy, build the wheel, then publish it to a temporary directory.
+# Build only: no tests are run.
+# PLA source defaults to the latest master; target_ref selects a PR URL,
+# a branch name, a release tag (x.y.z+va.b.c) or a commit id instead.
+# Requires RELEASE_USERNAME / RELEASE_TOKEN secrets (TEMPLATE_TOKEN for private templates).
+on:
+  schedule:
+    - cron: '0 13 * * *'  # Daily at 21:00 Asia/Shanghai (UTC+8)
+  workflow_call:
+    inputs:
+      matrix:
+        description: Board matrix as a JSON array
+        required: false
+        type: string
+        default: '["ZW-M890P"]'
+      target_ref:
+        description: PLA PR URL, branch name, release tag (x.y.z+va.b.c) or commit id. Empty uses the latest master.
+        required: false
+        type: string
+        default: ''
+      sail_image:
+        description: Container image for the build pod. Empty uses the default image pinned in env.
+        required: false
+        type: string
+        default: ''
+    secrets:
+      RELEASE_USERNAME:
+        required: true
+      RELEASE_TOKEN:
+        required: true
+      TEMPLATE_TOKEN:
+        required: false
+  workflow_dispatch:
+    inputs:
+      matrix:
+        description: Board matrix as a JSON array
+        required: false
+        type: string
+        default: '["ZW-M890P"]'
+      target_ref:
+        description: PLA PR URL, branch name, release tag (x.y.z+va.b.c) or commit id. Empty uses the latest master.
+        required: false
+        type: string
+        default: ''
+      sail_image:
+        description: Container image for the build pod. Empty uses the default image pinned in env.
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+# Runs for different targets must not cancel each other.
+concurrency:
+  group: cudafy-pla-upload-tmp-${{ inputs.target_ref || 'master' }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Schedule runs carry no inputs, so the pinned default below still applies.
+  SAIL_IMAGE: ${{ inputs.sail_image || 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-eic-20261010' }}
+
+jobs:
+  build:
+    name: build (${{ matrix.runner }})
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P"]') }}
+    # Cancel per leg; the workflow-level group cannot distinguish matrix legs.
+    concurrency:
+      group: cudafy-pla-upload-tmp-${{ matrix.runner }}-${{ inputs.target_ref || 'master' }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout cudafy
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve PLA target
+        id: target
+        shell: bash
+        env:
+          # Passed through env so the raw input never lands in the script text.
+          TARGET_REF_INPUT: ${{ inputs.target_ref }}
+        run: |
+          set -euo pipefail
+          # Accepted forms: PR URL / branch name / release tag / commit id. Bare
+          # PR numbers are rejected because they read like commit ids.
+          raw="${TARGET_REF_INPUT//[[:space:]]/}"
+          kind=default
+          # PLA's default branch is master, not main.
+          ref=master
+          if [[ -n "$raw" ]]; then
+            # Drop a pasted ?query/#fragment before validating.
+            raw="${raw%%[?#]*}"
+            # Reject anything that is not a plausible ref (also guards the later
+            # interpolation of these outputs into the pod command).
+            if [[ ! "$raw" =~ ^[A-Za-z0-9][A-Za-z0-9._/@:+-]*$ ]]; then
+              echo "::error::Unsupported target_ref '$TARGET_REF_INPUT': expected a PR URL, branch name, release tag or commit id"
+              exit 1
+            fi
+            case "$raw" in
+              *'/pull/'*)
+                # PR URL: keep only the number, dropping /files and any suffix.
+                num="${raw#*/pull/}"
+                num="${num%%[!0-9]*}"
+                [[ "$num" =~ ^[0-9]+$ ]] || { echo "::error::Cannot read a PR number from '$raw'"; exit 1; }
+                kind=pr
+                ref="$num"
+                ;;
+              *)
+                if [[ "$raw" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                  # Release tag such as 2.8.2+v2.1.0: never a branch or a commit id.
+                  kind=tag
+                  ref="$raw"
+                elif [[ "$raw" =~ ^[0-9]+$ ]] && [[ ${#raw} -ne 40 ]]; then
+                  echo "::error::Bare PR numbers are not supported: pass the PR URL, a branch name, a release tag or a commit id (got '$raw')"
+                  exit 1
+                else
+                  # Branch name or commit id: decided later against the cloned repo.
+                  kind=ref
+                  ref="$raw"
+                fi
+                ;;
+            esac
+          fi
+          case "$kind" in
+            default) display='master (latest)' ;;
+            pr) display="PR #$ref" ;;
+            tag) display="tag $ref" ;;
+            *) display="$ref" ;;
+          esac
+          {
+            echo "kind=$kind"
+            echo "ref=$ref"
+            echo "display=$display"
+          } >> "$GITHUB_OUTPUT"
+          echo "PLA target: $display" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Convert and build PLA
+        id: ppu-build
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: board-type=${{ matrix.runner }}
+          namespace: ppu-sched
+          timeout_minutes: 360
+          command: |
+            set -ex
+            unset PIP_INDEX_URL PYTHONPATH PLA_BUILD_NAMESPACE PPU_ACTLIZE_DIR
+            # The image rewrites github.com to an unreachable gerrit mirror.
+            for key in $(git config --global --name-only --get-regexp '^url\.'); do
+              git config --global --unset-all "$key"
+            done
+            git config --global --add safe.directory '*'
+
+            CUDAFY_ROOT=/workspace/source
+            TARGET_ROOT=/workspace/target
+            # --recurse-submodules pulls 3rdparty/actlize: setup.py builds against
+            # the pinned submodule and aborts if the headers are missing.
+            git clone --recurse-submodules -b master  https://github.com/t-head/pla.git "$TARGET_ROOT"
+            # Default target is the latest master (just cloned). Any other target is
+            # checked out on top of it, before the conversion runs.
+            TARGET_KIND='${{ steps.target.outputs.kind }}'
+            TARGET_REF='${{ steps.target.outputs.ref }}'
+            if [[ "$TARGET_KIND" != default ]]; then
+              cd "$TARGET_ROOT"
+              if [[ "$TARGET_KIND" == pr ]]; then
+                # PR head from any fork, matching what the PR's own checks build.
+                git fetch --no-tags origin \
+                  "+refs/pull/${TARGET_REF}/head:refs/remotes/origin/pr/${TARGET_REF}"
+                TARGET_COMMIT="$(git rev-parse --verify "refs/remotes/origin/pr/${TARGET_REF}^{commit}")"
+              elif [[ "$TARGET_KIND" == tag ]]; then
+                # Tags come with the clone; fetch the ref explicitly when missing.
+                TARGET_COMMIT="$(git rev-parse --verify --quiet "refs/tags/${TARGET_REF}^{commit}")" || {
+                  git fetch --no-tags origin "refs/tags/${TARGET_REF}:refs/tags/${TARGET_REF}" || {
+                    echo "::error::Tag ${TARGET_REF} not found in pla repository"
+                    exit 1
+                  }
+                  TARGET_COMMIT="$(git rev-parse --verify "refs/tags/${TARGET_REF}^{commit}")"
+                }
+              elif git rev-parse --verify --quiet "refs/remotes/origin/${TARGET_REF}^{commit}" > /dev/null; then
+                TARGET_COMMIT="$(git rev-parse --verify "refs/remotes/origin/${TARGET_REF}^{commit}")"
+              else
+                # Not a branch tip: treat it as a commit id, from the clone or fetched directly.
+                TARGET_COMMIT="$(git rev-parse --verify --quiet "${TARGET_REF}^{commit}")" || {
+                  git fetch --no-tags origin "$TARGET_REF"
+                  TARGET_COMMIT="$(git rev-parse --verify "FETCH_HEAD^{commit}")"
+                }
+              fi
+              git checkout --detach "$TARGET_COMMIT"
+              # Submodules must follow the checked-out tree, not master.
+              git submodule sync --recursive
+              git submodule update --init --recursive
+              echo "PLA target resolved: ${TARGET_KIND} ${TARGET_REF} -> ${TARGET_COMMIT}"
+            fi
+            python3 "$CUDAFY_ROOT/cudafy.py" general "$TARGET_ROOT"
+            cd "$TARGET_ROOT"
+
+            source /usr/local/PPU_SDK/envsetup.sh
+            export PPU_SDK_DIR=/usr/local/PPU_SDK
+            "$PPU_SDK_DIR/bin/hgcc" --version
+            python -m pip install setuptools==69.5.1 setuptools-scm==9.2.2 \
+              packaging==24.2 wheel==0.45.1 pybind11==2.13.6 ninja==1.11.1.4 \
+              numpy==1.26.4 pandas==2.2.3 einops==0.8.1
+            export TORCH_CUDA_ARCH_LIST='8.0'
+            export MAX_JOBS=16
+            export NVCC_THREADS=2
+            python setup.py bdist_wheel
+
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/cudafy-ci/pla/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+            mkdir -p "$NAS_RESULT_DIR/wheels"
+            cp dist/*.whl "$NAS_RESULT_DIR/wheels/"
+          cleanup_policy: on_success
+
+      - name: Upload wheel artifact (${{ matrix.runner }})
+        # Only the first leg uploads: wheels are board independent. !cancelled()
+        # keeps the artifact available even when the build failed.
+        if: ${{ !cancelled() && strategy.job-index == 0 }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pla-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}
+          path: /wl_nas/devops/cudafy-ci/pla/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/wheels/*.whl
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+
+  merge:
+    name: Merge board wheel artifacts
+    # Every board must build successfully.
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      artifact_name: ${{ steps.artifact-name.outputs.artifact_name }}
+    steps:
+      - name: Set merged artifact name
+        id: artifact-name
+        shell: bash
+        run: echo 'artifact_name=pla-wheels-${{ github.run_id }}-${{ github.run_attempt }}' >> "$GITHUB_OUTPUT"
+
+      - name: Merge wheel artifacts
+        uses: actions/upload-artifact/merge@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.artifact_name }}
+          pattern: pla-wheel-${{ github.run_id }}-${{ github.run_attempt }}-*
+          compression-level: 0
+          delete-merged: false
+
+  push:
+    name: Call temporary wheel upload template
+    needs: merge
+    uses: flytiger-eco/shared-workflows/.github/workflows/push-tmp-wheel.yml@main
+    with:
+      # run_attempt moves when only the publishing job is rerun.
+      artifact_name: ${{ needs.merge.outputs.artifact_name }}
+      template_repository: flytiger-eco/shared-workflows
+      template_ref: main
+    secrets:
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+      # Read-only token; also enable cross-repo access in the template repo.
+      template_token: ${{ secrets.TEMPLATE_TOKEN }}
+
+  result:
+    name: Show batch directory URL
+    needs: push
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write to logs and job summary
+        shell: bash
+        env:
+          UPLOAD_URL: ${{ needs.push.outputs.upload_url }}
+        run: |
+          set -euo pipefail
+          printf 'Batch directory: %s\n' "$UPLOAD_URL" | tee -a "$GITHUB_STEP_SUMMARY"

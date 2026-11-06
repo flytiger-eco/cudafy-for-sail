@@ -4,18 +4,18 @@ on:
   workflow_call:
     inputs:
       branch:
-        description: 'FA branch to clone (v2.7.2 / v2.7.4 / v2.8.2 / v2.8.2_v0.2.0_release). The plain version is derived from it.'
+        description: 'FA branch to clone (v2.7.2 / v2.7.4 / v2.8.2 ). The plain version is derived from it.'
         required: true
         type: string
       matrix:
         description: Board matrix as a JSON array
         required: false
         type: string
-        default: '["OAM-810E", "ZW-M890P"]'
+        default: '["ZW-810E", "ZW-M890P"]'
   workflow_dispatch:
     inputs:
       branch:
-        description: 'FA branch to clone (v2.7.2 / v2.7.4 / v2.8.2 / v2.8.2_v0.2.0_release).'
+        description: 'FA branch to clone (v2.7.2 / v2.7.4 / v2.8.2 ).'
         required: true
         type: string
         default: 'v2.8.2'
@@ -23,7 +23,7 @@ on:
         description: Board matrix as a JSON array
         required: false
         type: string
-        default: '["OAM-810E", "ZW-M890P"]'
+        default: '["ZW-810E", "ZW-M890P"]'
 
 permissions:
   contents: read
@@ -45,11 +45,11 @@ jobs:
     runs-on: k8s-runner-group-cpu-flytiger
     container:
       image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 420
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJson(inputs.matrix || '["OAM-810E", "ZW-M890P"]') }}
+        runner: ${{ fromJson(inputs.matrix || '["ZW-810E", "ZW-M890P"]') }}
         # Only fa2.8.2 converts and tests fa3 in addition to fa2; other versions run fa2 only.
         variant: ${{ fromJson(contains(inputs.branch, '2.8.2') && '["fa2", "fa3"]' || '["fa2"]') }}
     # Job-level group isolates the variant x runner matrix legs (workflow-level
@@ -93,15 +93,14 @@ jobs:
             TARGET_ROOT=/workspace/target
             CI_SCRIPTS=/workspace/ci-scripts
             # Extract the plain version (2.8.2) from the branch name
-            # (v2.8.2 / v2.8.2_v0.2.0_release): drop a leading 'v' and any '_' suffix.
+            # (v2.8.2 ): drop a leading 'v' and any '_' suffix.
             BRANCH='${{ inputs.branch }}'
             FA_VERSION="${BRANCH#v}"
             FA_VERSION="${FA_VERSION%%_*}"
             FA_BRANCH="$BRANCH"
             VARIANT='${{ matrix.variant }}'
             VARIANT_UPPER="${VARIANT^^}"
-            git clone --recurse-submodules -b "$FA_BRANCH" \
-              https://github.com/t-head/flash-attention-for-sail.git "$TARGET_ROOT"
+            git clone --recurse-submodules -b "$FA_BRANCH" https://github.com/t-head/flash-attention-for-sail.git "$TARGET_ROOT"
             # The target repo ships its own UT runner and casecmd.json
             # caselist; copy them out BEFORE the conversion (cudafy rewrites
             # .py contents in place).
@@ -154,6 +153,9 @@ jobs:
               exit "$BUILD_EXIT_CODE"
             fi
             tail -n 200 "$LOG_FILE"
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/cudafy-ci/flash-attention/${FA_VERSION}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${VARIANT}"
+            mkdir -p "$NAS_RESULT_DIR/wheels"
+            cp "$BUILD_DIR"/dist/*.whl "$NAS_RESULT_DIR/wheels/"
 
             rm -rf "$BUILD_DIR"/*.egg-info
             pip install "$BUILD_DIR"/dist/*.whl
@@ -186,13 +188,34 @@ jobs:
             python3 "$CI_SCRIPTS/generate-env-info.py" \
               --docker-image '${{ env.SAIL_IMAGE }}' \
               --output env_info.json
-            NAS_RESULT_DIR="/mnt/wl_nas/devops/cudafy-ci/flash-attention/${FA_VERSION}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${VARIANT}"
-            mkdir -p "$NAS_RESULT_DIR"
             cp "$RESULT_FILE" "$NAS_RESULT_DIR/" 2>/dev/null || true
             cp env_info.json "$NAS_RESULT_DIR/" 2>/dev/null || true
             cp "$CI_SCRIPTS/display-test-summary.py" "$NAS_RESULT_DIR/"
             exit "$TEST_EXIT_CODE"
           cleanup_policy: on_success
+
+      - name: Locate wheel artifact
+        id: wheel-artifact
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          FA_BRANCH: ${{ inputs.branch }}
+        run: |
+          FA_VERSION="${FA_BRANCH#v}"
+          FA_VERSION="${FA_VERSION%%_*}"
+          echo "version=$FA_VERSION" >> "$GITHUB_OUTPUT"
+          echo "path=/wl_nas/devops/cudafy-ci/flash-attention/${FA_VERSION}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${{ matrix.variant }}/wheels/*.whl" >> "$GITHUB_OUTPUT"
+
+      - name: Upload wheel artifact (${{ matrix.variant }} / ${{ matrix.runner }})
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: flash-attention-checkin-wheel-${{ steps.wheel-artifact.outputs.version }}-${{ matrix.variant }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}
+          path: ${{ steps.wheel-artifact.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          overwrite: true
 
       - name: Test summary
         if: always()

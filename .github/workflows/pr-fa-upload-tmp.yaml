@@ -1,0 +1,378 @@
+name: FlashAttention CUDAFY temporary wheel upload
+
+# Convert with cudafy, build the wheel, publish it to a temporary directory.
+# Build only: pr-fa-ut.yaml owns the FA UT pipeline.
+# source selects what to build (PR URL / branch / release tag / commit id;
+# empty = head of the default branch). variants lists which wheels to build from
+# it: fa2 is the root package, fa3 the hopper/ package. The FA version label is
+# read from the source tree, so label, NAS path and code always match.
+# Requires RELEASE_USERNAME / RELEASE_TOKEN (TEMPLATE_TOKEN for private templates).
+on:
+  workflow_call:
+    inputs:
+      source:
+        description: 'flash-attention-for-sail PR URL / branch / release tag / commit id. Empty builds the head of the default branch.'
+        required: false
+        type: string
+        default: ''
+      variants:
+        description: 'Variants to build as a JSON array: fa2 (root package) and/or fa3 (hopper package).'
+        required: false
+        type: string
+        default: '["fa2", "fa3"]'
+      sail_image:
+        description: 'Container image for the build pod. Empty uses the default image pinned in env.'
+        required: false
+        type: string
+        default: ''
+      matrix:
+        description: Board matrix as a JSON array
+        required: false
+        type: string
+        default: '["ZW-810E", "ZW-M890P"]'
+    secrets:
+      RELEASE_USERNAME:
+        required: true
+      RELEASE_TOKEN:
+        required: true
+      TEMPLATE_TOKEN:
+        required: false
+  workflow_dispatch:
+    inputs:
+      source:
+        description: 'flash-attention-for-sail PR URL / branch / release tag / commit id. Empty builds the head of the default branch.'
+        required: false
+        type: string
+        default: ''
+      variants:
+        description: 'Variants to build as a JSON array: fa2 (root package) and/or fa3 (hopper package).'
+        required: false
+        type: string
+        default: '["fa2", "fa3"]'
+      sail_image:
+        description: 'Container image for the build pod. Empty uses the default image pinned in env.'
+        required: false
+        type: string
+        default: ''
+      matrix:
+        description: Board matrix as a JSON array
+        required: false
+        type: string
+        default: '["ZW-810E", "ZW-M890P"]'
+
+permissions:
+  contents: read
+
+# Runs for different targets must not cancel each other.
+concurrency:
+  group: cudafy-flash-attention-upload-tmp-${{ inputs.source || 'default-branch' }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Empty sail_image falls back to this pinned image.
+  SAIL_IMAGE: ${{ inputs.sail_image || 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-eic-20261010' }}
+  # Clone base; its head is the default target.
+  FA_BRANCH: v2.8.2
+
+jobs:
+  resolve:
+    name: Resolve target
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      kind: ${{ steps.target.outputs.kind }}
+      ref: ${{ steps.target.outputs.ref }}
+      commit: ${{ steps.target.outputs.commit }}
+      version: ${{ steps.target.outputs.version }}
+    steps:
+      - name: Fetch target and read the FA version
+        id: target
+        shell: bash
+        env:
+          # Passed through env so the raw input never lands in the script text.
+          SOURCE_INPUT: ${{ inputs.source }}
+          VARIANTS_INPUT: ${{ inputs.variants }}
+        run: |
+          set -euo pipefail
+          # Accepted forms: PR URL / branch / release tag / commit id; bare PR
+          # numbers are ambiguous.
+          raw="${SOURCE_INPUT//[[:space:]]/}"
+          kind=default
+          ref="$FA_BRANCH"
+          if [[ -n "$raw" ]]; then
+            raw="${raw%%[?#]*}"
+            # Whitelist check: the value is reused as a git ref below.
+            if [[ ! "$raw" =~ ^[A-Za-z0-9][A-Za-z0-9._/@:+-]*$ ]]; then
+              echo "::error::Unsupported source '$SOURCE_INPUT': expected a PR URL, branch, release tag or commit id"
+              exit 1
+            fi
+            case "$raw" in
+              *'/pull/'*)
+                num="${raw#*/pull/}"
+                num="${num%%[!0-9]*}"
+                [[ "$num" =~ ^[0-9]+$ ]] || { echo "::error::Cannot read a PR number from '$raw'"; exit 1; }
+                kind=pr
+                ref="$num"
+                ;;
+              *)
+                if [[ "$raw" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                  # Release tag such as 2.8.2+v2.1.0: never a branch or a commit id.
+                  kind=tag
+                  ref="$raw"
+                elif [[ "$raw" =~ ^[0-9]+$ ]] && [[ ${#raw} -ne 40 ]]; then
+                  echo "::error::Bare PR numbers are not supported: pass the PR URL, a branch, a release tag or a commit id (got '$raw')"
+                  exit 1
+                else
+                  # Branch or commit id: the fetch below decides which one.
+                  kind=ref
+                  ref="$raw"
+                fi
+                ;;
+            esac
+          fi
+          case "$kind" in
+            default) display="$FA_BRANCH (head)" ;;
+            pr) display="PR #$ref" ;;
+            tag) display="tag $ref" ;;
+            *) display="$ref" ;;
+          esac
+
+          # Shallow fetch of the one commit to build: its tree is enough to read
+          # the version and to check whether the requested variants exist.
+          work="$RUNNER_TEMP/fa-resolve"
+          # One shallow clone of the default branch also registers the remote, so the
+          # selected ref is fetched from 'origin' without repeating the address.
+          rm -rf "$work"
+          git clone -q --no-checkout --depth 1 --no-tags -b "$FA_BRANCH" https://github.com/t-head/flash-attention-for-sail.git "$work"
+          cd "$work"
+          case "$kind" in
+            pr)
+              git fetch -q --no-tags --depth 1 origin "+refs/pull/${ref}/head" || {
+                echo "::error::Cannot fetch PR #$ref from FA repository"
+                exit 1
+              }
+              ;;
+            default) git fetch -q --no-tags --depth 1 origin "refs/heads/${ref}" ;;
+            tag)
+              git fetch -q --no-tags --depth 1 origin "refs/tags/${ref}" || {
+                echo "::error::Tag '$ref' not found in FA repository"
+                exit 1
+              }
+              ;;
+            *)
+              git fetch -q --no-tags --depth 1 origin "refs/heads/${ref}" \
+                || git fetch -q --no-tags --depth 1 origin "$ref" || {
+                  echo "::error::Cannot fetch '$ref': no branch or tag with that name and it is not a fetchable commit (use the full 40-char sha)"
+                  exit 1
+                }
+              ;;
+          esac
+          commit="$(git rev-parse "FETCH_HEAD^{commit}")"
+
+          # setup.py takes the version from flash_attn/__init__.py, e.g. 2.7.4.post1.
+          raw_version="$(git show "${commit}:flash_attn/__init__.py" 2>/dev/null \
+            | sed -n 's/^__version__[[:space:]]*=[[:space:]]*//p' | head -n 1 | tr -d "\"'")"
+          version="${raw_version%%.post*}"
+          version="${version%%+*}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::$commit is not a readable flash-attention tree (__version__='$raw_version')"
+            exit 1
+          fi
+
+          # Fail here instead of after a long build when the tree lacks a variant.
+          if [[ "$VARIANTS_INPUT" == *fa3* ]] && ! git cat-file -e "${commit}:hopper/setup.py" 2>/dev/null; then
+            echo "::error::fa3 requested but $commit has no hopper/setup.py"
+            exit 1
+          fi
+
+          {
+            echo "kind=$kind"
+            echo "ref=$ref"
+            echo "commit=$commit"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "FlashAttention target: ${display} -> ${commit:0:8} (version ${version}, variants ${VARIANTS_INPUT})" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: ${{ matrix.variant }} (${{ matrix.runner }})
+    needs: resolve
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJson(inputs.matrix || '["ZW-810E", "ZW-M890P"]') }}
+        variant: ${{ fromJson(inputs.variants) }}
+    # Cancel per leg; the workflow-level group cannot distinguish matrix legs.
+    concurrency:
+      group: cudafy-flash-attention-upload-tmp-${{ inputs.source || 'default-branch' }}-${{ matrix.variant }}-${{ matrix.runner }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout cudafy
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Convert and build FlashAttention
+        id: ppu-build
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          container_options: |
+            cpus: '30'
+            memory: '240g'
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: board-type=${{ matrix.runner }}
+          namespace: ppu-sched
+          timeout_minutes: 360
+          command: |
+            set -ex
+            unset PIP_INDEX_URL
+            # Drop the image's url rewrites: they point github.com at an unreachable gerrit mirror.
+            for key in $(git config --global --name-only --get-regexp '^url\.'); do
+              git config --global --unset-all "$key"
+            done
+            git config --global --add safe.directory '*'
+
+            CUDAFY_ROOT=/workspace/source
+            TARGET_ROOT=/workspace/target
+            FA_VERSION='${{ needs.resolve.outputs.version }}'
+            TARGET_KIND='${{ needs.resolve.outputs.kind }}'
+            TARGET_REF='${{ needs.resolve.outputs.ref }}'
+            TARGET_COMMIT='${{ needs.resolve.outputs.commit }}'
+            VARIANT='${{ matrix.variant }}'
+            VARIANT_UPPER="${VARIANT^^}"
+            git clone --recurse-submodules -b '${{ env.FA_BRANCH }}' https://github.com/t-head/flash-attention-for-sail.git "$TARGET_ROOT"
+            # The clone above is the default target; anything else is fetched and
+            # checked out here, before the conversion runs.
+            if [[ "$(git -C "$TARGET_ROOT" rev-parse HEAD)" != "$TARGET_COMMIT" ]]; then
+              cd "$TARGET_ROOT"
+              if [[ "$TARGET_KIND" == pr ]]; then
+                git fetch --no-tags origin \
+                  "+refs/pull/${TARGET_REF}/head:refs/remotes/origin/pr/${TARGET_REF}"
+              elif [[ "$TARGET_KIND" == tag ]]; then
+                git fetch --no-tags origin "+refs/tags/${TARGET_REF}:refs/tags/${TARGET_REF}"
+              else
+                git fetch --no-tags origin "$TARGET_COMMIT"
+              fi
+              git checkout --detach "$TARGET_COMMIT"
+              # Submodules must follow the checked-out tree.
+              git submodule sync --recursive
+              git submodule update --init --recursive
+            fi
+            echo "FlashAttention target: ${TARGET_KIND} ${TARGET_REF} -> ${TARGET_COMMIT} (version ${FA_VERSION})"
+
+            # No --version: the engine is version independent and the old flag only
+            # accepted 2.7.2/2.7.4/2.8.2. Bundled csrc/actlize is converted too.
+            python3 "$CUDAFY_ROOT/cudafy.py" flash-attention "$TARGET_ROOT"
+            cd "$TARGET_ROOT"
+
+            source /usr/local/PPU_SDK/envsetup.sh || true
+            pip uninstall -y flash-attn flash-attn-3 || true
+            export MAX_JOBS=20
+            export PYTORCH_SAIL_ARCH='ppu_10;ppu_15'
+            export FLASH_ATTENTION_FORCE_BUILD=TRUE
+            pip install 'setuptools==75.8.0' 'packaging==24.2' psutil ninja
+
+            if [[ "$VARIANT" == fa3 ]]; then
+              BUILD_DIR="$TARGET_ROOT/hopper"
+            else
+              BUILD_DIR="$TARGET_ROOT"
+            fi
+            LOG_FILE="$BUILD_DIR/build_${VARIANT}.log"
+            ERROR_LOG="$BUILD_DIR/error_${VARIANT}.log"
+            cd "$BUILD_DIR"
+            python ./setup.py bdist_wheel > "$LOG_FILE" 2> "$ERROR_LOG" &
+            BUILD_PID=$!
+            set +x
+            ELAPSED=0
+            while kill -0 "$BUILD_PID" 2>/dev/null; do
+              sleep 10
+              ELAPSED=$((ELAPSED + 10))
+              if (( ELAPSED % 600 == 0 )); then
+                echo "[$(date '+%F %T')] ${VARIANT_UPPER} build is still running ($((ELAPSED / 60)) min)"
+                tail -n 100 "$LOG_FILE" || true
+              fi
+            done
+            set -x
+            BUILD_EXIT_CODE=0
+            wait "$BUILD_PID" || BUILD_EXIT_CODE=$?
+            if [[ "$BUILD_EXIT_CODE" -ne 0 ]]; then
+              cat "$ERROR_LOG"
+              tail -n 1000 "$LOG_FILE"
+              exit "$BUILD_EXIT_CODE"
+            fi
+            tail -n 200 "$LOG_FILE"
+
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/cudafy-ci/flash-attention/${{ needs.resolve.outputs.ref }}/${FA_VERSION}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${VARIANT}"
+            mkdir -p "$NAS_RESULT_DIR/wheels"
+            cp "$BUILD_DIR"/dist/*.whl "$NAS_RESULT_DIR/wheels/"
+          cleanup_policy: on_success
+
+      - name: Upload wheel artifact (${{ matrix.variant }} / ${{ matrix.runner }})
+        # Wheels are board independent: only the first board uploads, all
+        # variants do. !cancelled() keeps artifacts when the build failed.
+        if: ${{ !cancelled() && matrix.runner == fromJson(inputs.matrix || '["ZW-810E", "ZW-M890P"]')[0] }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: flash-attention-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.resolve.outputs.ref }}-${{ needs.resolve.outputs.version }}-${{ matrix.variant }}
+          # Container-side /mnt/wl_nas maps to /wl_nas on the runner host.
+          path: /wl_nas/devops/cudafy-ci/flash-attention/${{ needs.resolve.outputs.ref }}/${{ needs.resolve.outputs.version }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${{ matrix.variant }}/wheels/*.whl
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+
+  merge:
+    name: Merge wheel artifacts
+    # Every leg must build successfully; resolve carries the target ref.
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      artifact_name: ${{ steps.artifact-name.outputs.artifact_name }}
+    steps:
+      - name: Set merged artifact name
+        id: artifact-name
+        shell: bash
+        run: echo 'artifact_name=flash-attention-wheels-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.resolve.outputs.ref }}' >> "$GITHUB_OUTPUT"
+
+      - name: Merge wheel artifacts
+        uses: actions/upload-artifact/merge@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.artifact_name }}
+          pattern: flash-attention-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.resolve.outputs.ref }}-*
+          compression-level: 0
+          delete-merged: false
+
+  push:
+    name: Call temporary wheel upload template
+    needs: merge
+    uses: flytiger-eco/shared-workflows/.github/workflows/push-tmp-wheel.yml@main
+    with:
+      # run_attempt moves when only the publishing job is rerun.
+      artifact_name: ${{ needs.merge.outputs.artifact_name }}
+      template_repository: flytiger-eco/shared-workflows
+      template_ref: main
+    secrets:
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+      # Read-only token; also enable cross-repo access in the template repo.
+      template_token: ${{ secrets.TEMPLATE_TOKEN }}
+
+  result:
+    name: Show batch directory URL
+    needs: push
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write to logs and job summary
+        shell: bash
+        env:
+          UPLOAD_URL: ${{ needs.push.outputs.upload_url }}
+        run: |
+          set -euo pipefail
+          printf 'Batch directory: %s\n' "$UPLOAD_URL" | tee -a "$GITHUB_STEP_SUMMARY"
