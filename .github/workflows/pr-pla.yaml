@@ -1,0 +1,126 @@
+name: PLA CUDA compatibility UT
+
+on:
+  workflow_call:
+    inputs:
+      matrix:
+        description: Board matrix as a JSON array
+        required: false
+        type: string
+        default: '["ZW-M890P", "OAM-810E"]'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cudafy-pla-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  SAIL_IMAGE: pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-eic-20261010
+
+jobs:
+  build-test:
+    name: test (${{ matrix.runner }})
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 900
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P", "OAM-810E"]') }}
+    concurrency:
+      group: cudafy-pla-${{ matrix.runner }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout cudafy
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Convert, build and test PLA
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: board-type=${{ matrix.runner }}
+          namespace: ppu-sched
+          timeout_minutes: 840
+          command: |
+            set -exo pipefail
+            unset PIP_INDEX_URL PYTHONPATH PPU_ACTLIZE_DIR
+            unset PLA_BUILD_NAMESPACE PLA_FLA_BUILD_ONLY PLA_FLA_BUILD_HEADS
+            # Drop any URL rewrites the image baked into the global git config:
+            # they redirect github.com to the unreachable internal gerrit mirror.
+            for key in $(git config --global --name-only --get-regexp '^url\.'); do
+              git config --global --unset-all "$key"
+            done
+            git config --global --add safe.directory '*'
+
+            CUDAFY_ROOT=/workspace/source
+            TARGET_ROOT=/workspace/target
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/cudafy-ci/pla/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+            # actlize stays at the commit recorded by the PLA submodule.
+            git clone --recurse-submodules https://github.com/t-head/pla.git "$TARGET_ROOT"
+            git -C "$TARGET_ROOT" log -1 --format='PLA %H %s'
+            export PLA_TEST_REVISION=$(git -C "$TARGET_ROOT" rev-parse HEAD)
+
+            # Converts the PLA tree together with the bundled 3rdparty/actlize.
+            python3 "$CUDAFY_ROOT/cudafy.py" general "$TARGET_ROOT"
+            cd "$TARGET_ROOT"
+
+            export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+            source /usr/local/PPU_SDK/envsetup.sh
+            export CUDA_HOME=/usr/local/PPU_SDK/CUDA_SDK
+            export PATH="$CUDA_HOME/bin:$PATH"
+            nvcc --version
+            pip install setuptools==69.5.1 setuptools-scm==9.2.2 \
+              packaging==24.2 wheel==0.45.1 pybind11==2.13.6 ninja==1.11.1.4 \
+              numpy==1.26.4 pandas==2.2.3 pytest==8.3.5 einops==0.8.1
+            python3 -c 'import torch, triton; print(torch.__version__, triton.__version__)'
+            python3 .github/workflows/scripts/run_functional.py --list
+            export MAX_JOBS=20 HGCC_THREADS=2 NVCC_THREADS=2
+
+            # Build the committed kernel instantiations as-is: regenerating them
+            # with --default-only drops the variants the tunable tests launch.
+            timeout --signal=TERM --kill-after=30s 180m python3 setup.py bdist_wheel
+            wheels=(dist/pla-*.whl)
+            test "${#wheels[@]}" -eq 1 && test -f "${wheels[0]}"
+            pip install --force-reinstall --no-deps "${wheels[0]}"
+            python3 .github/workflows/scripts/run_functional.py --stage-wheel "${wheels[0]}"
+
+            mkdir -p "$NAS_RESULT_DIR"
+            cp "$CUDAFY_ROOT/.github/workflows/scripts/display-test-summary.py" "$NAS_RESULT_DIR/"
+            python3 "$CUDAFY_ROOT/.github/workflows/scripts/generate-env-info.py" \
+              --docker-image '${{ env.SAIL_IMAGE }}' \
+              --output "$NAS_RESULT_DIR/env_info.json"
+            TEST_EXIT_CODE=0
+            for phase in decode prefill; do
+              python3 .github/workflows/scripts/run_functional.py \
+                --board '${{ matrix.runner }}' --phase "$phase" \
+                --output "$NAS_RESULT_DIR/$phase" --budget-seconds 18000 || TEST_EXIT_CODE=1
+            done
+            exit "$TEST_EXIT_CODE"
+          cleanup_policy: on_success
+
+      - name: Test summary (${{ matrix.runner }})
+        if: always()
+        shell: bash
+        run: |
+          NAS_RESULT_DIR="/wl_nas/devops/cudafy-ci/pla/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+          status=0
+          for phase in decode prefill; do
+            XML_FILE="$NAS_RESULT_DIR/$phase/junit.xml"
+            echo "## PLA $phase results (${{ matrix.runner }})" >> "$GITHUB_STEP_SUMMARY"
+            if [[ ! -f "$XML_FILE" ]]; then
+              echo "JUnit report not found: $XML_FILE" >> "$GITHUB_STEP_SUMMARY"
+              status=1
+              continue
+            fi
+            python3 "$NAS_RESULT_DIR/display-test-summary.py" \
+              "$XML_FILE" --env-info "$NAS_RESULT_DIR/env_info.json" || status=1
+          done
+          exit "$status"
