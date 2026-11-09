@@ -6,9 +6,6 @@ name: MSA CUDAFY temporary wheel upload
 # a branch name, a release tag (x.y.z+va.b.c) or a commit id instead.
 # Requires RELEASE_USERNAME / RELEASE_TOKEN secrets (TEMPLATE_TOKEN for private templates).
 on:
-  # temporary open push trigger for debug
-  push:
-    branches: ['feat/upload_tmp_whl']
   schedule:
     - cron: '0 13 * * *'  # Daily at 21:00 Asia/Shanghai (UTC+8)
   workflow_call:
