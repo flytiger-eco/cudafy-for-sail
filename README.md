@@ -43,6 +43,40 @@ All supported repositories use the shared conversion engine:
 
 ## Usage
 
+### Nightly vLLM SAIL wheels
+
+[vLLM SAIL nightly wheels](.github/workflows/nightly-vllm-sail.yaml) builds
+`vllm-project/vllm-sail` directly, without cudafy conversion, every day at
+**21:00 Asia/Shanghai (13:00 UTC)**. The schedule becomes active once the
+workflow is merged into this repository's default branch.
+
+The workflow uses the existing Flytiger cluster runner and SAIL SDK image.
+It runs upstream's `scripts/build_wheels.sh` to build the latest SAIL `main`
+and the exact vLLM commit pinned by that checkout. Both `ppu_10` and `ppu_15`
+are compiled in one build. The upstream tooling builds vLLM's Rust components,
+requires all four SAIL native extensions and verifies the wheel manifest.
+This is a build and packaging check; it does not run device or inference tests.
+
+Wheels and their manifest are retained as GitHub Actions artifacts for 14 days.
+After a successful build, the existing `push-tmp-wheel.yml` template publishes
+both wheels to a timestamped temporary directory; the final job prints its URL
+in the run summary. Build logs are saved as a separate diagnostics artifact,
+including on build failure when logs are available.
+
+Repository or organization Actions secrets `RELEASE_USERNAME` and
+`RELEASE_TOKEN` must be available for upload. `TEMPLATE_TOKEN` is optional
+unless access to the shared template repository requires it. The cluster
+runner, shared NAS mounts and build image access follow the existing workflows.
+
+Use **Actions → vLLM SAIL nightly wheels → Run workflow** for a manual build.
+`target_ref` accepts a SAIL branch, tag, commit SHA or `refs/pull/<number>/head`
+(default `main`). `sail_image` can select a matching CUDA-compatible or
+CUDA-free SAIL SDK/PyTorch image; an empty value uses the existing Python 3.12,
+SDK 2.2.0, PyTorch 2.13.0 image. The same inputs are exposed through
+`workflow_call`.
+
+### Conversion commands
+
 Use `general` as the recommended entry point for all repositories.
 Existing repository-specific commands remain supported and use the same
 general engine.
