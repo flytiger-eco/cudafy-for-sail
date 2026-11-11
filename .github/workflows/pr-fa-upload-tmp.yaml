@@ -6,8 +6,17 @@ name: FlashAttention CUDAFY temporary wheel upload
 # empty = head of the default branch). variants lists which wheels to build from
 # it: fa2 is the root package, fa3 the hopper/ package. The FA version label is
 # read from the source tree, so label, NAS path and code always match.
+# One run builds every (source, variant) pair: manual and reusable runs take the
+# single pair from the inputs, while the schedule sweeps the maintained branches
+# listed in SCHEDULE_TARGETS on the board given by the matrix default.
 # Requires RELEASE_USERNAME / RELEASE_TOKEN (TEMPLATE_TOKEN for private templates).
 on:
+  schedule:
+    - cron: '0 13 * * *'  # Daily at 21:00 Asia/Shanghai (UTC+8)
+  push:
+    # Verification trigger: a push to the branch hosting this workflow builds the
+    # default source (FA_BRANCH head) with the default variants on the default board.
+    branches: [feat/upload_tmp_whl]
   workflow_call:
     inputs:
       source:
@@ -26,10 +35,10 @@ on:
         type: string
         default: ''
       matrix:
-        description: Board matrix as a JSON array
+        description: Board matrix as a JSON array. ZW-M890P alone is enough for the wheels.
         required: false
         type: string
-        default: '["ZW-810E", "ZW-M890P"]'
+        default: '["ZW-M890P"]'
     secrets:
       RELEASE_USERNAME:
         required: true
@@ -55,17 +64,17 @@ on:
         type: string
         default: ''
       matrix:
-        description: Board matrix as a JSON array
+        description: Board matrix as a JSON array. ZW-M890P alone is enough for the wheels.
         required: false
         type: string
-        default: '["ZW-810E", "ZW-M890P"]'
+        default: '["ZW-M890P"]'
 
 permissions:
   contents: read
 
 # Runs for different targets must not cancel each other.
 concurrency:
-  group: cudafy-flash-attention-upload-tmp-${{ inputs.source || 'default-branch' }}-${{ github.event.pull_request.number || github.ref }}
+  group: cudafy-flash-attention-upload-tmp-${{ inputs.source || (github.event_name == 'schedule' && 'scheduled' || 'default-branch') }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -73,25 +82,89 @@ env:
   SAIL_IMAGE: ${{ inputs.sail_image || 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-eic-20261010' }}
   # Clone base; its head is the default target.
   FA_BRANCH: v2.8.2
+  # Scheduled sweep: only v2.8.2 still ships hopper/, so fa3 is listed for it alone.
+  SCHEDULE_TARGETS: >-
+    [{"source":"v2.8.2","variants":["fa2","fa3"]},{"source":"v2.7.2","variants":["fa2"]},{"source":"v2.7.4","variants":["fa2"]}]
 
 jobs:
-  resolve:
-    name: Resolve target
+  plan:
+    name: Expand build legs
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     outputs:
-      kind: ${{ steps.target.outputs.kind }}
-      ref: ${{ steps.target.outputs.ref }}
-      commit: ${{ steps.target.outputs.commit }}
-      version: ${{ steps.target.outputs.version }}
+      # JSON array of {source, variant}: one build leg per pair.
+      legs: ${{ steps.expand.outputs.legs }}
     steps:
+      - name: Expand (source, variant) pairs
+        id: expand
+        shell: bash
+        env:
+          # Passed through env so the raw inputs never land in the script text.
+          SOURCE_INPUT: ${{ inputs.source }}
+          # Push runs carry no inputs, so restate the dispatch default here.
+          VARIANTS_INPUT: ${{ inputs.variants || '["fa2", "fa3"]' }}
+          SCHEDULED: ${{ github.event_name == 'schedule' }}
+          # Scheduled sweeps ignore the inputs above.
+          SCHEDULE_TARGETS: ${{ env.SCHEDULE_TARGETS }}
+        run: |
+          set -euo pipefail
+          if [[ "$SCHEDULED" == "true" ]]; then
+            targets="$SCHEDULE_TARGETS"
+          else
+            # Manual and reusable runs build exactly the one requested source.
+            targets="$(jq -cn --arg source "$SOURCE_INPUT" --argjson variants "$VARIANTS_INPUT" \
+              '[{source: $source, variants: $variants}]')" || {
+              echo "::error::variants must be a JSON array such as [\"fa2\", \"fa3\"] (got '$VARIANTS_INPUT')"
+              exit 1
+            }
+          fi
+          legs="$(jq -c '[.[] as $target | $target.variants[] | {source: $target.source, variant: .}]' <<< "$targets")" || {
+            echo "::error::Cannot expand the targets '$targets'"
+            exit 1
+          }
+          # The names reach artifact names and pod commands: keep them simple.
+          if ! jq -e 'all(.[]; .variant | test("^[a-z0-9]+$"))' > /dev/null <<< "$legs"; then
+            echo "::error::variants must be simple names such as [\"fa2\", \"fa3\"] (got '$targets')"
+            exit 1
+          fi
+          if [[ "$legs" == '[]' ]]; then
+            echo "::error::No build leg selected"
+            exit 1
+          fi
+          echo "legs=$legs" >> "$GITHUB_OUTPUT"
+          echo "Build legs: $legs" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: ${{ matrix.leg.variant }} (${{ matrix.leg.source || 'default' }} / ${{ matrix.runner }})
+    needs: plan
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P"]') }}
+        leg: ${{ fromJson(needs.plan.outputs.legs) }}
+    # Cancel per leg; the workflow-level group cannot distinguish matrix legs.
+    concurrency:
+      group: cudafy-flash-attention-upload-tmp-${{ matrix.leg.source || 'default-branch' }}-${{ matrix.leg.variant }}-${{ matrix.runner }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout cudafy
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Resolved per leg: one scheduled run covers several sources at once.
       - name: Fetch target and read the FA version
         id: target
         shell: bash
         env:
-          # Passed through env so the raw input never lands in the script text.
-          SOURCE_INPUT: ${{ inputs.source }}
-          VARIANTS_INPUT: ${{ inputs.variants }}
+          # Empty source keeps the head of the default branch.
+          SOURCE_INPUT: ${{ matrix.leg.source }}
+          VARIANT: ${{ matrix.leg.variant }}
         run: |
           set -euo pipefail
           # Accepted forms: PR URL / branch / release tag / commit id; bare PR
@@ -179,42 +252,22 @@ jobs:
             exit 1
           fi
 
-          # Fail here instead of after a long build when the tree lacks a variant.
-          if [[ "$VARIANTS_INPUT" == *fa3* ]] && ! git cat-file -e "${commit}:hopper/setup.py" 2>/dev/null; then
+          # Fail here instead of after a long build when the tree lacks the variant.
+          if [[ "$VARIANT" == fa3 ]] && ! git cat-file -e "${commit}:hopper/setup.py" 2>/dev/null; then
             echo "::error::fa3 requested but $commit has no hopper/setup.py"
             exit 1
           fi
 
+          # Artifact names reject '/', so derive a separator-free label from the ref.
+          slug="$(printf '%s' "$ref" | tr -c 'A-Za-z0-9._+-' '-')"
           {
             echo "kind=$kind"
             echo "ref=$ref"
             echo "commit=$commit"
             echo "version=$version"
+            echo "slug=$slug"
           } >> "$GITHUB_OUTPUT"
-          echo "FlashAttention target: ${display} -> ${commit:0:8} (version ${version}, variants ${VARIANTS_INPUT})" | tee -a "$GITHUB_STEP_SUMMARY"
-
-  build:
-    name: ${{ matrix.variant }} (${{ matrix.runner }})
-    needs: resolve
-    runs-on: k8s-runner-group-cpu-flytiger
-    container:
-      image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 360
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: ${{ fromJson(inputs.matrix || '["ZW-810E", "ZW-M890P"]') }}
-        variant: ${{ fromJson(inputs.variants) }}
-    # Cancel per leg; the workflow-level group cannot distinguish matrix legs.
-    concurrency:
-      group: cudafy-flash-attention-upload-tmp-${{ inputs.source || 'default-branch' }}-${{ matrix.variant }}-${{ matrix.runner }}-${{ github.event.pull_request.number || github.ref }}
-      cancel-in-progress: true
-    steps:
-      - name: Checkout cudafy
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
+          echo "FlashAttention target: ${display} -> ${commit:0:8} (version ${version}, variant ${VARIANT})" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Convert and build FlashAttention
         id: ppu-build
@@ -240,11 +293,11 @@ jobs:
 
             CUDAFY_ROOT=/workspace/source
             TARGET_ROOT=/workspace/target
-            FA_VERSION='${{ needs.resolve.outputs.version }}'
-            TARGET_KIND='${{ needs.resolve.outputs.kind }}'
-            TARGET_REF='${{ needs.resolve.outputs.ref }}'
-            TARGET_COMMIT='${{ needs.resolve.outputs.commit }}'
-            VARIANT='${{ matrix.variant }}'
+            FA_VERSION='${{ steps.target.outputs.version }}'
+            TARGET_KIND='${{ steps.target.outputs.kind }}'
+            TARGET_REF='${{ steps.target.outputs.ref }}'
+            TARGET_COMMIT='${{ steps.target.outputs.commit }}'
+            VARIANT='${{ matrix.leg.variant }}'
             VARIANT_UPPER="${VARIANT^^}"
             git clone --recurse-submodules -b '${{ env.FA_BRANCH }}' https://github.com/t-head/flash-attention-for-sail.git "$TARGET_ROOT"
             # The clone above is the default target; anything else is fetched and
@@ -308,28 +361,30 @@ jobs:
             fi
             tail -n 200 "$LOG_FILE"
 
-            NAS_RESULT_DIR="/mnt/wl_nas/devops/cudafy-ci/flash-attention/${{ needs.resolve.outputs.ref }}/${FA_VERSION}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${VARIANT}"
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/cudafy-ci/flash-attention/${{ steps.target.outputs.ref }}/${FA_VERSION}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${VARIANT}"
             mkdir -p "$NAS_RESULT_DIR/wheels"
             cp "$BUILD_DIR"/dist/*.whl "$NAS_RESULT_DIR/wheels/"
           cleanup_policy: on_success
 
-      - name: Upload wheel artifact (${{ matrix.variant }} / ${{ matrix.runner }})
+      - name: Upload wheel artifact (${{ matrix.leg.variant }} / ${{ matrix.runner }})
         # Wheels are board independent: only the first board uploads, all
-        # variants do. !cancelled() keeps artifacts when the build failed.
-        if: ${{ !cancelled() && matrix.runner == fromJson(inputs.matrix || '["ZW-810E", "ZW-M890P"]')[0] }}
+        # variants do. !cancelled() keeps artifacts when the build failed, and a
+        # failed resolve must not be masked by a missing-file error here.
+        if: ${{ !cancelled() && steps.target.outcome == 'success' && matrix.runner == fromJson(inputs.matrix || '["ZW-M890P"]')[0] }}
         uses: actions/upload-artifact@v4
         with:
-          name: flash-attention-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.resolve.outputs.ref }}-${{ needs.resolve.outputs.version }}-${{ matrix.variant }}
+          name: flash-attention-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.target.outputs.slug }}-${{ steps.target.outputs.version }}-${{ matrix.leg.variant }}
           # Container-side /mnt/wl_nas maps to /wl_nas on the runner host.
-          path: /wl_nas/devops/cudafy-ci/flash-attention/${{ needs.resolve.outputs.ref }}/${{ needs.resolve.outputs.version }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${{ matrix.variant }}/wheels/*.whl
+          path: /wl_nas/devops/cudafy-ci/flash-attention/${{ steps.target.outputs.ref }}/${{ steps.target.outputs.version }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${{ matrix.leg.variant }}/wheels/*.whl
           if-no-files-found: error
           compression-level: 0
           overwrite: true
 
   merge:
     name: Merge wheel artifacts
-    # Every leg must build successfully; resolve carries the target ref.
-    needs: [resolve, build]
+    # Every leg must build successfully. One run may mix several target refs, so
+    # the merged artifact is named after the run instead of the ref.
+    needs: [plan, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -338,13 +393,13 @@ jobs:
       - name: Set merged artifact name
         id: artifact-name
         shell: bash
-        run: echo 'artifact_name=flash-attention-wheels-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.resolve.outputs.ref }}' >> "$GITHUB_OUTPUT"
+        run: echo 'artifact_name=flash-attention-wheels-${{ github.run_id }}-${{ github.run_attempt }}' >> "$GITHUB_OUTPUT"
 
       - name: Merge wheel artifacts
         uses: actions/upload-artifact/merge@v4
         with:
           name: ${{ steps.artifact-name.outputs.artifact_name }}
-          pattern: flash-attention-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.resolve.outputs.ref }}-*
+          pattern: flash-attention-wheel-${{ github.run_id }}-${{ github.run_attempt }}-*
           compression-level: 0
           delete-merged: false
 
