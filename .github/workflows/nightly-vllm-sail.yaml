@@ -1,0 +1,201 @@
+name: vLLM SAIL nightly wheels
+
+# Build directly with the upstream SAIL tooling; no cudafy conversion is needed.
+# The upstream entry point builds both vllm-sail and its exact pinned vLLM.
+on:
+  schedule:
+    - cron: '0 13 * * *'  # Daily at 21:00 Asia/Shanghai (UTC+8)
+  workflow_call:
+    inputs:
+      target_ref:
+        description: vllm-sail branch, tag, commit SHA or refs/pull/<number>/head.
+        required: false
+        type: string
+        default: main
+      sail_image:
+        description: SDK and SAIL PyTorch image. Empty uses the default image.
+        required: false
+        type: string
+        default: ''
+    secrets:
+      RELEASE_USERNAME:
+        required: true
+      RELEASE_TOKEN:
+        required: true
+      TEMPLATE_TOKEN:
+        required: false
+  workflow_dispatch:
+    inputs:
+      target_ref:
+        description: vllm-sail branch, tag, commit SHA or refs/pull/<number>/head.
+        required: false
+        type: string
+        default: main
+      sail_image:
+        description: SDK and SAIL PyTorch image. Empty uses the default image.
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vllm-sail-nightly-${{ inputs.target_ref || 'main' }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SAIL_IMAGE: ${{ inputs.sail_image || 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-eic-20261010' }}
+
+jobs:
+  build:
+    name: Build vLLM and SAIL wheels
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    # Leave time after the cluster deadline to preserve diagnostics and upload.
+    timeout-minutes: 390
+    outputs:
+      artifact_name: ${{ steps.artifact-name.outputs.name }}
+    steps:
+      - name: Checkout workflow tools
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout vLLM SAIL
+        uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm-sail
+          ref: ${{ inputs.target_ref || 'main' }}
+          path: vllm-sail
+          # Keep tags and history so setuptools-scm derives the source version.
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set wheel artifact name
+        id: artifact-name
+        shell: bash
+        run: echo 'name=vllm-sail-nightly-wheels-${{ github.run_id }}-${{ github.run_attempt }}' >> "$GITHUB_OUTPUT"
+
+      - name: Build directly with the SAIL SDK
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: board-type=ZW-M890P
+          namespace: ppu-sched
+          timeout_minutes: 360
+          command: |
+            set -euo pipefail
+            # Remove image-provided GitHub rewrites to the internal mirror.
+            for scope in system global; do
+              while IFS= read -r key; do
+                [[ -n "$key" ]] || continue
+                git config --"$scope" --unset-all "$key"
+              done < <(git config --"$scope" --name-only --get-regexp '^url\..*\.insteadof$' || true)
+            done
+            git config --global --add safe.directory '*'
+
+            TARGET_ROOT=/workspace/source/vllm-sail
+            BUILD_OUTPUT=/workspace/nightly-build
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/cudafy-ci/vllm-sail/${{ github.run_id }}/${{ github.run_attempt }}"
+            mkdir -p "$NAS_RESULT_DIR"
+            # The cluster action always cleans up pods, including failed builds.
+            # Preserve partial logs/manifests on NAS before the pod exits.
+            preserve_results() {
+              status=$?
+              trap - EXIT
+              if [[ -d "$BUILD_OUTPUT" ]]; then
+                cp -a "$BUILD_OUTPUT/." "$NAS_RESULT_DIR/" || status=1
+              fi
+              exit "$status"
+            }
+            trap preserve_results EXIT
+
+            source /usr/local/PPU_SDK/envsetup.sh
+            export PPU_SDK=/usr/local/PPU_SDK
+            # SDK activation can select an internal index unreachable from CI.
+            export PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+            export PIP_EXTRA_INDEX_URL=''
+            unset PYTHONPATH VLLM_SAIL_SKIP_EXT VLLM_SAIL_PREBUILT_EXT_DIR
+            export BUILD_JOBS=16
+            export PYTORCH_SAIL_ARCH='ppu_10;ppu_15'
+            export VLLM_SAIL_BUILD_IMAGE="$SAIL_IMAGE"
+
+            cd "$TARGET_ROOT"
+            # Builds pinned vLLM with VLLM_TARGET_DEVICE=empty (including Rust),
+            # then SAIL's four native extensions without build isolation.
+            bash scripts/build_wheels.sh --output-dir "$BUILD_OUTPUT"
+            # Recheck the pair and its native extension hashes before uploading.
+            python scripts/ci/ppu_wheel_manifest.py verify "$BUILD_OUTPUT/wheels"
+
+      - name: Upload nightly wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.name }}
+          path: /wl_nas/devops/cudafy-ci/vllm-sail/${{ github.run_id }}/${{ github.run_attempt }}/wheels/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          overwrite: true
+
+      - name: Preserve build diagnostics
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vllm-sail-nightly-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            /wl_nas/devops/cudafy-ci/vllm-sail/${{ github.run_id }}/${{ github.run_attempt }}/logs/
+            /wl_nas/devops/cudafy-ci/vllm-sail/${{ github.run_id }}/${{ github.run_attempt }}/build-manifest.txt
+          if-no-files-found: warn
+          retention-days: 14
+          overwrite: true
+
+      - name: Build summary
+        if: always()
+        shell: bash
+        run: |
+          manifest='/wl_nas/devops/cudafy-ci/vllm-sail/${{ github.run_id }}/${{ github.run_attempt }}/build-manifest.txt'
+          {
+            echo '## vLLM SAIL nightly build'
+            echo 'Direct SAIL build, targeting ppu_10 and ppu_15.'
+            echo 'Build and wheel integrity checks only; runtime tests are not run.'
+            if [[ -f "$manifest" ]]; then
+              echo '```text'
+              cat "$manifest"
+              echo '```'
+            else
+              echo 'Build manifest unavailable; see the cluster task logs.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  push:
+    name: Publish temporary nightly wheels
+    needs: build
+    uses: flytiger-eco/shared-workflows/.github/workflows/push-tmp-wheel.yml@main
+    with:
+      # Use the producer's output so rerunning only this job finds its artifact.
+      artifact_name: ${{ needs.build.outputs.artifact_name }}
+      template_repository: flytiger-eco/shared-workflows
+      template_ref: main
+    secrets:
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+      template_token: ${{ secrets.TEMPLATE_TOKEN }}
+
+  result:
+    name: Show nightly download URL
+    needs: push
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write batch directory URL
+        shell: bash
+        env:
+          UPLOAD_URL: ${{ needs.push.outputs.upload_url }}
+        run: |
+          set -euo pipefail
+          printf 'Nightly wheel directory: %s\n' "$UPLOAD_URL" | tee -a "$GITHUB_STEP_SUMMARY"
