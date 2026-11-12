@@ -10,7 +10,7 @@ on:
         description: 'sglang-for-sail 源码分支，与运行此 workflow 的 cudafy 分支独立'
         required: false
         type: string
-        default: ywj/v0.5.23
+        default: release/v0.5.23
       sail_image:
         description: 'CUDA 兼容构建镜像；留空使用仓库其它临时上传 workflow 的默认镜像'
         required: false
@@ -38,7 +38,7 @@ on:
         description: 'sglang-for-sail 源码分支，与运行此 workflow 的 cudafy 分支独立'
         required: true
         type: string
-        default: ywj/v0.5.23
+        default: release/v0.5.23
       sail_image:
         description: 'CUDA 兼容构建镜像；留空使用仓库其它临时上传 workflow 的默认镜像'
         required: false
@@ -54,7 +54,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: cudafy-sglang-upload-tmp-${{ inputs.branch || 'ywj/v0.5.23' }}-${{ github.ref }}
+  group: cudafy-sglang-upload-tmp-${{ inputs.branch || 'release/v0.5.23' }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -92,7 +92,7 @@ jobs:
         id: source
         shell: bash
         env:
-          SOURCE_BRANCH: ${{ inputs.branch || 'ywj/v0.5.23' }}
+          SOURCE_BRANCH: ${{ inputs.branch || 'release/v0.5.23' }}
         run: |
           set -euo pipefail
           git check-ref-format "refs/heads/$SOURCE_BRANCH"
@@ -124,7 +124,7 @@ jobs:
         runner: ${{ fromJson(inputs.matrix || '["ZW-M890P"]') }}
         package: [sglang, sglang-kernel]
     concurrency:
-      group: cudafy-sglang-upload-tmp-${{ inputs.branch || 'ywj/v0.5.23' }}-${{ matrix.package }}-${{ matrix.runner }}-${{ github.ref }}
+      group: cudafy-sglang-upload-tmp-${{ inputs.branch || 'release/v0.5.23' }}-${{ matrix.package }}-${{ matrix.runner }}-${{ github.ref }}
       cancel-in-progress: true
     steps:
       - name: 检出 cudafy 转换脚本
