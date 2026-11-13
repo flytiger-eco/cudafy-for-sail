@@ -1,0 +1,272 @@
+name: SGLang CUDAFY temporary wheel upload
+
+# 构建 sglang 和转换后的 sglang-kernel，仅上传到临时目录，不走正式发布。
+# 需要 RELEASE_USERNAME、RELEASE_TOKEN；私有模板另需 TEMPLATE_TOKEN。
+on:
+  workflow_call:
+    inputs:
+      branch:
+        description: 'sglang-for-sail 源码分支，与运行此 workflow 的 cudafy 分支独立'
+        required: false
+        type: string
+        default: release/v0.5.23
+      sail_image:
+        description: 'CUDA 兼容构建镜像；留空使用仓库其它临时上传 workflow 的默认镜像'
+        required: false
+        type: string
+        default: ''
+      matrix:
+        description: '板卡 JSON 数组，可选 ZW-M890P、ZW-810E'
+        required: false
+        type: string
+        default: '["ZW-M890P"]'
+    outputs:
+      upload_url:
+        description: '包含 sglang 和 sglang-kernel wheel 的临时批次目录'
+        value: ${{ jobs.push.outputs.upload_url }}
+    secrets:
+      RELEASE_USERNAME:
+        required: true
+      RELEASE_TOKEN:
+        required: true
+      TEMPLATE_TOKEN:
+        required: false
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'sglang-for-sail 源码分支，与运行此 workflow 的 cudafy 分支独立'
+        required: true
+        type: string
+        default: release/v0.5.23
+      sail_image:
+        description: 'CUDA 兼容构建镜像；留空使用仓库其它临时上传 workflow 的默认镜像'
+        required: false
+        type: string
+        default: ''
+      matrix:
+        description: '板卡 JSON 数组，可选 ZW-M890P、ZW-810E'
+        required: true
+        type: string
+        default: '["ZW-M890P"]'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cudafy-sglang-upload-tmp-${{ inputs.branch || 'release/v0.5.23' }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SAIL_IMAGE: ${{ inputs.sail_image || 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-eic-20261010' }}
+
+jobs:
+  resolve:
+    name: 解析源码并固定 commit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+    steps:
+      - name: 校验板卡矩阵
+        shell: bash
+        env:
+          BOARD_MATRIX: ${{ inputs.matrix || '["ZW-M890P"]' }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+
+          boards = json.loads(os.environ['BOARD_MATRIX'])
+          if (
+              not isinstance(boards, list)
+              or not boards
+              or any(board not in ('ZW-M890P', 'ZW-810E') for board in boards)
+              or len(set(boards)) != len(boards)
+          ):
+              raise SystemExit('matrix 必须是无重复板卡的非空 JSON 数组：ZW-M890P、ZW-810E')
+          PY
+
+      - name: 拉取所选分支并检查构建入口
+        id: source
+        shell: bash
+        env:
+          SOURCE_BRANCH: ${{ inputs.branch || 'release/v0.5.23' }}
+        run: |
+          set -euo pipefail
+          git check-ref-format "refs/heads/$SOURCE_BRANCH"
+          git clone --branch "$SOURCE_BRANCH" --single-branch --depth 1 https://github.com/t-head/sglang-for-sail.git sglang-source
+          cd sglang-source
+          commit=$(git rev-parse HEAD)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          for file in python/pyproject_other.toml \
+                      scripts/ci/utils/install_protoc.sh \
+                      scripts/ci/utils/install_rustup.sh \
+                      python/sglang/kernels/aot/setup_sail.py \
+                      python/sglang/kernels/aot/pyproject_sail.toml; do
+            test -f "$file" || { printf '::error::所选源码缺少 %s\n' "$file" >&2; exit 1; }
+          done
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          printf 'sglang-for-sail 源码：%s -> %s\n' "$SOURCE_BRANCH" "$commit" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: ${{ matrix.package }} (${{ matrix.runner }})
+    needs: resolve
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P"]') }}
+        package: [sglang, sglang-kernel]
+    concurrency:
+      group: cudafy-sglang-upload-tmp-${{ inputs.branch || 'release/v0.5.23' }}-${{ matrix.package }}-${{ matrix.runner }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: 检出 cudafy 转换脚本
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 构建 wheel
+        uses: flytiger-eco/shared-workflows/cluster-task@main
+        with:
+          image: ${{ env.SAIL_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: board-type=${{ matrix.runner }}
+          namespace: ppu-sched
+          timeout_minutes: 330
+          command: |
+            set -eo pipefail
+            unset PIP_INDEX_URL
+            # 清除镜像内指向不可达镜像站的 Git URL 重写。
+            for key in $(git config --global --name-only --get-regexp '^url\.'); do
+              git config --global --unset-all "$key"
+            done
+            git config --global --add safe.directory '*'
+
+            CUDAFY_ROOT=/workspace/source
+            TARGET_ROOT=/workspace/target
+            TARGET_COMMIT='${{ needs.resolve.outputs.commit }}'
+            PACKAGE='${{ matrix.package }}'
+            git clone --no-checkout https://github.com/t-head/sglang-for-sail.git "$TARGET_ROOT"
+            git -C "$TARGET_ROOT" fetch --no-tags origin "$TARGET_COMMIT"
+            git -C "$TARGET_ROOT" checkout --detach "$TARGET_COMMIT"
+            git -C "$TARGET_ROOT" submodule update --init --recursive
+            cd "$TARGET_ROOT"
+
+            export HOME=$(eval echo ~$(id -un))
+            source /usr/local/PPU_SDK/envsetup.sh || true
+            if [[ "$PACKAGE" == sglang ]]; then
+              # 主包保留现有发布 workflow 的构建步骤。
+              source scripts/ci/utils/install_protoc.sh
+              source scripts/ci/utils/install_rustup.sh
+              cd python
+              cp pyproject_other.toml pyproject.toml
+              cp ../README.md ../LICENSE .
+              pip install build wheel setuptools setuptools-scm setuptools-rust
+              git config --global --add safe.directory '*'
+              python3 -m build --wheel
+            else
+              # 先确认 Torch 走 CUDA 兼容编译，再转换 kernel 的构建配置。
+              python3 - <<'PY'
+            import torch
+            from torch.utils import cpp_extension
+
+            print(f'torch {torch.__version__} (cuda {torch.version.cuda})')
+            if getattr(cpp_extension, 'IS_PPU_EXTENSION', False):
+                raise SystemExit('::error::当前镜像走 hgcc / cuda-free，请选择 CUDA 兼容 Torch 镜像')
+            PY
+              export MAX_JOBS="${MAX_JOBS:-$(nproc)}"
+              git config --global --add safe.directory '*'
+              # 固定 CI 打包工具版本，避免镜像中的 packaging 与 setuptools API 不兼容。
+              python3 -m pip install --no-input 'setuptools==75.8.0' 'wheel==0.45.1' 'packaging==24.2'
+              python3 - <<'PY'
+            from importlib.metadata import version
+            from packaging.utils import canonicalize_version
+
+            for name in ('setuptools', 'wheel', 'packaging'):
+                print(f'{name} {version(name)}')
+            assert canonicalize_version('1.0.0', strip_trailing_zero=False) == '1.0.0'
+            PY
+              cd python/sglang/kernels/aot
+              test -f setup_sail.py || { echo '::error::缺少 python/sglang/kernels/aot/setup_sail.py' >&2; exit 1; }
+              python3 "$CUDAFY_ROOT/cudafy_sail_sglang.py" --file "$TARGET_ROOT/python/sglang/kernels/aot/setup_sail.py"
+              cp pyproject_sail.toml pyproject.toml
+              python3 setup_sail.py bdist_wheel
+            fi
+
+            # 两种包均记录实际 sglang 源码 commit，保持版本及兼容性标签不变。
+            # wheel tags 同步更新文件名、WHEEL Build 和 RECORD，移除未标记的原 wheel。
+            python3 -m wheel tags --build "1g${TARGET_COMMIT:0:12}" --remove dist/*.whl
+
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/cudafy-ci/sglang/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${PACKAGE}"
+            mkdir -p "$NAS_RESULT_DIR/wheels"
+            cp dist/*.whl "$NAS_RESULT_DIR/wheels/"
+
+      - name: 保存 wheel artifact
+        # wheel 与板卡无关；两种包均由首个板卡上传，其余板卡只验证构建。
+        if: ${{ success() && matrix.runner == fromJson(inputs.matrix || '["ZW-M890P"]')[0] }}
+        uses: actions/upload-artifact@v4
+        with:
+          # 按源码 commit 隔离且不含 attempt，重跑失败 job 时可复用同一源码的另一包。
+          name: sglang-tmp-wheel-${{ github.run_id }}-${{ needs.resolve.outputs.commit }}-${{ matrix.package }}
+          # 容器内 /mnt/wl_nas 对应 runner 上的 /wl_nas。
+          path: /wl_nas/devops/cudafy-ci/sglang/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${{ matrix.package }}/wheels/*.whl
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+
+  merge:
+    name: 合并两种包的 wheel
+    # 所有板卡上的两种包均构建成功才允许临时上传。
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      artifact_name: ${{ steps.artifact-name.outputs.artifact_name }}
+    steps:
+      - name: 设置合并 artifact 名
+        id: artifact-name
+        shell: bash
+        run: echo 'artifact_name=sglang-tmp-wheels-${{ github.run_id }}-${{ github.run_attempt }}' >> "$GITHUB_OUTPUT"
+
+      - name: 合并 wheel artifacts
+        uses: actions/upload-artifact/merge@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.artifact_name }}
+          pattern: sglang-tmp-wheel-${{ github.run_id }}-${{ needs.resolve.outputs.commit }}-*
+          compression-level: 0
+          delete-merged: false
+
+  push:
+    name: 上传到临时目录
+    needs: merge
+    uses: flytiger-eco/shared-workflows/.github/workflows/push-tmp-wheel.yml@main
+    with:
+      artifact_name: ${{ needs.merge.outputs.artifact_name }}
+      template_repository: flytiger-eco/shared-workflows
+      template_ref: main
+    secrets:
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+      template_token: ${{ secrets.TEMPLATE_TOKEN }}
+
+  result:
+    name: 显示临时下载地址
+    needs: push
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 写入日志和 Summary
+        shell: bash
+        env:
+          UPLOAD_URL: ${{ needs.push.outputs.upload_url }}
+        run: |
+          set -euo pipefail
+          printf '临时 wheel 下载目录：%s\n' "$UPLOAD_URL" | tee -a "$GITHUB_STEP_SUMMARY"

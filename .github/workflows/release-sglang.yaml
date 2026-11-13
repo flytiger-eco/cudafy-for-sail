@@ -39,7 +39,7 @@ on:
         description: 'Torch 版本 JSON 数组'
         required: true
         type: string
-        default: '["2.10.0"]'
+        default: '["2.13.0"]'
       sdk_versions:
         description: 'CUDA 兼容 SDK 版本 JSON 数组'
         required: true
@@ -136,7 +136,7 @@ jobs:
       python_versions: ${{ inputs.python_versions || '["312"]' }}
       os_versions: ${{ inputs.os_versions || '["ubuntu2404"]' }}
       runtime_versions: ${{ inputs.runtime_versions || '["13.0.0"]' }}
-      torch_versions: ${{ inputs.torch_versions || '["2.10.0"]' }}
+      torch_versions: ${{ inputs.torch_versions || '["2.13.0"]' }}
       sdk_versions: ${{ inputs.sdk_versions || '["2.2.0"]' }}
       tag_version: ${{ inputs.tag_version || '' }}
       # 模板检出的是 cudafy 仓库；源码放在其子目录中，方便模板收集 wheel。
@@ -183,7 +183,7 @@ jobs:
       python_versions: ${{ inputs.python_versions || '["312"]' }}
       os_versions: ${{ inputs.os_versions || '["ubuntu2404"]' }}
       runtime_versions: ${{ inputs.runtime_versions || '["13.0.0"]' }}
-      torch_versions: ${{ inputs.torch_versions || '["2.10.0"]' }}
+      torch_versions: ${{ inputs.torch_versions || '["2.13.0"]' }}
       sdk_versions: ${{ inputs.sdk_versions || '["2.2.0"]' }}
       tag_version: ${{ needs.resolve.outputs.tag_version }}
       # 转换脚本来自本次运行检出的 cudafy 仓库，不从外部下载或修改内核源码。
