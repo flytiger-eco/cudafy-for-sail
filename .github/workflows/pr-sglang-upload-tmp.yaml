@@ -3,7 +3,6 @@ name: SGLang CUDAFY temporary wheel upload
 # 构建 sglang 和转换后的 sglang-kernel，仅上传到临时目录，不走正式发布。
 # 需要 RELEASE_USERNAME、RELEASE_TOKEN；私有模板另需 TEMPLATE_TOKEN。
 on:
-  push:
   workflow_call:
     inputs:
       branch:
@@ -201,6 +200,10 @@ jobs:
               cp pyproject_sail.toml pyproject.toml
               python3 setup_sail.py bdist_wheel
             fi
+
+            # 两种包均记录实际 sglang 源码 commit，保持版本及兼容性标签不变。
+            # wheel tags 同步更新文件名、WHEEL Build 和 RECORD，移除未标记的原 wheel。
+            python3 -m wheel tags --build "1g${TARGET_COMMIT:0:12}" --remove dist/*.whl
 
             NAS_RESULT_DIR="/mnt/wl_nas/devops/cudafy-ci/sglang/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${PACKAGE}"
             mkdir -p "$NAS_RESULT_DIR/wheels"
