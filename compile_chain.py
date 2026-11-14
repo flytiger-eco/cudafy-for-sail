@@ -25,7 +25,7 @@ COMPILER_IDENTITY_SUBS = [
     ("hgcc", "nvcc"),
     # uppercase: HGCC compiler: / HGCCBuildExtension-style labels
     ("HGCC", "NVCC"),
-    ("hgobjdump", "cuobjdump"),
+    # ("hgobjdump", "cuobjdump"),  # no cuobjdump in the CUDA-compatible SDK
 ]
 
 # ---------------------------------------------------------------------------

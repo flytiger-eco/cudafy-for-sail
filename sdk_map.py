@@ -20760,7 +20760,7 @@ NON_SDK_TOKEN_MAP = {
     'DG_JIT_USE_HGRTC': 'DG_JIT_USE_NVRTC',
     'hggcEventElapsed': 'cudaEventElapsed',
     'to_ppu_bfloat16': 'to_nv_bfloat16',
-    'hgobjdump_path': 'cuobjdump_path',
+    # 'hgobjdump_path': 'cuobjdump_path',  # no cuobjdump in the CUDA-compatible SDK
     'ACBLAS_ERROR': 'CUBLAS_ERROR',
     'hggcTypedefs': 'cudaTypedefs',
     'is_acComplex': 'is_cuComplex',
