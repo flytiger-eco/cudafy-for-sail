@@ -28,6 +28,14 @@ COMPILER_IDENTITY_SUBS = [
     # ("hgobjdump", "cuobjdump"),  # no cuobjdump in the CUDA-compatible SDK
 ]
 
+# After conversion the SDK root variable resolves to <SDK>/CUDA_SDK, which
+# ships nvcc but no objdump at all; the PPU tool still lives in <SDK>/bin, one
+# level up, so anchor these paths there instead of renaming the tool.
+SDK_TOOL_PATH_SUBS = [
+    ('sdk_home / "bin" / "hgobjdump"', 'sdk_home / ".." / "bin" / "hgobjdump"'),
+    ("{PPU_HOME}/bin/hgobjdump", "{PPU_HOME}/../bin/hgobjdump"),
+]
+
 # ---------------------------------------------------------------------------
 # Arch flags.
 # ---------------------------------------------------------------------------
@@ -104,7 +112,7 @@ def apply_compile_chain(content: str) -> str:
     content = DROP_PPU_COMPAT_I_RE.sub("", content)
     content = DROP_COMPAT_WRAPPER_RE.sub("", content)
 
-    for old, new in COMPILER_IDENTITY_SUBS:
+    for old, new in COMPILER_IDENTITY_SUBS + SDK_TOOL_PATH_SUBS:
         if old in content:
             content = content.replace(old, new)
 
