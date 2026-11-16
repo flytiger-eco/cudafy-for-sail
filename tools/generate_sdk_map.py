@@ -273,7 +273,7 @@ HISTORICAL_TOKENS = [
     ("hggc_vector_types.h", "vector_types.h"),
     ("hggc_device_runtime_api.h", "cuda_device_runtime_api.h"),
     ("hggc_fp4.h", "cuda_fp4.h"),
-    ("hgobjdump_path", "cuobjdump_path"),
+    # ("hgobjdump_path", "cuobjdump_path"),  # no cuobjdump in that SDK
     ("kernel.hgbin", "kernel.cubin"),
     ("lazy_hgFuncSetAttribute", "lazy_cuFuncSetAttribute"),
     ("lazy_hgGetErrorName", "lazy_cuGetErrorName"),
