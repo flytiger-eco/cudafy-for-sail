@@ -1,0 +1,5 @@
+# Default owners for all files and directories.
+* @Shen-Benjamin @qingyun975 @AAAlicanfly @limsn27
+
+# GitHub configuration and workflows. This overrides the default owners.
+/.github/ @RY857644432 @likaixu-lkx123 @Shen-Benjamin @qingyun975
