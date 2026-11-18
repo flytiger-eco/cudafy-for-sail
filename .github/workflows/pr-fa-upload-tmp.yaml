@@ -6,8 +6,19 @@ name: FlashAttention CUDAFY temporary wheel upload
 # empty = head of the default branch). variants lists which wheels to build from
 # it: fa2 is the root package, fa3 the hopper/ package. The FA version label is
 # read from the source tree, so label, NAS path and code always match.
+# Artifact names use a slug of the ref: upload-artifact rejects the '/' in
+# branch names such as release/v2.8.2_v1.0.0.
+# A schedule run carries no inputs, so it builds every entry in
+# SCHEDULE_TARGETS, one leg per pinned variant (ref:fa2,fa3). The list is
+# authoritative: v2.7.4 and v2.7.2 build fa2 only. A target that still lacks
+# hopper/ (v2.7.2) drops a pinned fa3 instead of failing the whole night; an
+# explicit dispatch request for a missing variant still fails fast.
+# A scheduled workflow only runs from the default branch, so this file must be
+# on main for the cron to fire.
 # Requires RELEASE_USERNAME / RELEASE_TOKEN (TEMPLATE_TOKEN for private templates).
 on:
+  schedule:
+    - cron: '0 13 * * *'  # Daily at 21:00 Asia/Shanghai (UTC+8)
   workflow_call:
     inputs:
       source:
@@ -25,11 +36,16 @@ on:
         required: false
         type: string
         default: ''
+      fast:
+        description: 'Compile only. This workflow already runs no test suite, so the flag only keeps the input set uniform.'
+        required: false
+        type: boolean
+        default: false
       matrix:
         description: Board matrix as a JSON array
         required: false
         type: string
-        default: '["ZW-810E", "ZW-M890P"]'
+        default: '["ZW-M890P"]'
     secrets:
       RELEASE_USERNAME:
         required: true
@@ -43,7 +59,6 @@ on:
         description: 'flash-attention-for-sail PR URL / branch / release tag / commit id. Empty builds the head of the default branch.'
         required: false
         type: string
-        default: ''
       variants:
         description: 'Variants to build as a JSON array: fa2 (root package) and/or fa3 (hopper package).'
         required: false
@@ -54,147 +69,217 @@ on:
         required: false
         type: string
         default: ''
+      fast:
+        description: 'Compile only. This workflow already runs no test suite, so the flag only keeps the input set uniform.'
+        required: false
+        type: boolean
+        default: false
       matrix:
         description: Board matrix as a JSON array
         required: false
         type: string
-        default: '["ZW-810E", "ZW-M890P"]'
+        default: '["ZW-M890P"]'
 
 permissions:
   contents: read
 
-# Runs for different targets must not cancel each other.
+# A schedule run must not cancel a manual verification run, and vice versa.
 concurrency:
-  group: cudafy-flash-attention-upload-tmp-${{ inputs.source || 'default-branch' }}-${{ github.event.pull_request.number || github.ref }}
+  group: cudafy-flash-attention-upload-tmp-${{ github.event_name }}-${{ inputs.source || 'pinned' }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
   # Empty sail_image falls back to this pinned image.
-  SAIL_IMAGE: ${{ inputs.sail_image || 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-eic-20261010' }}
+  SAIL_IMAGE: ${{ inputs.sail_image || 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.1-2.13.0-ubuntu24.04-cuda13.0-py312-20261103' }}
   # Clone base; its head is the default target.
   FA_BRANCH: v2.8.2
+  # Schedule events carry no inputs; ref:fa2,fa3 pins each target's
+  # variants and every entry becomes its own matrix leg.
+  SCHEDULE_TARGETS: v2.8.2:fa2,fa3 v2.7.4:fa2 v2.7.2:fa2
 
 jobs:
   resolve:
-    name: Resolve target
+    name: Resolve targets
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     outputs:
-      kind: ${{ steps.target.outputs.kind }}
-      ref: ${{ steps.target.outputs.ref }}
-      commit: ${{ steps.target.outputs.commit }}
-      version: ${{ steps.target.outputs.version }}
+      # Matrix legs: [{"ref","kind","slug","commit","version","variant"}, ...]
+      legs: ${{ steps.target.outputs.legs }}
     steps:
-      - name: Fetch target and read the FA version
+      - name: Fetch targets and read the FA versions
         id: target
         shell: bash
         env:
           # Passed through env so the raw input never lands in the script text.
           SOURCE_INPUT: ${{ inputs.source }}
-          VARIANTS_INPUT: ${{ inputs.variants }}
+          # Restated for schedule runs: the declared default renders empty there.
+          VARIANTS_INPUT: ${{ inputs.variants || '["fa2", "fa3"]' }}
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULE_TARGETS_VALUE: ${{ env.SCHEDULE_TARGETS }}
         run: |
           set -euo pipefail
-          # Accepted forms: PR URL / branch / release tag / commit id; bare PR
-          # numbers are ambiguous.
-          raw="${SOURCE_INPUT//[[:space:]]/}"
-          kind=default
-          ref="$FA_BRANCH"
-          if [[ -n "$raw" ]]; then
-            raw="${raw%%[?#]*}"
-            # Whitelist check: the value is reused as a git ref below.
-            if [[ ! "$raw" =~ ^[A-Za-z0-9][A-Za-z0-9._/@:+-]*$ ]]; then
-              echo "::error::Unsupported source '$SOURCE_INPUT': expected a PR URL, branch, release tag or commit id"
-              exit 1
-            fi
-            case "$raw" in
-              *'/pull/'*)
-                num="${raw#*/pull/}"
-                num="${num%%[!0-9]*}"
-                [[ "$num" =~ ^[0-9]+$ ]] || { echo "::error::Cannot read a PR number from '$raw'"; exit 1; }
-                kind=pr
-                ref="$num"
-                ;;
-              *)
-                if [[ "$raw" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                  # Release tag such as 2.8.2+v2.1.0: never a branch or a commit id.
-                  kind=tag
-                  ref="$raw"
-                elif [[ "$raw" =~ ^[0-9]+$ ]] && [[ ${#raw} -ne 40 ]]; then
-                  echo "::error::Bare PR numbers are not supported: pass the PR URL, a branch, a release tag or a commit id (got '$raw')"
-                  exit 1
-                else
-                  # Branch or commit id: the fetch below decides which one.
-                  kind=ref
-                  ref="$raw"
-                fi
-                ;;
-            esac
+          # Dispatch/call carry inputs; a schedule expands to its pinned list.
+          sources="$SOURCE_INPUT"
+          if [[ "$EVENT_NAME" == schedule ]]; then
+            sources="$SCHEDULE_TARGETS_VALUE"
           fi
-          case "$kind" in
-            default) display="$FA_BRANCH (head)" ;;
-            pr) display="PR #$ref" ;;
-            tag) display="tag $ref" ;;
-            *) display="$ref" ;;
-          esac
+          # An empty source means the head of the default branch.
+          read -r -a targets <<< "${sources:- }"
+          [[ ${#targets[@]} -gt 0 ]] || targets=("")
 
-          # Shallow fetch of the one commit to build: its tree is enough to read
-          # the version and to check whether the requested variants exist.
+          # Requested variants, e.g. ["fa2", "fa3"], as a bash array.
+          requested_variants=()
+          while IFS= read -r variant; do
+            requested_variants+=("$variant")
+          done < <(printf '%s' "$VARIANTS_INPUT" | grep -o '"[A-Za-z0-9._-]*"' | tr -d '"')
+          if [[ ${#requested_variants[@]} -eq 0 ]]; then
+            echo "::error::Cannot read variants from '$VARIANTS_INPUT'"
+            exit 1
+          fi
+
+          # One shallow clone of the default branch also registers the remote, so
+          # every selected ref is fetched from 'origin' without repeating the address.
           work="$RUNNER_TEMP/fa-resolve"
-          # One shallow clone of the default branch also registers the remote, so the
-          # selected ref is fetched from 'origin' without repeating the address.
           rm -rf "$work"
           git clone -q --no-checkout --depth 1 --no-tags -b "$FA_BRANCH" https://github.com/t-head/flash-attention-for-sail.git "$work"
           cd "$work"
-          case "$kind" in
-            pr)
-              git fetch -q --no-tags --depth 1 origin "+refs/pull/${ref}/head" || {
-                echo "::error::Cannot fetch PR #$ref from FA repository"
+
+          legs='[]'
+          summary=''
+          for source in "${targets[@]}"; do
+            # Accepted forms: PR URL / branch / release tag / commit id; bare PR
+            # numbers are ambiguous.
+            raw="${source//[[:space:]]/}"
+            # A schedule entry may pin its own variants (ref:fa2,fa3); every
+            # other event builds the requested variants.
+            source_variants=("${requested_variants[@]}")
+            if [[ "$EVENT_NAME" == schedule && "$raw" == *:* ]]; then
+              variant_spec="${raw##*:}"
+              if [[ "$variant_spec" =~ ^fa[23](,fa[23])*$ ]]; then
+                raw="${raw%:*}"
+                IFS=',' read -r -a source_variants <<< "$variant_spec"
+              fi
+            fi
+            kind=default
+            ref="$FA_BRANCH"
+            if [[ -n "$raw" ]]; then
+              raw="${raw%%[?#]*}"
+              # Whitelist check: the value is reused as a git ref below.
+              if [[ ! "$raw" =~ ^[A-Za-z0-9][A-Za-z0-9._/@:+-]*$ ]]; then
+                echo "::error::Unsupported source '$source': expected a PR URL, branch, release tag or commit id"
                 exit 1
-              }
-              ;;
-            default) git fetch -q --no-tags --depth 1 origin "refs/heads/${ref}" ;;
-            tag)
-              git fetch -q --no-tags --depth 1 origin "refs/tags/${ref}" || {
-                echo "::error::Tag '$ref' not found in FA repository"
-                exit 1
-              }
-              ;;
-            *)
-              git fetch -q --no-tags --depth 1 origin "refs/heads/${ref}" \
-                || git fetch -q --no-tags --depth 1 origin "$ref" || {
-                  echo "::error::Cannot fetch '$ref': no branch or tag with that name and it is not a fetchable commit (use the full 40-char sha)"
+              fi
+              case "$raw" in
+                *'/pull/'*)
+                  num="${raw#*/pull/}"
+                  num="${num%%[!0-9]*}"
+                  [[ "$num" =~ ^[0-9]+$ ]] || { echo "::error::Cannot read a PR number from '$raw'"; exit 1; }
+                  kind=pr
+                  ref="$num"
+                  ;;
+                *)
+                  if [[ "$raw" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                    # Release tag such as 2.8.2+v2.1.0: never a branch or a commit id.
+                    kind=tag
+                    ref="$raw"
+                  elif [[ "$raw" =~ ^[0-9]+$ ]] && [[ ${#raw} -ne 40 ]]; then
+                    echo "::error::Bare PR numbers are not supported: pass the PR URL, a branch, a release tag or a commit id (got '$raw')"
+                    exit 1
+                  else
+                    # Branch or commit id: the fetch below decides which one.
+                    kind=ref
+                    ref="$raw"
+                  fi
+                  ;;
+              esac
+            fi
+
+            # Artifact names forbid '/', so a ref such as release/v2.8.2_v1.0.0 is
+            # slugged for the artifact name. NAS paths keep the raw ref, where
+            # subdirectories are harmless.
+            slug="$(printf '%s' "$ref" | tr -c 'A-Za-z0-9._+-' '-')"
+
+            # Shallow fetch of the one commit to build: its tree is enough to read
+            # the version and to check whether the requested variants exist.
+            case "$kind" in
+              pr)
+                git fetch -q --no-tags --depth 1 origin "+refs/pull/${ref}/head" || {
+                  echo "::error::Cannot fetch PR #$ref from FA repository"
                   exit 1
                 }
-              ;;
-          esac
-          commit="$(git rev-parse "FETCH_HEAD^{commit}")"
+                ;;
+              default) git fetch -q --no-tags --depth 1 origin "refs/heads/${ref}" ;;
+              tag)
+                git fetch -q --no-tags --depth 1 origin "refs/tags/${ref}" || {
+                  echo "::error::Tag '$ref' not found in FA repository"
+                  exit 1
+                }
+                ;;
+              *)
+                git fetch -q --no-tags --depth 1 origin "refs/heads/${ref}" \
+                  || git fetch -q --no-tags --depth 1 origin "$ref" || {
+                    echo "::error::Cannot fetch '$ref': no branch or tag with that name and it is not a fetchable commit (use the full 40-char sha)"
+                    exit 1
+                  }
+                ;;
+            esac
+            commit="$(git rev-parse "FETCH_HEAD^{commit}")"
 
-          # setup.py takes the version from flash_attn/__init__.py, e.g. 2.7.4.post1.
-          raw_version="$(git show "${commit}:flash_attn/__init__.py" 2>/dev/null \
-            | sed -n 's/^__version__[[:space:]]*=[[:space:]]*//p' | head -n 1 | tr -d "\"'")"
-          version="${raw_version%%.post*}"
-          version="${version%%+*}"
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::$commit is not a readable flash-attention tree (__version__='$raw_version')"
-            exit 1
-          fi
+            # setup.py takes the version from flash_attn/__init__.py, e.g. 2.7.4.post1.
+            raw_version="$(git show "${commit}:flash_attn/__init__.py" 2>/dev/null \
+              | sed -n 's/^__version__[[:space:]]*=[[:space:]]*//p' | head -n 1 | tr -d "\"'")"
+            version="${raw_version%%.post*}"
+            version="${version%%+*}"
+            if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::$commit is not a readable flash-attention tree (__version__='$raw_version')"
+              exit 1
+            fi
 
-          # Fail here instead of after a long build when the tree lacks a variant.
-          if [[ "$VARIANTS_INPUT" == *fa3* ]] && ! git cat-file -e "${commit}:hopper/setup.py" 2>/dev/null; then
-            echo "::error::fa3 requested but $commit has no hopper/setup.py"
-            exit 1
-          fi
+            # v2.7.2 ships no hopper/ tree. A schedule must still cover the other
+            # targets, so a pinned fa3 is dropped there; an explicit request
+            # fails fast here instead of after a long build.
+            target_variants=()
+            skip_note=''
+            for variant in "${source_variants[@]}"; do
+              if [[ "$variant" == fa3 ]] && ! git cat-file -e "${commit}:hopper/setup.py" 2>/dev/null; then
+                if [[ "$EVENT_NAME" == schedule ]]; then
+                  echo "::notice::$ref (version $version) has no hopper/setup.py: skipping fa3 on this run"
+                  skip_note='fa3 skipped, no hopper/'
+                  continue
+                fi
+                echo "::error::fa3 requested but $commit has no hopper/setup.py"
+                exit 1
+              fi
+              target_variants+=("$variant")
+            done
+            if [[ ${#target_variants[@]} -eq 0 ]]; then
+              echo "::error::No buildable variant for $ref (requested ${source_variants[*]})"
+              exit 1
+            fi
+
+            for variant in "${target_variants[@]}"; do
+              leg="{\"ref\":\"$ref\",\"kind\":\"$kind\",\"slug\":\"$slug\",\"commit\":\"$commit\",\"version\":\"$version\",\"variant\":\"$variant\"}"
+              if [[ "$legs" == '[]' ]]; then
+                legs="[$leg]"
+              else
+                legs="${legs%]},$leg]"
+              fi
+              summary+="- ${ref} -> ${commit:0:8} (version ${version}, ${variant})"$'\n'
+            done
+            if [[ -n "$skip_note" ]]; then
+              summary+="- ${ref} -> ${commit:0:8} (version ${version}): ${skip_note}"$'\n'
+            fi
+          done
 
           {
-            echo "kind=$kind"
-            echo "ref=$ref"
-            echo "commit=$commit"
-            echo "version=$version"
+            echo "legs<<EOF"
+            echo "$legs"
+            echo "EOF"
           } >> "$GITHUB_OUTPUT"
-          echo "FlashAttention target: ${display} -> ${commit:0:8} (version ${version}, variants ${VARIANTS_INPUT})" | tee -a "$GITHUB_STEP_SUMMARY"
+          printf 'FlashAttention targets:\n%s' "$summary" | tee -a "$GITHUB_STEP_SUMMARY"
 
   build:
-    name: ${{ matrix.variant }} (${{ matrix.runner }})
+    name: ${{ matrix.leg.variant }} ${{ matrix.leg.ref }} (${{ matrix.runner }})
     needs: resolve
     runs-on: k8s-runner-group-cpu-flytiger
     container:
@@ -203,11 +288,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: ${{ fromJson(inputs.matrix || '["ZW-810E", "ZW-M890P"]') }}
-        variant: ${{ fromJson(inputs.variants) }}
-    # Cancel per leg; the workflow-level group cannot distinguish matrix legs.
+        # The fallbacks only apply to schedule runs, which carry no inputs;
+        # dispatch and workflow_call always send their declared defaults.
+        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P"]') }}
+        # One leg per (target ref, variant); resolve already dropped unavailable
+        # variants such as fa3 on v2.7.2.
+        leg: ${{ fromJson(needs.resolve.outputs.legs) }}
+    # Cancel per leg; the workflow-level group cannot distinguish targets or
+    # matrix legs.
     concurrency:
-      group: cudafy-flash-attention-upload-tmp-${{ inputs.source || 'default-branch' }}-${{ matrix.variant }}-${{ matrix.runner }}-${{ github.event.pull_request.number || github.ref }}
+      group: cudafy-flash-attention-upload-tmp-${{ matrix.leg.ref }}-${{ matrix.leg.variant }}-${{ matrix.runner }}-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: true
     steps:
       - name: Checkout cudafy
@@ -240,11 +330,11 @@ jobs:
 
             CUDAFY_ROOT=/workspace/source
             TARGET_ROOT=/workspace/target
-            FA_VERSION='${{ needs.resolve.outputs.version }}'
-            TARGET_KIND='${{ needs.resolve.outputs.kind }}'
-            TARGET_REF='${{ needs.resolve.outputs.ref }}'
-            TARGET_COMMIT='${{ needs.resolve.outputs.commit }}'
-            VARIANT='${{ matrix.variant }}'
+            FA_VERSION='${{ matrix.leg.version }}'
+            TARGET_KIND='${{ matrix.leg.kind }}'
+            TARGET_REF='${{ matrix.leg.ref }}'
+            TARGET_COMMIT='${{ matrix.leg.commit }}'
+            VARIANT='${{ matrix.leg.variant }}'
             VARIANT_UPPER="${VARIANT^^}"
             git clone --recurse-submodules -b '${{ env.FA_BRANCH }}' https://github.com/t-head/flash-attention-for-sail.git "$TARGET_ROOT"
             # The clone above is the default target; anything else is fetched and
@@ -308,28 +398,31 @@ jobs:
             fi
             tail -n 200 "$LOG_FILE"
 
-            NAS_RESULT_DIR="/mnt/wl_nas/devops/cudafy-ci/flash-attention/${{ needs.resolve.outputs.ref }}/${FA_VERSION}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${VARIANT}"
+            NAS_RESULT_DIR="/mnt/wl_nas/devops/cudafy-ci/flash-attention/${{ matrix.leg.ref }}/${FA_VERSION}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${VARIANT}"
             mkdir -p "$NAS_RESULT_DIR/wheels"
             cp "$BUILD_DIR"/dist/*.whl "$NAS_RESULT_DIR/wheels/"
           cleanup_policy: on_success
 
-      - name: Upload wheel artifact (${{ matrix.variant }} / ${{ matrix.runner }})
+      - name: Upload wheel artifact (${{ matrix.leg.variant }} / ${{ matrix.runner }})
         # Wheels are board independent: only the first board uploads, all
         # variants do. !cancelled() keeps artifacts when the build failed.
-        if: ${{ !cancelled() && matrix.runner == fromJson(inputs.matrix || '["ZW-810E", "ZW-M890P"]')[0] }}
+        if: ${{ !cancelled() && matrix.runner == fromJson(inputs.matrix || '["ZW-M890P"]')[0] }}
         uses: actions/upload-artifact@v4
         with:
-          name: flash-attention-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.resolve.outputs.ref }}-${{ needs.resolve.outputs.version }}-${{ matrix.variant }}
+          name: flash-attention-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.leg.slug }}-${{ matrix.leg.version }}-${{ matrix.leg.variant }}
           # Container-side /mnt/wl_nas maps to /wl_nas on the runner host.
-          path: /wl_nas/devops/cudafy-ci/flash-attention/${{ needs.resolve.outputs.ref }}/${{ needs.resolve.outputs.version }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${{ matrix.variant }}/wheels/*.whl
+          path: /wl_nas/devops/cudafy-ci/flash-attention/${{ matrix.leg.ref }}/${{ matrix.leg.version }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${{ matrix.leg.variant }}/wheels/*.whl
           if-no-files-found: error
           compression-level: 0
           overwrite: true
 
   merge:
     name: Merge wheel artifacts
-    # Every leg must build successfully; resolve carries the target ref.
-    needs: [resolve, build]
+    # Partial success must still publish: a failed leg (e.g. one board or one
+    # target) must not block the wheels the other legs built. 'skipped' means
+    # resolve failed, so no leg produced anything.
+    if: ${{ !cancelled() && needs.build.result != 'skipped' }}
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -338,13 +431,14 @@ jobs:
       - name: Set merged artifact name
         id: artifact-name
         shell: bash
-        run: echo 'artifact_name=flash-attention-wheels-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.resolve.outputs.ref }}' >> "$GITHUB_OUTPUT"
+        run: echo 'artifact_name=flash-attention-wheels-${{ github.run_id }}-${{ github.run_attempt }}' >> "$GITHUB_OUTPUT"
 
       - name: Merge wheel artifacts
         uses: actions/upload-artifact/merge@v4
         with:
           name: ${{ steps.artifact-name.outputs.artifact_name }}
-          pattern: flash-attention-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ needs.resolve.outputs.ref }}-*
+          # All targets and variants of this run land in one batch directory.
+          pattern: flash-attention-wheel-${{ github.run_id }}-${{ github.run_attempt }}-*
           compression-level: 0
           delete-merged: false
 

@@ -25,6 +25,11 @@ on:
         required: false
         type: string
         default: ''
+      fast:
+        description: 'Compile only. This workflow already runs no test suite, so the flag only keeps the input set uniform.'
+        required: false
+        type: boolean
+        default: false
     secrets:
       RELEASE_USERNAME:
         required: true
@@ -49,6 +54,11 @@ on:
         required: false
         type: string
         default: ''
+      fast:
+        description: 'Compile only. This workflow already runs no test suite, so the flag only keeps the input set uniform.'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -60,7 +70,7 @@ concurrency:
 
 env:
   # Schedule runs carry no inputs, so the pinned default below still applies.
-  SAIL_IMAGE: ${{ inputs.sail_image || 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-eic-20261010' }}
+  SAIL_IMAGE: ${{ inputs.sail_image || 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.1-2.13.0-ubuntu24.04-cuda13.0-py312-20261103' }}
 
 jobs:
   build:
