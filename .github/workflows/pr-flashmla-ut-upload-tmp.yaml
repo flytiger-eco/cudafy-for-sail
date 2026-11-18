@@ -2,6 +2,8 @@ name: FlashMLA CUDAFY temporary wheel upload
 
 # Convert with cudafy, build a wheel, run the target repo's UT caselist, then
 # publish it to a temporary directory. Publishing is gated on the caselist.
+# fast: compile only. The UT caselist and its summary are skipped and the staged
+# wheel is published as is.
 # FlashMLA source defaults to the latest main; target_ref selects a PR URL,
 # a branch name, a release tag (x.y.z+va.b.c) or a commit id instead.
 # Requires RELEASE_USERNAME / RELEASE_TOKEN secrets (TEMPLATE_TOKEN for private templates).
@@ -25,6 +27,11 @@ on:
         required: false
         type: string
         default: ''
+      fast:
+        description: 'Compile only: skip the UT caselist and its summary, keep the staged wheel.'
+        required: false
+        type: boolean
+        default: false
     secrets:
       RELEASE_USERNAME:
         required: true
@@ -49,6 +56,11 @@ on:
         required: false
         type: string
         default: ''
+      fast:
+        description: 'Compile only: skip the UT caselist and its summary, keep the staged wheel.'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -60,7 +72,7 @@ concurrency:
 
 env:
   # Schedule runs carry no inputs, so the pinned default below still applies.
-  SAIL_IMAGE: ${{ inputs.sail_image || 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-eic-20261010' }}
+  SAIL_IMAGE: ${{ inputs.sail_image || 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.1-2.13.0-ubuntu24.04-cuda13.0-py312-20261103' }}
 
 jobs:
   build-test:
@@ -258,6 +270,11 @@ jobs:
             NAS_RESULT_DIR="/mnt/wl_nas/devops/cudafy-ci/flashmla/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
             mkdir -p "$NAS_RESULT_DIR/wheels"
             cp ./dist/*.whl "$NAS_RESULT_DIR/wheels/"
+            # Fast mode: the wheel is already staged, so stop before installing and testing.
+            if [[ '${{ inputs.fast }}' == 'true' ]]; then
+              echo "Fast mode: skipping the UT caselist"
+              exit 0
+            fi
             pip install ./dist/*.whl --force-reinstall
 
             set +e
@@ -297,7 +314,8 @@ jobs:
           overwrite: true
 
       - name: Test summary (${{ matrix.runner }})
-        if: always()
+        # Fast mode produces no JUnit report, so the summary must not run.
+        if: ${{ always() && !inputs.fast }}
         shell: bash
         env:
           TARGET_DISPLAY: ${{ steps.target.outputs.display }}

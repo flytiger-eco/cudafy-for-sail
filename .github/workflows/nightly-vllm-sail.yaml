@@ -45,7 +45,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  SAIL_IMAGE: ${{ inputs.sail_image || 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-eic-20261010' }}
+  SAIL_IMAGE: ${{ inputs.sail_image || 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.1-2.13.0-ubuntu24.04-cuda13.0-py312-20261103' }}
 
 jobs:
   build:
