@@ -52,6 +52,7 @@ ARCH_FLAG_SUBS = [
 # ---------------------------------------------------------------------------
 FLAG_SUBS = [
     # PPU LLVM backend prefix -> nvcc's mllvm
+    ("--llvm-options", "-mllvm"),
     ("-Xllvm", "-mllvm"),
     # fatbin-producing flag
     ("-hgbin", "-cubin"),

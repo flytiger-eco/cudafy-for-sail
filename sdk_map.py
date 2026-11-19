@@ -20727,6 +20727,11 @@ NON_SDK_COMPILER_MACROS = {
 
 # Category 7 -- build artifacts, sonames and link libraries.
 NON_SDK_ARTIFACT_MAP = {
+    'libpccl.so': 'libnccl.so',
+    'libsailshmem_host.so': 'libnvshmem_host.so',
+    'libsailshmem_device.a': 'libnvshmem_device.a',
+    'libsailshmem*.so*': 'libnvshmem*.so*',
+    '-lsailshmem_device': '-lnvshmem_device',
     'kernel.hgbin': 'kernel.cubin',
     'hgbin_path': 'cubin_path',
     'libhggc.so': 'libcuda.so.1',
@@ -20745,6 +20750,21 @@ NON_SDK_TEXT_MAP = {
 
 # Category 9 -- repo-local identifiers (e.g. DG_JIT_USE_HGRTC).
 NON_SDK_TOKEN_MAP = {
+    'pccl.h': 'nccl.h',
+    'pccl_device': 'nccl_device',
+    'SAILSHMEM_DIR': 'NVSHMEM_DIR',
+    'SAILSHMEM_HOME': 'NVSHMEM_HOME',
+    'hg_wrapper': 'cuda',
+    'hggc_wrapper': 'cudart',
+    '-Xhgfatbin': '-Xfatbin',
+    '-lhg_wrapper': '-lcuda',
+    '-lhggc_wrapper': '-lcudart',
+    '-lhgml': '-lnvidia-ml',
+    '__HGGCCC_RDC__': '__CUDACC_RDC__',
+    '__HGGC_NO_BFLOAT162_OPERATORS__': '__CUDA_NO_BFLOAT162_OPERATORS__',
+    'libhg_wrapper.so': 'libcuda.so.1',
+    'libhgml.so': 'libnvidia-ml.so.1',
+
     'lazy_hgTensorMapEncodeTiled': 'lazy_cuTensorMapEncodeTiled',
     'hggc_device_runtime_api.h': 'cuda_device_runtime_api.h',
     'lazy_hgModuleGetFunction': 'lazy_cuModuleGetFunction',
@@ -20777,6 +20797,7 @@ NON_SDK_TOKEN_MAP = {
 
 # Category 10 -- SAILify platform naming (COMPATIBLE_ARCH family).
 NON_SDK_SAILIFY_MAP = {
+    'from torch.utils.cpp_extension import PPU_HOME': 'from torch.utils.cpp_extension import CUDA_HOME',
     '__COMPATIBLECC_VER_MAJOR__': '__CUDACC_VER_MAJOR__',
     '__COMPATIBLECC_VER_MINOR__': '__CUDACC_VER_MINOR__',
     '__COMPATIBLECC_VER_BUILD__': '__CUDACC_VER_BUILD__',
@@ -20798,6 +20819,7 @@ SDK_PREFIX_OPEN = {
 
 # Category 12 -- prefix-open, non-SDK (camelCase continuation allowed).
 NON_SDK_PREFIX_OPEN = {
+    'PCCL_': 'NCCL_',
     '__HGGC_STD_': '__NV_STD_',
     'acBLAS': 'cuBLAS',
     'ACBLAS': 'CUBLAS',

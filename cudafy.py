@@ -12,6 +12,7 @@ Three ways to run a conversion:
       actlize, flash-attention, xformers, deepgemm and flashmla are fully
       covered by the general rules (their per-repo scripts are gone); the
       command runs the general engine directly, keeping the historical CLI shape.
+      deepep and moonep add file-scoped source adaptations to the general rules.
 
       An unknown <repo> name falls back to `general <path>`: the name is
       dropped and the path is converted with the general rules.
@@ -28,7 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 
 KNOWN_COMMANDS = {
-    "general", "actlize", "flash-attention", "xformers", "deepgemm", "flashmla",
+    "general", "actlize", "flash-attention", "xformers", "deepgemm", "deepep", "moonep", "flashmla",
 }
 
 
@@ -39,7 +40,8 @@ def _require_target(value, name: str) -> str:
 
 
 def _run_general(target: str, dry_run: bool, verbose: bool,
-                 version: Optional[str] = None, label: str = "general") -> int:
+                 version: Optional[str] = None, label: str = "general",
+                 exclude=(), file_converter=None) -> int:
     """Convert a path with the general engine (SDK map + compile chain)."""
     from general import convert_path
 
@@ -47,14 +49,17 @@ def _run_general(target: str, dry_run: bool, verbose: bool,
         raise SystemExit(f"ERROR: path not found: {target}")
 
     print("=" * 60)
-    print(f"{label}: PPU -> CUDA conversion (general rules)")
+    rules = "general rules + repository adaptations" if file_converter else "general rules"
+    print(f"{label}: PPU -> CUDA conversion ({rules})")
     print(f"Target: {os.path.abspath(target)}")
     if version:
         print(f"Version: {version} (informational; the general rules are "
               f"version-independent)")
     print("=" * 60)
 
-    scanned, changed, renamed, _ = convert_path(target, dry_run=dry_run, verbose=verbose)
+    scanned, changed, renamed, _ = convert_path(
+        target, dry_run=dry_run, verbose=verbose,
+        exclude=exclude, file_converter=file_converter)
     print(f"  Files scanned: {scanned}")
     print(f"  Files changed: {changed}")
     print(f"  Renames:       {renamed}")
@@ -65,7 +70,8 @@ def _run_general(target: str, dry_run: bool, verbose: bool,
 
 def run_general(args: argparse.Namespace) -> int:
     target = _require_target(args.target, "target path")
-    return _run_general(target, args.dry_run, args.verbose)
+    return _run_general(target, args.dry_run, args.verbose,
+                        exclude=args.exclude)
 
 
 def run_actlize(args: argparse.Namespace) -> int:
@@ -79,6 +85,28 @@ def run_actlize(args: argparse.Namespace) -> int:
 def run_deepgemm(args: argparse.Namespace) -> int:
     target = _require_target(args.target, "target DeepGEMM directory")
     return _run_general(target, args.dry_run, args.verbose, label="deepgemm")
+
+
+def run_deepep(args: argparse.Namespace) -> int:
+    from deepep import convert_source
+
+    target = _require_target(args.target, "target DeepEP directory")
+    for relative in ('setup.py', 'deep_ep/__init__.py', 'csrc/jit/compiler.hpp'):
+        if not os.path.isfile(os.path.join(target, relative)):
+            raise SystemExit(f"ERROR: {target} is not a DeepEP root directory: missing {relative}")
+    return _run_general(target, args.dry_run, args.verbose, label="deepep",
+                        exclude=args.exclude, file_converter=convert_source)
+
+
+def run_moonep(args: argparse.Namespace) -> int:
+    from moonep import convert_source
+
+    target = _require_target(args.target, "target MoonEP directory")
+    for relative in ('setup.py', 'moonep/_cxx_backend.py', 'csrc/jit/compiler.hpp'):
+        if not os.path.isfile(os.path.join(target, relative)):
+            raise SystemExit(f"ERROR: {target} is not a MoonEP root directory: missing {relative}")
+    return _run_general(target, args.dry_run, args.verbose, label="moonep",
+                        exclude=args.exclude, file_converter=convert_source)
 
 
 def run_xformers(args: argparse.Namespace) -> int:
@@ -114,6 +142,11 @@ def add_common_repo_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--verbose", action="store_true", help="Print detailed output")
 
 
+def add_conversion_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--exclude", action="append", default=[],
+                        help="Exclude a path relative to the target directory (repeatable)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run CUDA compatibility converters for supported SAIL repositories."
@@ -123,6 +156,7 @@ def build_parser() -> argparse.ArgumentParser:
     general = subparsers.add_parser(
         "general", help="Convert any path with the general rules (SDK map + compile chain)")
     add_common_repo_args(general)
+    add_conversion_args(general)
     # Accepted (and ignored) so that an unknown-repo fallback carrying
     # --version=X still parses.
     general.add_argument("--version", default=None, help=argparse.SUPPRESS)
@@ -150,6 +184,18 @@ def build_parser() -> argparse.ArgumentParser:
         "deepgemm", help="Convert a DeepGEMM repository (general rules only)")
     add_common_repo_args(deepgemm)
     deepgemm.set_defaults(func=run_deepgemm)
+
+    deepep = subparsers.add_parser(
+        "deepep", help="Convert a DeepEP repository (general rules + DeepEP adaptations)")
+    add_common_repo_args(deepep)
+    add_conversion_args(deepep)
+    deepep.set_defaults(func=run_deepep)
+
+    moonep = subparsers.add_parser(
+        "moonep", help="Convert a MoonEP repository (general rules + MoonEP adaptations)")
+    add_common_repo_args(moonep)
+    add_conversion_args(moonep)
+    moonep.set_defaults(func=run_moonep)
 
     flashmla = subparsers.add_parser(
         "flashmla", help="Convert a FlashMLA repository (general rules only)")
