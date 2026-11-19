@@ -1,6 +1,6 @@
-"""ACTLIZE 1.0.0 库级兼容数据。
-来源：官方 cudafy pytorch fe5b4338bd37bcc142c7609a2b99af50b4345935。
-仅保留库级规则；SDK 转换由 general 唯一负责。
+"""ACTLIZE 1.0.0 library compatibility data.
+Source: official cudafy pytorch fe5b4338bd37bcc142c7609a2b99af50b4345935.
+Library rules only; general remains the sole SDK conversion engine.
 """
 
 VERSION = '1.0.0'

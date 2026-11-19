@@ -1,4 +1,4 @@
-"""按库和版本限定的编译时兼容产物生成器。"""
+"""Build-time compatibility artifacts scoped to a library and version."""
 from .engine import extend_actlize_plan
 
 __all__ = ['extend_actlize_plan']

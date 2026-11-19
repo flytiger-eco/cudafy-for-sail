@@ -1,16 +1,32 @@
 #!/usr/bin/env python3
-"""cudafy-for-sail 的统一 CUDA 兼容转换入口。
+"""Unified CUDA compatibility dispatcher for cudafy-for-sail.
+
+Three ways to run a conversion:
 
   python3 cudafy.py general <path>
-      仅执行 SDK 命名与编译链转换，不生成 ACTLIZE 库级兼容产物。
-      未知仓库名，以及 FA2/xformers/deepgemm/flashmla 入口仍使用通用规则。
+      Convert ANY tree with the general rules only (full SDK naming map +
+      compile-chain rules). Bundled actlize copies under the path are
+      converted together with the tree, so no separate actlize step is needed.
 
-  python3 cudafy.py actlize --version=0.8.0|1.0.0 <include>
-      在同一只读计划中追加对应版本的库级规则；0.5.0 仅执行 SDK 转换。
+  python3 cudafy.py <repo> [--version=X] <path>
+      actlize, flash-attention, xformers, deepgemm and flashmla are fully
+      covered by the general rules (their per-repo scripts are gone); the
+      command runs the general engine directly, keeping the historical CLI shape.
+
+      An unknown <repo> name falls back to `general <path>`: the name is
+      dropped and the path is converted with the general rules.
+
+Additional library compatibility commands:
+
+  python3 cudafy.py actlize --compat --version=0.8.0|1.0.0 <include>
+      Opt into versioned library rules in a shared read-only plan. Without
+      --compat, all versions retain the original SDK-only path. Version 0.5.0
+      remains SDK-only even when compatibility is explicitly requested.
 
   python3 cudafy.py flex-flash-attention --version=2.8.2 <root>
-      转换外层 SDK 内容，并为仓内 ACTLIZE 的 include/util 生成 1.0 兼容产物。
-      不自动修改 ACTLIZE_DIR 指定的外部库；dry-run 不写入任何转换产物。
+      Convert outer SDK sources and generate ACTLIZE 1.0 compatibility artifacts
+      for repository-local include/util trees. Never modify external ACTLIZE_DIR
+      libraries automatically. Dry runs do not write conversion artifacts.
 """
 
 import argparse
@@ -24,8 +40,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 
 KNOWN_COMMANDS = {
-    "general", "actlize", "flash-attention", "flex-flash-attention",
-    "xformers", "deepgemm", "flashmla",
+    "general", "actlize", "flash-attention", "xformers", "deepgemm", "flashmla",
 }
 
 
@@ -69,11 +84,8 @@ def run_actlize(args: argparse.Namespace) -> int:
     target = _require_target(args.target, "actlize include directory")
     if not os.path.isdir(target):
         raise SystemExit(f"ERROR: directory not found: {target}")
-    if args.version == "0.5.0":
-        print("WARNING: ACTLIZE 0.5.0 仅执行 SDK 转换，没有经过验证的库兼容 profile。")
-        return _run_general(target, args.dry_run, args.verbose,
-                            version=args.version, label="actlize")
-    return _run_compatible(target, args.version, args.dry_run, args.verbose)
+    return _run_general(target, args.dry_run, args.verbose,
+                        version=args.version, label="actlize")
 
 
 def _run_compatible(target, version, dry_run, verbose, flex=False):
@@ -88,7 +100,7 @@ def _run_compatible(target, version, dry_run, verbose, flex=False):
             nested = (os.path.isfile(os.path.join(target, "setup.py"))
                       and os.path.isdir(os.path.join(target, "csrc", "flash_attn")))
             if not (flattened or nested):
-                raise ValueError(f"不是受支持的 flex 根目录：{target}")
+                raise ValueError(f"Not a supported flex root directory: {target}")
             actlize = os.path.join(target, "csrc", "actlize")
             include = os.path.join(actlize, "include")
             plan = plan_path(target, exclude_roots=[actlize])
@@ -100,15 +112,15 @@ def _run_compatible(target, version, dry_run, verbose, flex=False):
     except (OSError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    print(f"{'flex-flash-attention' if flex else 'actlize'} {version}: SDK + 库级兼容")
-    print(f"  扫描：{scanned}；修改/生成：{changed}；重命名：{renamed}")
+    print(f"{'flex-flash-attention' if flex else 'actlize'} {version}: SDK + library compatibility")
+    print(f"  Scanned: {scanned}; modified/generated: {changed}; renamed: {renamed}")
     if dry_run:
         print("  [DRY RUN - no files modified]")
     return 0
 
 
 def run_flex_flash_attention(args):
-    target = _require_target(args.target, "flex-flash-attention 根目录")
+    target = _require_target(args.target, "flex-flash-attention root directory")
     return _run_compatible(target, args.version, args.dry_run, args.verbose, flex=True)
 
 
@@ -165,10 +177,10 @@ def build_parser() -> argparse.ArgumentParser:
     general.set_defaults(func=run_general)
 
     actlize = subparsers.add_parser(
-        "actlize", help="转换 ACTLIZE：SDK 规则及版本化库兼容层")
+        "actlize", help="Convert ACTLIZE include files (general rules only)")
     actlize.add_argument(
         "--version", choices=["0.5.0", "0.8.0", "1.0.0"], default="1.0.0",
-        help="ACTLIZE 库版本；0.8/1.0 启用兼容 profile，0.5 仅执行 SDK 转换")
+        help="Informational only; the general rules are version-independent")
     actlize.add_argument("target", help="Target ACTLIZE include directory")
     actlize.add_argument("--dry-run", action="store_true", help="Preview changes without modifying files")
     actlize.add_argument("--verbose", action="store_true", help="Print detailed output")
@@ -181,12 +193,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Informational only; the general rules are version-independent")
     add_common_repo_args(flash_attention)
     flash_attention.set_defaults(func=run_flash_attention)
-
-    flex = subparsers.add_parser("flex-flash-attention", help="转换 flex 及仓内 ACTLIZE 1.0")
-    flex.add_argument("--version", choices=["2.8.2"], default="2.8.2",
-                      help="已适配的 flex 版本")
-    add_common_repo_args(flex)
-    flex.set_defaults(func=run_flex_flash_attention)
 
     deepgemm = subparsers.add_parser(
         "deepgemm", help="Convert a DeepGEMM repository (general rules only)")
@@ -226,5 +232,50 @@ def main() -> int:
     return args.func(args)
 
 
+def run_actlize_compat(args: argparse.Namespace) -> int:
+    """Handle explicit library compatibility without changing run_actlize()."""
+    target = _require_target(args.target, "actlize include directory")
+    if not os.path.isdir(target):
+        raise SystemExit(f"ERROR: directory not found: {target}")
+    if args.version == "0.5.0":
+        print("WARNING: ACTLIZE 0.5.0 is SDK-only; no validated library compatibility profile is available.")
+        return run_actlize(args)
+    return _run_compatible(target, args.version, args.dry_run, args.verbose)
+
+
+def build_compat_parser() -> argparse.ArgumentParser:
+    """Parse new compatibility commands separately from the legacy parser."""
+    parser = argparse.ArgumentParser(
+        description="Run opt-in ACTLIZE library compatibility conversion.")
+    subparsers = parser.add_subparsers(dest="command")
+    actlize = subparsers.add_parser("actlize", help="Opt into ACTLIZE library compatibility")
+    actlize.add_argument("--compat", action="store_true", required=True,
+                        help="Enable versioned library compatibility artifacts")
+    actlize.add_argument("--version", choices=["0.5.0", "0.8.0", "1.0.0"], default="1.0.0",
+                        help="Library profile version; 0.5.0 remains SDK-only")
+    add_common_repo_args(actlize)
+    actlize.set_defaults(func=run_actlize_compat)
+    flex = subparsers.add_parser("flex-flash-attention",
+                                help="Convert flex and repository-local ACTLIZE 1.0")
+    flex.add_argument("--version", choices=["2.8.2"], default="2.8.2",
+                      help="Supported flex version")
+    add_common_repo_args(flex)
+    flex.set_defaults(func=run_flex_flash_attention)
+    return parser
+
+
+def main_with_compat() -> int:
+    """Dispatch only new commands; all legacy invocations use main() unchanged."""
+    argv = sys.argv[1:]
+    options = argv[1:]
+    if "--" in options:
+        options = options[:options.index("--")]
+    if argv and (argv[0] == "flex-flash-attention"
+                 or (argv[0] == "actlize" and "--compat" in options)):
+        args = build_compat_parser().parse_args(argv)
+        return args.func(args)
+    return main()
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main_with_compat())

@@ -1,4 +1,4 @@
-"""在 SDK 转换的虚拟文件视图上生成版本限定的 ACTLIZE 兼容产物。"""
+"""Generate versioned ACTLIZE artifacts in the SDK-converted virtual tree."""
 import importlib
 import os
 import re
@@ -12,16 +12,16 @@ OWNER = '// cudafy-compat: actlize:'
 def _profile(version):
     module = {'0.8.0': 'actlize_v0_8', '1.0.0': 'actlize_v1_0'}.get(version)
     if module is None:
-        raise ValueError(f'没有 ACTLIZE {version} 的库兼容 profile')
+        raise ValueError(f'No library compatibility profile for ACTLIZE {version}')
     return importlib.import_module(f'compat.{module}')
 
 
 def _normal_path(root, relative):
     if os.path.isabs(relative) or '..' in relative.split('/'):
-        raise ValueError(f'规则路径越界：{relative}')
+        raise ValueError(f'Rule path escapes its root: {relative}')
     path = os.path.join(root, *[convert_text(part) for part in relative.split('/')])
     if os.path.realpath(path) != path:
-        raise ValueError(f'规则路径包含 symlink：{path}')
+        raise ValueError(f'Rule path contains a symlink: {path}')
     return path
 
 
@@ -35,7 +35,7 @@ def _without_comments(text):
 
 
 def _namespace_at(text, index):
-    # 仅识别词法 namespace/块边界；字符串内的花括号不是作用域。
+    # Track lexical namespace/block boundaries, ignoring braces in strings.
     text = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
                   lambda match: ' ' * len(match.group(0)), text[:index])
     stack = []
@@ -61,8 +61,8 @@ def _append_aliases(content, namespace, body, marker, path):
     existing_block = re.search(re.escape(begin) + r'\n.*?' + re.escape(end) + r'\n',
                                content, flags=re.S)
     if begin in content and (existing_block is None or content.count(begin) != 1):
-        raise ValueError(f'已有别名块与 profile 不一致：{path}')
-    # 已经存在的真实别名不重复声明；不一致或不能确认的定义拒绝覆盖。
+        raise ValueError(f'Existing alias block does not match the profile: {path}')
+    # Preserve matching aliases; reject conflicting or unverified definitions.
     base = content if existing_block is None else content[:existing_block.start()] + content[existing_block.end():]
     clean = _without_comments(base)
     declarations = {}
@@ -77,22 +77,22 @@ def _append_aliases(content, namespace, body, marker, path):
                                        for key in ['template', 'target'])
         if existing:
             if any(signature(item) != signature(match) for item in existing):
-                raise ValueError(f'别名定义冲突：{path}: {namespace}::{name}')
+                raise ValueError(f'Alias definition conflict: {path}: {namespace}::{name}')
             removals.append((match.start(), match.end()))
         else:
             for occupied in re.finditer(r'\b(?:struct|class|enum)\s+' + re.escape(name) + r'\b', clean):
                 if _namespace_at(clean, occupied.start()) == namespace:
-                    raise ValueError(f'兼容名已被真实类型占用：{path}: {name}')
+                    raise ValueError(f'Compatibility name is occupied by an existing type: {path}: {name}')
     for start, stop in reversed(removals):
         body = body[:start] + body[stop:]
     if re.search(r'\bint\s+SmId\s*\(', body):
         for occupied in re.finditer(r'\bint\s+SmId\s*\(', clean):
             if _namespace_at(clean, occupied.start()) == namespace:
-                raise ValueError(f'SmId 定义冲突：{path}')
+                raise ValueError(f'SmId definition conflict: {path}')
     block = f'{begin}\nnamespace {namespace} {{\n{body.rstrip()}\n}}\n{end}\n'
     if existing_block is not None:
         if existing_block.group(0) != block:
-            raise ValueError(f'已有别名块与 profile 不一致：{path}')
+            raise ValueError(f'Existing alias block does not match the profile: {path}')
         return content
     guard = re.search(r'(?m)^\s*#ifndef\s+(\w+)\s*\n\s*#define\s+\1\b', content)
     if guard:
@@ -114,7 +114,7 @@ def _insert_include(content, include):
 
 
 def extend_actlize_plan(plan, include_root, version):
-    """扩展只读计划；缺失结构和冲突在任何写盘之前报错。"""
+    """Extend a read-only plan; reject missing structure or conflicts before writes."""
     profile = _profile(version)
     root = os.path.abspath(include_root)
     marker = OWNER + version
@@ -122,13 +122,13 @@ def extend_actlize_plan(plan, include_root, version):
     for relative in profile.REQUIRED:
         path = _normal_path(root, relative)
         if path not in plan.files:
-            raise ValueError(f'ACTLIZE {version} 必需结构缺失：{relative}')
+            raise ValueError(f'ACTLIZE {version} required structure missing: {relative}')
     for path, text in plan.files.items():
         if not any(_within(path, scope) for scope in roots):
             continue
         for existing in re.findall(re.escape(OWNER) + r'([^\s]+)', text):
             if existing != version:
-                raise ValueError(f'异版本生成产物：{path}: {existing} != {version}')
+                raise ValueError(f'Generated artifact version mismatch: {path}: {existing} != {version}')
     convert_tokens = _token_converter(profile.TOKEN_RENAMES)
     for path in list(plan.files):
         if (any(_within(path, scope) for scope in roots)
@@ -137,7 +137,7 @@ def extend_actlize_plan(plan, include_root, version):
     for relative, (namespace, body) in profile.ALIASES.items():
         path = _normal_path(root, relative)
         if path not in plan.files:
-            plan.diagnostics.append(f'可选别名目标缺失，跳过：{relative}')
+            plan.diagnostics.append(f'Optional alias target missing, skipped: {relative}')
             continue
         body = convert_tokens(convert_text(body))
         plan.files[path] = _append_aliases(plan.files[path], namespace, body, marker, path)
@@ -147,30 +147,30 @@ def extend_actlize_plan(plan, include_root, version):
         path = _normal_path(root, relative)
         targets = [_normal_path(root, inc) for inc in includes]
         if path in specifications and specifications[path] != targets:
-            raise ValueError(f'wrapper 规则路径冲突：{relative}')
+            raise ValueError(f'Wrapper rule path conflict: {relative}')
         specifications[path] = targets
         if path in targets:
-            # SDK 已经把真实实现重命名到此入口，不能覆盖成自包含 wrapper。
+            # SDK renaming already supplies the implementation; never replace it with a self-including wrapper.
             if path not in plan.files:
-                raise ValueError(f'自包含 wrapper：{relative}')
+                raise ValueError(f'Self-including wrapper: {relative}')
             continue
         if any(target not in plan.files for target in targets):
-            plan.diagnostics.append(f'可选 wrapper 实现缺失，跳过：{relative}')
+            plan.diagnostics.append(f'Optional wrapper implementation missing, skipped: {relative}')
             continue
         body = '#pragma once\n' + marker + ' wrapper\n'
         body += ''.join(f'#include <{os.path.relpath(target, root)}>\n' for target in targets)
         if path in plan.files:
             if OWNER in plan.files[path] and plan.files[path] != body:
-                raise ValueError(f'已有 wrapper 与 profile 不一致：{relative}')
+                raise ValueError(f'Existing wrapper does not match the profile: {relative}')
             if OWNER in plan.files[path]:
                 wrapper_edges[path] = targets
-            # 真实入口文件保留原实现，不覆盖。
+            # Preserve existing entry-point implementations without overwriting them.
             continue
         plan.add_file(path, body)
         wrapper_edges[path] = targets
     def visit(path, stack):
         if path in stack:
-            raise ValueError(f'wrapper 包含循环：{path}')
+            raise ValueError(f'Wrapper include cycle: {path}')
         for target in wrapper_edges.get(path, ()):
             visit(target, stack | {path})
     for path in wrapper_edges:
@@ -178,7 +178,7 @@ def extend_actlize_plan(plan, include_root, version):
     arch_path = _normal_path(root, profile.ARCH_HEADER)
     arch_content = marker + ' architecture\n' + convert_text(profile.ARCH_CONTENT)
     if arch_path in plan.files and plan.files[arch_path] != arch_content:
-        raise ValueError(f'已有架构桥接与 profile 不一致：{arch_path}')
+        raise ValueError(f'Existing architecture bridge does not match the profile: {arch_path}')
     if arch_path not in plan.files:
         plan.add_file(arch_path, arch_content)
     include = f'#include "{os.path.relpath(arch_path, root)}"'
