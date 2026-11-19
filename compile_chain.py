@@ -8,7 +8,8 @@ the build-chain differences shared by all upper repositories:
     -arch=ppu_15 -> compute_89/sm_89, preserving both flags when present
   - fatbin artifact naming: hgbin -> cubin (flag and file suffix)
   - PPU-only -D defines that no converted source consumes
-  - -x hg language override and the PPU LLVM backend flag prefix
+  - -x hg -> -x cu and the PPU LLVM backend flag prefix
+  - resource reporting and local-memory warnings
 
 Build dependencies and reporting options are declared by the source
 repositories; this module does not inject repository-specific build settings.
@@ -57,6 +58,22 @@ FLAG_SUBS = [
     ("-hgbin", "-cubin"),
 ]
 
+_REPORT_OPTIONS = {
+    '--resource-usage': '--ptxas-options=--verbose',
+    '-resource-usage': '--ptxas-options=--verbose',
+    '--ppu-warn-lmem-usage': '--ptxas-options=--warn-on-local-memory-usage',
+    '-ppu-warn-lmem-usage': '--ptxas-options=--warn-on-local-memory-usage',
+}
+_LLVM_OPTION = r"(?:--llvm-options|-Xllvm)"
+_REPORT_VALUE = r"--?(?:resource-usage|ppu-warn-lmem-usage)"
+REPORT_FLAG_RE = re.compile(
+    r"(?<![\w-])" + _LLVM_OPTION + r"(?:=|[ \t]+)(" + _REPORT_VALUE + r")(?![\w,=.-])"
+)
+REPORT_LIST_RE = re.compile(
+    r"(?P<q>['\"])" + _LLVM_OPTION + r"(?P=q)\s*,\s*"
+    r"(?P<v>['\"])(?P<report>" + _REPORT_VALUE + r")(?P=v)"
+)
+
 # PPU-only -D defines; no converted source consumes them (verified: they only
 # ever appear on command lines). Removed as standalone list items ...
 DROP_DEFINE_ITEM_RE = re.compile(
@@ -68,10 +85,9 @@ DROP_DEFINE_TEXT_RE = re.compile(
     r"(?:=[^\s\"']*)?"
 )
 
-# -x hg language override: the whole extend() line (python) or the in-string
-# flag; removing only the .extend(...) call would leave a stray receiver.
-DROP_XHG_LIST_RE = re.compile(r"(?m)^[ \t]*\w+\.extend\(\['-x', 'hg'\]\)\r?\n")
-DROP_XHG_TEXT_RE = re.compile(r"[ ]+-x hg\b")
+# Preserve an explicit language override for inputs with non-device suffixes.
+XHG_TEXT_RE = re.compile(r"(?<![\w-])(-x(?:=|[ \t]+))hg(?![\w.-])")
+XHG_LIST_RE = re.compile(r"((['\"])-x\2\s*,\s*)(['\"])hg\3")
 
 _FSTR_FIELD = r"\{[^{}\n]*\}"
 _FSTR_FIELD_COMPAT = r"\{[^{}\n]*\.ppu_compat[^{}\n]*\}"
@@ -100,14 +116,16 @@ DROP_COMPAT_WRAPPER_RE = re.compile(
 
 def apply_compile_chain(content: str) -> str:
     """Apply the general compile-chain rules to one file's content."""
+    content = REPORT_LIST_RE.sub(lambda m: m['q'] + _REPORT_OPTIONS[m['report']] + m['q'], content)
+    content = REPORT_FLAG_RE.sub(lambda m: _REPORT_OPTIONS[m[1]], content)
     for old, new in ARCH_FLAG_SUBS + FLAG_SUBS:
         if old in content:
             content = content.replace(old, new)
 
     content = DROP_DEFINE_ITEM_RE.sub("", content)
     content = DROP_DEFINE_TEXT_RE.sub("", content)
-    content = DROP_XHG_LIST_RE.sub("", content)
-    content = DROP_XHG_TEXT_RE.sub("", content)
+    content = XHG_LIST_RE.sub(lambda m: m[1] + m[3] + 'cu' + m[3], content)
+    content = XHG_TEXT_RE.sub(r"\1cu", content)
     content = DROP_PPU_COMPAT_I_RE.sub("", content)
     content = DROP_COMPAT_WRAPPER_RE.sub("", content)
 

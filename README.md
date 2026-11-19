@@ -27,8 +27,8 @@ All supported repositories use the shared conversion engine:
      (e.g. `-no-hggc-embed-bc`) verbatim: the CUDA-compatible nvcc still
      honors them under their original spelling.
 
-2. **Repository coverage** -- all supported repositories are covered by
-   the general rules, with no per-repository residual scripts:
+2. **Repository coverage** -- repository commands use the general rules
+   plus any source adaptations listed below:
 
    | Repository | Residual rules |
    |---|---|
@@ -37,15 +37,15 @@ All supported repositories use the shared conversion engine:
    | `xformers` (0.0.27) | none -- the `COMPATIBLE_ARCH` / `__COMPATIBLECC_VER_*` SAILify platform naming lives in the general map (`NON_SDK_SAILIFY_MAP`) |
    | `flashmla` | none -- fully covered by the general rules |
    | `deepgemm` | none -- fully covered by the general rules |
+   | `deepep` | `deepep.py` -- file-scoped setup.py, SDK lookup, JIT and FP4 adaptations |
+   | `moonep` | `moonep.py` -- ltOki/PCCL native interfaces and JIT version checks |
 
-   Repository-specific commands retain their historical CLI shape and run
-   the general engine directly.
+   Repository-specific commands retain their historical CLI shape.
 
 ## Usage
 
-Use `general` as the recommended entry point for all repositories.
-Existing repository-specific commands remain supported and use the same
-general engine.
+Use `general` for the shared rules only. Repository-specific commands apply
+any additional rules listed above.
 
 Run from the repository root:
 
@@ -56,13 +56,18 @@ python3 cudafy.py --help
 ### General mode (any tree)
 
 ```bash
-python3 cudafy.py general <path> [--dry-run] [--verbose]
+python3 cudafy.py general <path> [--dry-run] [--verbose] \
+    [--output <directory>] [--exclude <relative-path>]
 ```
 
 Converts any path with the general rules only (SDK map + compile chain).
 The general engine is also expected to work with other PPU libraries.
 Bundled actlize copies under the path are converted together with the tree,
 so no separate actlize step is needed.
+
+`--output` copies a directory to a new destination and converts the copy,
+leaving the source unchanged. The destination must not already exist.
+`--exclude` skips a relative file or directory, including renames, and can be repeated.
 
 Any command whose repository name is not recognized falls back to this mode:
 `python3 cudafy.py <unknown-repo> <path>` is executed as
@@ -103,6 +108,24 @@ python3 cudafy.py flashmla /path/to/FlashMLA
 
 Both commands use the general engine only, equivalent to
 `python3 cudafy.py general <path>`.
+
+### DeepEP
+
+```bash
+python3 cudafy.py deepep /path/to/DeepEP
+```
+
+Applies the general rules and DeepEP adaptations to their designated source files.
+
+### MoonEP
+
+```bash
+python3 cudafy.py moonep /path/to/MoonEP
+```
+
+Applies the general rules while retaining the native PPU SDK interfaces used by
+ltOki and PCCL dispatch. The converted build and JIT use the CUDA-compatible
+compiler; ltOki device linking and ISA dumps still use PPU tools.
 
 ### Regenerating the SDK map
 
