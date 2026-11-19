@@ -23,6 +23,10 @@ Additional library compatibility commands:
       --compat, all versions retain the original SDK-only path. Version 0.5.0
       remains SDK-only even when compatibility is explicitly requested.
 
+  python3 cudafy.py flash-attention --compat --version=2.7.2 <root>
+      Restore integrated FA2 library symbols and architecture conditions.
+      The separate ACTLIZE 0.8 include tree still needs its own compatibility step.
+
   python3 cudafy.py flex-flash-attention --version=2.8.2 <root>
       Convert outer SDK sources and generate ACTLIZE 1.0 compatibility artifacts
       for repository-local include/util trees. Never modify external ACTLIZE_DIR
@@ -243,6 +247,25 @@ def run_actlize_compat(args: argparse.Namespace) -> int:
     return _run_compatible(target, args.version, args.dry_run, args.verbose)
 
 
+def run_flash_attention_compat(args: argparse.Namespace) -> int:
+    """Handle explicit FA2 compatibility without changing run_flash_attention()."""
+    from general import plan_path
+    from compat.flash_attention_v2_7_2 import extend_flash_attention_plan
+
+    target = _require_target(args.target, "target flash-attention directory")
+    try:
+        plan = extend_flash_attention_plan(plan_path(target), target, args.version)
+        scanned, changed, renamed, _ = plan.apply(dry_run=args.dry_run, verbose=args.verbose)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(f"flash-attention {args.version}: SDK + integrated FA2 library compatibility")
+    print(f"  Scanned: {scanned}; modified/generated: {changed}; renamed: {renamed}")
+    if args.dry_run:
+        print("  [DRY RUN - no files modified]")
+    return 0
+
+
 def build_compat_parser() -> argparse.ArgumentParser:
     """Parse new compatibility commands separately from the legacy parser."""
     parser = argparse.ArgumentParser(
@@ -261,6 +284,13 @@ def build_compat_parser() -> argparse.ArgumentParser:
                       help="Supported flex version")
     add_common_repo_args(flex)
     flex.set_defaults(func=run_flex_flash_attention)
+    flash = subparsers.add_parser("flash-attention", help="Opt into integrated FA2 library compatibility")
+    flash.add_argument("--compat", action="store_true", required=True,
+                       help="Enable versioned FA2 library symbols and architecture conditions")
+    flash.add_argument("--version", choices=["2.7.2"], required=True,
+                       help="Supported integrated FA2 profile version")
+    add_common_repo_args(flash)
+    flash.set_defaults(func=run_flash_attention_compat)
     return parser
 
 
@@ -271,7 +301,7 @@ def main_with_compat() -> int:
     if "--" in options:
         options = options[:options.index("--")]
     if argv and (argv[0] == "flex-flash-attention"
-                 or (argv[0] == "actlize" and "--compat" in options)):
+                 or (argv[0] in ("actlize", "flash-attention") and "--compat" in options)):
         args = build_compat_parser().parse_args(argv)
         return args.func(args)
     return main()

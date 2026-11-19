@@ -183,7 +183,10 @@ TOKEN_RENAMES = {'cu_count': 'sm_count',
  'CuArch': 'SmArch',
  'dest_cu': 'dest_sm',
  'PtgType': 'NvType',
- 'PtgTypeV2': 'NvTypeV2'}
+ 'PtgTypeV2': 'NvTypeV2',
+ '__HGGCCC_VER_MAJOR__': '__CUDACC_VER_MAJOR__',
+ '__HGGCCC_VER_MINOR__': '__CUDACC_VER_MINOR__',
+ '__HGGC__': '__CUDA__'}
 
 ARCH_HEADER = 'cutlass/arch/hggc_arch_map.h'
 
