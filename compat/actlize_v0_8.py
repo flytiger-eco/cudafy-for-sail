@@ -433,7 +433,7 @@ ALIASES = {'cutlass/arch/arch.h': ('cutlass::arch',
                                                                       'using Sm90MatrixBroadcast = '
                                                                       'PPU0015AuxLoad<Stages, EpilogueTile, '
                                                                       'Element, StrideMNL, SmemLayoutAtom, '
-                                                                      'CopyOpS2R, EnableNullptr>;\n'
+                                                                      'CopyOpS2R, Alignment, EnableNullptr>;\n'
                                                                       'template<class Element, class '
                                                                       'StrideMNL = Stride<_0,_0,_0>, int '
                                                                       'BroadcastCount = 1, template<class> '

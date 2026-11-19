@@ -371,6 +371,16 @@ def _plan_strict_renames(root, exclude_roots=()):
     return renames
 
 
+def _validate_rename_destinations(renames):
+    """Reject destinations reserved by distinct sources before any writes."""
+    destinations = {}
+    for old, new in renames:
+        old, new = os.path.abspath(old), os.path.abspath(new)
+        previous = destinations.setdefault(new, old)
+        if previous != old:
+            raise ValueError(f"Duplicate rename destination: {previous}, {old} -> {new}")
+
+
 class ConversionPlan:
     """Shared SDK/library virtual tree; planning never writes to disk."""
 
@@ -383,6 +393,8 @@ class ConversionPlan:
         self.scanned = 0
 
     def merge(self, other):
+        renames = self.renames + [pair for pair in other.renames if pair not in self.renames]
+        _validate_rename_destinations(renames)
         for path, text in other.files.items():
             if path in self.files and (self.files[path] != text
                                        or self.sources[path] != other.sources[path]):
@@ -390,7 +402,7 @@ class ConversionPlan:
             self.files[path] = text
             self.sources[path] = other.sources[path]
         self.originals.update(other.originals)
-        self.renames.extend(pair for pair in other.renames if pair not in self.renames)
+        self.renames = renames
         self.scanned = len(self.originals)
         self.diagnostics.extend(other.diagnostics)
         return self
@@ -432,6 +444,7 @@ class ConversionPlan:
                 or text != self.originals[self.sources[path]]]
 
     def apply(self, dry_run=False, verbose=False):
+        _validate_rename_destinations(self.renames)
         changed = self.changed_paths()
         if verbose or dry_run:
             for path in changed:
@@ -504,5 +517,6 @@ def plan_path(target, exclude_roots=()):
                 if os.path.lexists(new):
                     raise ValueError(f"Rename target already exists: {old} -> {new}")
                 plan.renames.append((old, new))
+    _validate_rename_destinations(plan.renames)
     plan.scanned = len(plan.originals)
     return plan
