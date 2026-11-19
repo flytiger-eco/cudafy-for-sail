@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
-"""Unified CUDA compatibility dispatcher for cudafy-for-sail.
-
-Three ways to run a conversion:
+"""cudafy-for-sail 的统一 CUDA 兼容转换入口。
 
   python3 cudafy.py general <path>
-      Convert ANY tree with the general rules only (full SDK naming map +
-      compile-chain rules). Bundled actlize copies under the path are
-      converted together with the tree, so no separate actlize step is needed.
+      仅执行 SDK 命名与编译链转换，不生成 ACTLIZE 库级兼容产物。
+      未知仓库名，以及 FA2/xformers/deepgemm/flashmla 入口仍使用通用规则。
 
-  python3 cudafy.py <repo> [--version=X] <path>
-      actlize, flash-attention, xformers, deepgemm and flashmla are fully
-      covered by the general rules (their per-repo scripts are gone); the
-      command runs the general engine directly, keeping the historical CLI shape.
+  python3 cudafy.py actlize --version=0.8.0|1.0.0 <include>
+      在同一只读计划中追加对应版本的库级规则；0.5.0 仅执行 SDK 转换。
 
-      An unknown <repo> name falls back to `general <path>`: the name is
-      dropped and the path is converted with the general rules.
+  python3 cudafy.py flex-flash-attention --version=2.8.2 <root>
+      转换外层 SDK 内容，并为仓内 ACTLIZE 的 include/util 生成 1.0 兼容产物。
+      不自动修改 ACTLIZE_DIR 指定的外部库；dry-run 不写入任何转换产物。
 """
 
 import argparse
@@ -28,7 +24,8 @@ REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 
 KNOWN_COMMANDS = {
-    "general", "actlize", "flash-attention", "xformers", "deepgemm", "flashmla",
+    "general", "actlize", "flash-attention", "flex-flash-attention",
+    "xformers", "deepgemm", "flashmla",
 }
 
 
@@ -72,8 +69,47 @@ def run_actlize(args: argparse.Namespace) -> int:
     target = _require_target(args.target, "actlize include directory")
     if not os.path.isdir(target):
         raise SystemExit(f"ERROR: directory not found: {target}")
-    return _run_general(target, args.dry_run, args.verbose,
-                        version=args.version, label="actlize")
+    if args.version == "0.5.0":
+        print("WARNING: ACTLIZE 0.5.0 仅执行 SDK 转换，没有经过验证的库兼容 profile。")
+        return _run_general(target, args.dry_run, args.verbose,
+                            version=args.version, label="actlize")
+    return _run_compatible(target, args.version, args.dry_run, args.verbose)
+
+
+def _run_compatible(target, version, dry_run, verbose, flex=False):
+    from general import plan_path
+    from compat import extend_actlize_plan
+
+    target = os.path.abspath(target)
+    try:
+        if flex:
+            flattened = (os.path.isfile(os.path.join(target, "build_lib.py"))
+                         and os.path.isdir(os.path.join(target, "instantiations")))
+            nested = (os.path.isfile(os.path.join(target, "setup.py"))
+                      and os.path.isdir(os.path.join(target, "csrc", "flash_attn")))
+            if not (flattened or nested):
+                raise ValueError(f"不是受支持的 flex 根目录：{target}")
+            actlize = os.path.join(target, "csrc", "actlize")
+            include = os.path.join(actlize, "include")
+            plan = plan_path(target, exclude_roots=[actlize])
+            plan.merge(plan_path(include))
+            extend_actlize_plan(plan, include, "1.0.0")
+        else:
+            plan = extend_actlize_plan(plan_path(target), target, version)
+        scanned, changed, renamed, _ = plan.apply(dry_run=dry_run, verbose=verbose)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(f"{'flex-flash-attention' if flex else 'actlize'} {version}: SDK + 库级兼容")
+    print(f"  扫描：{scanned}；修改/生成：{changed}；重命名：{renamed}")
+    if dry_run:
+        print("  [DRY RUN - no files modified]")
+    return 0
+
+
+def run_flex_flash_attention(args):
+    target = _require_target(args.target, "flex-flash-attention 根目录")
+    return _run_compatible(target, args.version, args.dry_run, args.verbose, flex=True)
 
 
 def run_deepgemm(args: argparse.Namespace) -> int:
@@ -129,10 +165,10 @@ def build_parser() -> argparse.ArgumentParser:
     general.set_defaults(func=run_general)
 
     actlize = subparsers.add_parser(
-        "actlize", help="Convert ACTLIZE include files (general rules only)")
+        "actlize", help="转换 ACTLIZE：SDK 规则及版本化库兼容层")
     actlize.add_argument(
         "--version", choices=["0.5.0", "0.8.0", "1.0.0"], default="1.0.0",
-        help="Informational only; the general rules are version-independent")
+        help="ACTLIZE 库版本；0.8/1.0 启用兼容 profile，0.5 仅执行 SDK 转换")
     actlize.add_argument("target", help="Target ACTLIZE include directory")
     actlize.add_argument("--dry-run", action="store_true", help="Preview changes without modifying files")
     actlize.add_argument("--verbose", action="store_true", help="Print detailed output")
@@ -145,6 +181,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Informational only; the general rules are version-independent")
     add_common_repo_args(flash_attention)
     flash_attention.set_defaults(func=run_flash_attention)
+
+    flex = subparsers.add_parser("flex-flash-attention", help="转换 flex 及仓内 ACTLIZE 1.0")
+    flex.add_argument("--version", choices=["2.8.2"], default="2.8.2",
+                      help="已适配的 flex 版本")
+    add_common_repo_args(flex)
+    flex.set_defaults(func=run_flex_flash_attention)
 
     deepgemm = subparsers.add_parser(
         "deepgemm", help="Convert a DeepGEMM repository (general rules only)")

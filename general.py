@@ -177,12 +177,26 @@ def _is_target(filepath: str) -> bool:
     return os.path.splitext(name)[1] in TEXT_EXTENSIONS
 
 
-def _iter_files(root: str):
-    for base, dirnames, filenames in os.walk(root):
+def _walk_tree(root, exclude_roots=(), strict=False):
+    def onerror(exc):
+        if strict:
+            raise exc
+    for base, dirnames, filenames in os.walk(root, onerror=onerror):
         dirnames[:] = sorted(
             d for d in dirnames
             if d not in SKIP_DIRS and not d.endswith(SKIP_DIR_SUFFIXES)
+            and not any(_within(os.path.join(base, d), skip) for skip in exclude_roots)
         )
+        if strict:
+            for name in dirnames:
+                path = os.path.join(base, name)
+                if os.path.islink(path):
+                    raise ValueError(f"转换目录包含 symlink：{path}")
+        yield base, dirnames, filenames
+
+
+def _iter_files(root: str, exclude_roots=(), strict=False):
+    for base, dirnames, filenames in _walk_tree(root, exclude_roots, strict):
         for fname in sorted(filenames):
             filepath = os.path.join(base, fname)
             if _is_target(filepath):
@@ -273,14 +287,10 @@ def _convert_name(name: str) -> str:
     return convert_text(name)
 
 
-def _plan_renames(root: str):
+def _plan_renames(root: str, exclude_roots=(), strict=False):
     """Collect (old, new) rename pairs for convertible files and directories."""
     renames = []
-    for base, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(
-            d for d in dirnames
-            if d not in SKIP_DIRS and not d.endswith(SKIP_DIR_SUFFIXES)
-        )
+    for base, dirnames, filenames in _walk_tree(root, exclude_roots, strict):
         for fname in filenames:
             filepath = os.path.join(base, fname)
             if not _is_target(filepath):
@@ -329,3 +339,140 @@ def rename_path(target: str, dry_run: bool = False, verbose: bool = False):
     for extra in _extra_roots(target):
         renames.extend(_plan_renames(extra))
     return _apply_renames(renames, dry_run=dry_run, verbose=verbose)
+
+
+class ConversionPlan:
+    """SDK 与库级阶段共享的虚拟树；构造和扩展计划均不写盘。"""
+
+    def __init__(self):
+        self.files = {}
+        self.sources = {}
+        self.originals = {}
+        self.renames = []
+        self.diagnostics = []
+        self.scanned = 0
+
+    def merge(self, other):
+        for path, text in other.files.items():
+            if path in self.files and (self.files[path] != text
+                                       or self.sources[path] != other.sources[path]):
+                raise ValueError(f"转换计划路径冲突：{path}")
+            self.files[path] = text
+            self.sources[path] = other.sources[path]
+        self.originals.update(other.originals)
+        self.renames.extend(pair for pair in other.renames if pair not in self.renames)
+        self.scanned = len(self.originals)
+        self.diagnostics.extend(other.diagnostics)
+        return self
+
+    def _physical_path(self, path):
+        # 生成入口可能位于即将重命名的目录下，检查其转换前的真实占用。
+        for old, new in sorted(self.renames, key=lambda pair: pair[0].count(os.sep)):
+            if os.path.isdir(old) and _within(path, new):
+                path = os.path.join(old, os.path.relpath(path, new))
+        return path
+
+    def _check_generated_path(self, path):
+        physical = self._physical_path(path)
+        if os.path.realpath(physical) != physical:
+            raise ValueError(f"生成路径包含 symlink：{path}")
+        if os.path.lexists(physical):
+            raise ValueError(f"生成路径已被文件或目录占用：{path}")
+        parent = os.path.dirname(physical)
+        while not os.path.lexists(parent):
+            parent = os.path.dirname(parent)
+        if not os.path.isdir(parent):
+            raise ValueError(f"生成路径父级不是目录：{path}")
+
+    def add_file(self, path, text):
+        path = os.path.abspath(path)
+        if path in self.files:
+            if self.files[path] != text:
+                raise ValueError(f"生成规则路径冲突：{path}")
+            return
+        self._check_generated_path(path)
+        if any(_within(path, existing) or _within(existing, path) for existing in self.files):
+            raise ValueError(f"生成路径与虚拟文件层级冲突：{path}")
+        self.files[path] = text
+        self.sources[path] = None
+
+    def changed_paths(self):
+        return [path for path, text in self.files.items()
+                if self.sources[path] is None
+                or text != self.originals[self.sources[path]]]
+
+    def apply(self, dry_run=False, verbose=False):
+        changed = self.changed_paths()
+        if verbose or dry_run:
+            for path in changed:
+                print(f"  [plan] {'生成' if self.sources[path] is None else '修改'}：{path}")
+            for old, new in self.renames:
+                print(f"  [plan] 重命名：{old} -> {new}")
+        for note in self.diagnostics:
+            print(f"  [compat] {note}")
+        if dry_run:
+            return self.scanned, len(changed), len(self.renames), changed
+        # 在首个写入前确认计划中的源文件没有被其他进程改变。
+        for source, original in self.originals.items():
+            if os.path.realpath(source) != source:
+                raise ValueError(f"转换文件包含 symlink：{source}")
+            if _read(source) != original:
+                raise ValueError(f"计划构造后源文件发生变化：{source}")
+        for old, new in self.renames:
+            if os.path.lexists(new):
+                raise ValueError(f"重命名目标发生冲突：{old} -> {new}")
+        for path in changed:
+            if self.sources[path] is None:
+                self._check_generated_path(path)
+        for path in changed:
+            source = self.sources[path]
+            if source is not None:
+                _write(source, self.files[path])
+        for old, new in sorted(self.renames, key=lambda pair: -pair[0].count(os.sep)):
+            os.rename(old, new)
+        for path in changed:
+            if self.sources[path] is None:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                _write(path, self.files[path])
+        return self.scanned, len(changed), len(self.renames), changed
+
+
+def _within(path, root):
+    return os.path.commonpath([os.path.abspath(path), os.path.abspath(root)]) == os.path.abspath(root)
+
+
+def plan_path(target, exclude_roots=()):
+    """严格、只读的 SDK 转换计划，供需要库级后处理的入口使用。"""
+    target = os.path.abspath(target)
+    if not os.path.exists(target):
+        raise ValueError(f"转换目标不存在：{target}")
+    excluded = [os.path.abspath(root) for root in exclude_roots]
+    plan = ConversionPlan()
+    roots = [target] + (_extra_roots(target) if os.path.isdir(target) else [])
+    for root in roots:
+        if os.path.realpath(root) != root:
+            raise ValueError(f"转换根包含 symlink：{root}")
+        paths = [root] if os.path.isfile(root) else _iter_files(root, excluded, strict=True)
+        for source in paths:
+            if any(_within(source, skip) for skip in excluded):
+                continue
+            if os.path.realpath(source) != source:
+                raise ValueError(f"转换文件包含 symlink：{source}")
+            relative = os.path.relpath(source, root)
+            final = source if os.path.isfile(root) else os.path.join(
+                root, *[_convert_name(part) for part in relative.split(os.sep)])
+            if final in plan.files:
+                raise ValueError(f"多个源文件映射到同一路径：{final}")
+            original = _read(source)
+            plan.files[final] = convert_text(original)
+            plan.sources[final] = source
+            plan.originals[source] = original
+        if os.path.isdir(root):
+            for old, new in _plan_renames(root, excluded, strict=True):
+                if any(_within(old, skip) for skip in excluded):
+                    continue
+                if os.path.lexists(new):
+                    raise ValueError(f"重命名目标已存在：{old} -> {new}")
+                plan.renames.append((old, new))
+    plan.scanned = len(plan.originals)
+    return plan
