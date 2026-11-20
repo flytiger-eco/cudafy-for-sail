@@ -57,6 +57,12 @@ jobs:
     timeout-minutes: 390
     outputs:
       artifact_name: ${{ steps.artifact-name.outputs.name }}
+      vllm_artifact_name: ${{ steps.artifact-name.outputs.vllm_name }}
+      commit: ${{ steps.source.outputs.commit }}
+      branch: ${{ steps.source.outputs.branch }}
+      tag: ${{ steps.source.outputs.tag }}
+      vllm_commit: ${{ steps.source.outputs.vllm_commit }}
+      extra_info: ${{ steps.source.outputs.extra_info }}
     steps:
       - name: Checkout workflow tools
         uses: actions/checkout@v4
@@ -74,10 +80,30 @@ jobs:
           submodules: recursive
           persist-credentials: false
 
+      - name: Record actual build source and pinned upstream vLLM commit
+        id: source
+        shell: bash
+        working-directory: vllm-sail
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse HEAD)"
+          vllm_commit="$(tr -d '[:space:]' < .github/vllm-main-verified.commit)"
+          [[ "$vllm_commit" =~ ^[0-9a-f]{40}$ ]]
+          {
+            printf 'commit=%s\n' "$commit"
+            printf 'branch=%s\n' "$(git symbolic-ref --quiet --short HEAD || true)"
+            printf 'tag=%s\n' "$(git tag --points-at HEAD | paste -sd ',' -)"
+            printf 'vllm_commit=%s\n' "$vllm_commit"
+            printf 'extra_info=build_tool=vllm-sail/scripts/build_wheels.sh;vllm_sail_commit=%s;vllm_commit=%s;image=%s\n' \
+              "$commit" "$vllm_commit" "$SAIL_IMAGE"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Set wheel artifact name
         id: artifact-name
         shell: bash
-        run: echo 'name=vllm-sail-nightly-wheels-${{ github.run_id }}-${{ github.run_attempt }}' >> "$GITHUB_OUTPUT"
+        run: |
+          echo 'name=vllm-sail-nightly-wheels-${{ github.run_id }}-${{ github.run_attempt }}' >> "$GITHUB_OUTPUT"
+          echo 'vllm_name=vllm-nightly-wheels-${{ github.run_id }}-${{ github.run_attempt }}' >> "$GITHUB_OUTPUT"
 
       - name: Build directly with the SAIL SDK
         uses: flytiger-eco/shared-workflows/cluster-task@main
@@ -124,6 +150,8 @@ jobs:
             export BUILD_JOBS=16
             export PYTORCH_SAIL_ARCH='ppu_10;ppu_15'
             export VLLM_SAIL_BUILD_IMAGE="$SAIL_IMAGE"
+            # Match the published upstream repository, overriding any image-provided source URL.
+            export VLLM_REPOSITORY=https://github.com/vllm-project/vllm.git
 
             cd "$TARGET_ROOT"
             # Builds pinned vLLM with VLLM_TARGET_DEVICE=empty (including Rust),
@@ -136,7 +164,18 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.artifact-name.outputs.name }}
-          path: /wl_nas/devops/cudafy-ci/vllm-sail/${{ github.run_id }}/${{ github.run_attempt }}/wheels/
+          # The template sets identical properties per artifact; upload each source repository separately.
+          path: /wl_nas/devops/cudafy-ci/vllm-sail/${{ github.run_id }}/${{ github.run_attempt }}/wheels/vllm-sail/*.whl
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          overwrite: true
+
+      - name: Upload upstream vLLM wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.vllm_name }}
+          path: /wl_nas/devops/cudafy-ci/vllm-sail/${{ github.run_id }}/${{ github.run_attempt }}/wheels/vllm/*.whl
           if-no-files-found: error
           retention-days: 14
           compression-level: 0
@@ -150,6 +189,7 @@ jobs:
           path: |
             /wl_nas/devops/cudafy-ci/vllm-sail/${{ github.run_id }}/${{ github.run_attempt }}/logs/
             /wl_nas/devops/cudafy-ci/vllm-sail/${{ github.run_id }}/${{ github.run_attempt }}/build-manifest.txt
+            /wl_nas/devops/cudafy-ci/vllm-sail/${{ github.run_id }}/${{ github.run_attempt }}/wheels/wheel-manifest.json
           if-no-files-found: warn
           retention-days: 14
           overwrite: true
@@ -179,6 +219,30 @@ jobs:
     with:
       # Use the producer's output so rerunning only this job finds its artifact.
       artifact_name: ${{ needs.build.outputs.artifact_name }}
+      repo: vllm-project/vllm-sail
+      commit: ${{ needs.build.outputs.commit }}
+      branch: ${{ needs.build.outputs.branch }}
+      tag: ${{ needs.build.outputs.tag }}
+      extra_info: ${{ needs.build.outputs.extra_info }}
+      template_repository: flytiger-eco/shared-workflows
+      template_ref: main
+    secrets:
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+      template_token: ${{ secrets.TEMPLATE_TOKEN }}
+
+  push-vllm:
+    name: Publish upstream vLLM temporary wheel
+    needs: build
+    uses: flytiger-eco/shared-workflows/.github/workflows/push-tmp-wheel.yml@main
+    with:
+      artifact_name: ${{ needs.build.outputs.vllm_artifact_name }}
+      repo: vllm-project/vllm
+      commit: ${{ needs.build.outputs.vllm_commit }}
+      # Upstream is built from a pinned SHA; leave unknown branch and tag values empty.
+      branch: ''
+      tag: ''
+      extra_info: ${{ needs.build.outputs.extra_info }}
       template_repository: flytiger-eco/shared-workflows
       template_ref: main
     secrets:
@@ -188,7 +252,7 @@ jobs:
 
   result:
     name: Show nightly download URL
-    needs: push
+    needs: [push, push-vllm]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -196,6 +260,8 @@ jobs:
         shell: bash
         env:
           UPLOAD_URL: ${{ needs.push.outputs.upload_url }}
+          VLLM_UPLOAD_URL: ${{ needs.push-vllm.outputs.upload_url }}
         run: |
           set -euo pipefail
-          printf 'Nightly wheel directory: %s\n' "$UPLOAD_URL" | tee -a "$GITHUB_STEP_SUMMARY"
+          printf 'vLLM SAIL wheel directory: %s\n' "$UPLOAD_URL" | tee -a "$GITHUB_STEP_SUMMARY"
+          printf 'Upstream vLLM wheel directory: %s\n' "$VLLM_UPLOAD_URL" | tee -a "$GITHUB_STEP_SUMMARY"
