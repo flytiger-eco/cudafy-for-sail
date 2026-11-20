@@ -29,16 +29,14 @@ _ARCH_COMPARE = re.compile(r'(\b__CUDA_ARCH__\s*(>=|==)\s*)(100|150)\b')
 
 
 def convert_library_text(text):
-    """Rename whole identifiers; translate only the historical arch comparisons."""
+    """Rename whole identifiers and preserve supported architecture predicates."""
     text = _token_converter(TOKEN_RENAMES)(text)
 
     def architecture(match):
         value = match.group(3)
         if value == '100':
             return match.group(1) + '800'
-        if match.group(2) == '==':
-            return match.group(1) + '890'
-        return match.group(0)
+        return match.group(1) + '890'
 
     return _ARCH_COMPARE.sub(architecture, text)
 
