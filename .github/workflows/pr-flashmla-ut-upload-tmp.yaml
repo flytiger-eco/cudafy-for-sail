@@ -69,6 +69,8 @@ jobs:
     container:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 360
+    outputs:
+      source_artifact_name: flashmla-source-${{ github.run_id }}-${{ github.run_attempt }}
     strategy:
       fail-fast: false
       matrix:
@@ -202,6 +204,24 @@ jobs:
               git submodule update --init --recursive
               echo "FlashMLA target resolved: ${TARGET_KIND} ${TARGET_REF} -> ${TARGET_COMMIT}"
             fi
+
+            # Record the actual source before conversion, using the matrix leg that uploads the wheel.
+            SOURCE_COMMIT="$(git -C "$TARGET_ROOT" rev-parse HEAD)"
+            SOURCE_BRANCH="$(git -C "$TARGET_ROOT" symbolic-ref --quiet --short HEAD || true)"
+            if [[ "$TARGET_KIND" == ref ]] && [[ "$(git -C "$TARGET_ROOT" rev-parse --verify --quiet "refs/remotes/origin/${TARGET_REF}^{commit}" || true)" == "$SOURCE_COMMIT" ]]; then
+              SOURCE_BRANCH="$TARGET_REF"
+            fi
+            SOURCE_METADATA_DIR="/mnt/wl_nas/devops/cudafy-ci/flashmla/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
+            mkdir -p "$SOURCE_METADATA_DIR"
+            {
+              printf 'repo=t-head/FlashMLA-for-sail\n'
+              printf 'commit=%s\n' "$SOURCE_COMMIT"
+              printf 'branch=%s\n' "$SOURCE_BRANCH"
+              printf 'tag=%s\n' "$(git -C "$TARGET_ROOT" tag --points-at HEAD | paste -sd ',' -)"
+              printf 'extra_info=cudafy=%s@%s;image=%s;build_tool=setup.py\n' \
+                '${{ github.repository }}' "$(git -C "$CUDAFY_ROOT" rev-parse HEAD)" "$SAIL_IMAGE"
+            } > "$SOURCE_METADATA_DIR/source-metadata.txt"
+
             # Copy the UT runner and caselist out BEFORE conversion (cudafy rewrites .py in place).
             cp -a "$TARGET_ROOT/.github/workflows/scripts" "$CI_SCRIPTS"
             # Summary/env-info helpers come from this repository.
@@ -255,6 +275,15 @@ jobs:
             exit "$TEST_EXIT_CODE"
           cleanup_policy: on_success
 
+      - name: Upload build source metadata
+        if: ${{ strategy.job-index == 0 }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: flashmla-source-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /wl_nas/devops/cudafy-ci/flashmla/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/source-metadata.txt
+          if-no-files-found: error
+          overwrite: true
+
       - name: Upload wheel artifact (${{ matrix.runner }})
         # Only the first leg uploads: wheels are board independent. !cancelled()
         # keeps the artifact available even when the UT phase failed.
@@ -293,7 +322,28 @@ jobs:
     timeout-minutes: 15
     outputs:
       artifact_name: ${{ steps.artifact-name.outputs.artifact_name }}
+      repo: ${{ steps.source.outputs.repo }}
+      commit: ${{ steps.source.outputs.commit }}
+      branch: ${{ steps.source.outputs.branch }}
+      tag: ${{ steps.source.outputs.tag }}
+      extra_info: ${{ steps.source.outputs.extra_info }}
     steps:
+      - name: Download build source metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build-test.outputs.source_artifact_name }}
+          path: ${{ runner.temp }}/wheel-source
+
+      - name: Export build source parameters
+        id: source
+        shell: bash
+        env:
+          SOURCE_METADATA: ${{ runner.temp }}/wheel-source/source-metadata.txt
+        run: |
+          set -euo pipefail
+          grep -Eq '^commit=[0-9a-f]{40}$' "$SOURCE_METADATA"
+          cat "$SOURCE_METADATA" >> "$GITHUB_OUTPUT"
+
       - name: Set merged artifact name
         id: artifact-name
         shell: bash
@@ -314,6 +364,11 @@ jobs:
     with:
       # run_attempt moves when only the publishing job is rerun.
       artifact_name: ${{ needs.merge.outputs.artifact_name }}
+      repo: ${{ needs.merge.outputs.repo }}
+      commit: ${{ needs.merge.outputs.commit }}
+      branch: ${{ needs.merge.outputs.branch }}
+      tag: ${{ needs.merge.outputs.tag }}
+      extra_info: ${{ needs.merge.outputs.extra_info }}
       template_repository: flytiger-eco/shared-workflows
       template_ref: main
     secrets:

@@ -200,6 +200,8 @@ jobs:
     container:
       image: ghcr.io/actions/actions-runner:latest
     timeout-minutes: 360
+    outputs:
+      source_artifact_name: flash-attention-source-${{ github.run_id }}-${{ github.run_attempt }}
     strategy:
       fail-fast: false
       matrix:
@@ -266,6 +268,26 @@ jobs:
             fi
             echo "FlashAttention target: ${TARGET_KIND} ${TARGET_REF} -> ${TARGET_COMMIT} (version ${FA_VERSION})"
 
+            # Both variants use the same pinned SHA; metadata comes from the first wheel-uploading leg.
+            SOURCE_COMMIT="$(git -C "$TARGET_ROOT" rev-parse HEAD)"
+            [[ "$SOURCE_COMMIT" == "$TARGET_COMMIT" ]]
+            SOURCE_BRANCH=''
+            if [[ "$TARGET_KIND" == default ]]; then
+              SOURCE_BRANCH="$TARGET_REF"
+            elif [[ "$TARGET_KIND" == ref ]] && [[ "$(git -C "$TARGET_ROOT" rev-parse --verify --quiet "refs/remotes/origin/${TARGET_REF}^{commit}" || true)" == "$SOURCE_COMMIT" ]]; then
+              SOURCE_BRANCH="$TARGET_REF"
+            fi
+            SOURCE_METADATA_DIR="/mnt/wl_nas/devops/cudafy-ci/flash-attention/${{ needs.resolve.outputs.ref }}/${FA_VERSION}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${VARIANT}"
+            mkdir -p "$SOURCE_METADATA_DIR"
+            {
+              printf 'repo=t-head/flash-attention-for-sail\n'
+              printf 'commit=%s\n' "$SOURCE_COMMIT"
+              printf 'branch=%s\n' "$SOURCE_BRANCH"
+              printf 'tag=%s\n' "$(git -C "$TARGET_ROOT" tag --points-at HEAD | paste -sd ',' -)"
+              printf 'extra_info=cudafy=%s@%s;image=%s;build_tool=setup.py\n' \
+                '${{ github.repository }}' "$(git -C "$CUDAFY_ROOT" rev-parse HEAD)" "$SAIL_IMAGE"
+            } > "$SOURCE_METADATA_DIR/source-metadata.txt"
+
             # No --version: the engine is version independent and the old flag only
             # accepted 2.7.2/2.7.4/2.8.2. Bundled csrc/actlize is converted too.
             python3 "$CUDAFY_ROOT/cudafy.py" flash-attention "$TARGET_ROOT"
@@ -313,6 +335,15 @@ jobs:
             cp "$BUILD_DIR"/dist/*.whl "$NAS_RESULT_DIR/wheels/"
           cleanup_policy: on_success
 
+      - name: Upload build source metadata
+        if: ${{ strategy.job-index == 0 }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: flash-attention-source-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /wl_nas/devops/cudafy-ci/flash-attention/${{ needs.resolve.outputs.ref }}/${{ needs.resolve.outputs.version }}/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/${{ matrix.variant }}/source-metadata.txt
+          if-no-files-found: error
+          overwrite: true
+
       - name: Upload wheel artifact (${{ matrix.variant }} / ${{ matrix.runner }})
         # Wheels are board independent: only the first board uploads, all
         # variants do. !cancelled() keeps artifacts when the build failed.
@@ -334,7 +365,28 @@ jobs:
     timeout-minutes: 15
     outputs:
       artifact_name: ${{ steps.artifact-name.outputs.artifact_name }}
+      repo: ${{ steps.source.outputs.repo }}
+      commit: ${{ steps.source.outputs.commit }}
+      branch: ${{ steps.source.outputs.branch }}
+      tag: ${{ steps.source.outputs.tag }}
+      extra_info: ${{ steps.source.outputs.extra_info }}
     steps:
+      - name: Download build source metadata
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.source_artifact_name }}
+          path: ${{ runner.temp }}/wheel-source
+
+      - name: Export build source parameters
+        id: source
+        shell: bash
+        env:
+          SOURCE_METADATA: ${{ runner.temp }}/wheel-source/source-metadata.txt
+        run: |
+          set -euo pipefail
+          grep -Eq '^commit=[0-9a-f]{40}$' "$SOURCE_METADATA"
+          cat "$SOURCE_METADATA" >> "$GITHUB_OUTPUT"
+
       - name: Set merged artifact name
         id: artifact-name
         shell: bash
@@ -355,6 +407,11 @@ jobs:
     with:
       # run_attempt moves when only the publishing job is rerun.
       artifact_name: ${{ needs.merge.outputs.artifact_name }}
+      repo: ${{ needs.merge.outputs.repo }}
+      commit: ${{ needs.merge.outputs.commit }}
+      branch: ${{ needs.merge.outputs.branch }}
+      tag: ${{ needs.merge.outputs.tag }}
+      extra_info: ${{ needs.merge.outputs.extra_info }}
       template_repository: flytiger-eco/shared-workflows
       template_ref: main
     secrets:
