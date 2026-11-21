@@ -15,6 +15,22 @@ Three ways to run a conversion:
 
       An unknown <repo> name falls back to `general <path>`: the name is
       dropped and the path is converted with the general rules.
+
+Additional library compatibility commands:
+
+  python3 cudafy.py actlize --compat --version=0.8.0|1.0.0 <include>
+      Opt into versioned library rules in a shared read-only plan. Without
+      --compat, all versions retain the original SDK-only path. Version 0.5.0
+      remains SDK-only even when compatibility is explicitly requested.
+
+  python3 cudafy.py flash-attention --compat --version=2.7.2 <root>
+      Restore integrated FA2 library symbols and architecture conditions.
+      The separate ACTLIZE 0.8 include tree still needs its own compatibility step.
+
+  python3 cudafy.py flex-flash-attention --version=2.8.2 <root>
+      Convert outer SDK sources and generate ACTLIZE 1.0 compatibility artifacts
+      for repository-local include/util trees. Never modify external ACTLIZE_DIR
+      libraries automatically. Dry runs do not write conversion artifacts.
 """
 
 import argparse
@@ -74,6 +90,42 @@ def run_actlize(args: argparse.Namespace) -> int:
         raise SystemExit(f"ERROR: directory not found: {target}")
     return _run_general(target, args.dry_run, args.verbose,
                         version=args.version, label="actlize")
+
+
+def _run_compatible(target, version, dry_run, verbose, flex=False):
+    from general import plan_path
+    from compat import extend_actlize_plan
+
+    target = os.path.abspath(target)
+    try:
+        if flex:
+            flattened = (os.path.isfile(os.path.join(target, "build_lib.py"))
+                         and os.path.isdir(os.path.join(target, "instantiations")))
+            nested = (os.path.isfile(os.path.join(target, "setup.py"))
+                      and os.path.isdir(os.path.join(target, "csrc", "flash_attn")))
+            if not (flattened or nested):
+                raise ValueError(f"Not a supported flex root directory: {target}")
+            actlize = os.path.join(target, "csrc", "actlize")
+            include = os.path.join(actlize, "include")
+            plan = plan_path(target, exclude_roots=[actlize])
+            plan.merge(plan_path(include))
+            extend_actlize_plan(plan, include, "1.0.0")
+        else:
+            plan = extend_actlize_plan(plan_path(target), target, version)
+        scanned, changed, renamed, _ = plan.apply(dry_run=dry_run, verbose=verbose)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(f"{'flex-flash-attention' if flex else 'actlize'} {version}: SDK + library compatibility")
+    print(f"  Scanned: {scanned}; modified/generated: {changed}; renamed: {renamed}")
+    if dry_run:
+        print("  [DRY RUN - no files modified]")
+    return 0
+
+
+def run_flex_flash_attention(args):
+    target = _require_target(args.target, "flex-flash-attention root directory")
+    return _run_compatible(target, args.version, args.dry_run, args.verbose, flex=True)
 
 
 def run_deepgemm(args: argparse.Namespace) -> int:
@@ -184,5 +236,76 @@ def main() -> int:
     return args.func(args)
 
 
+def run_actlize_compat(args: argparse.Namespace) -> int:
+    """Handle explicit library compatibility without changing run_actlize()."""
+    target = _require_target(args.target, "actlize include directory")
+    if not os.path.isdir(target):
+        raise SystemExit(f"ERROR: directory not found: {target}")
+    if args.version == "0.5.0":
+        print("WARNING: ACTLIZE 0.5.0 is SDK-only; no validated library compatibility profile is available.")
+        return run_actlize(args)
+    return _run_compatible(target, args.version, args.dry_run, args.verbose)
+
+
+def run_flash_attention_compat(args: argparse.Namespace) -> int:
+    """Handle explicit FA2 compatibility without changing run_flash_attention()."""
+    from general import plan_path
+    from compat.flash_attention_v2_7_2 import extend_flash_attention_plan
+
+    target = _require_target(args.target, "target flash-attention directory")
+    try:
+        plan = extend_flash_attention_plan(plan_path(target), target, args.version)
+        scanned, changed, renamed, _ = plan.apply(dry_run=args.dry_run, verbose=args.verbose)
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(f"flash-attention {args.version}: SDK + integrated FA2 library compatibility")
+    print(f"  Scanned: {scanned}; modified/generated: {changed}; renamed: {renamed}")
+    if args.dry_run:
+        print("  [DRY RUN - no files modified]")
+    return 0
+
+
+def build_compat_parser() -> argparse.ArgumentParser:
+    """Parse new compatibility commands separately from the legacy parser."""
+    parser = argparse.ArgumentParser(
+        description="Run opt-in ACTLIZE library compatibility conversion.")
+    subparsers = parser.add_subparsers(dest="command")
+    actlize = subparsers.add_parser("actlize", help="Opt into ACTLIZE library compatibility")
+    actlize.add_argument("--compat", action="store_true", required=True,
+                        help="Enable versioned library compatibility artifacts")
+    actlize.add_argument("--version", choices=["0.5.0", "0.8.0", "1.0.0"], default="1.0.0",
+                        help="Library profile version; 0.5.0 remains SDK-only")
+    add_common_repo_args(actlize)
+    actlize.set_defaults(func=run_actlize_compat)
+    flex = subparsers.add_parser("flex-flash-attention",
+                                help="Convert flex and repository-local ACTLIZE 1.0")
+    flex.add_argument("--version", choices=["2.8.2"], default="2.8.2",
+                      help="Supported flex version")
+    add_common_repo_args(flex)
+    flex.set_defaults(func=run_flex_flash_attention)
+    flash = subparsers.add_parser("flash-attention", help="Opt into integrated FA2 library compatibility")
+    flash.add_argument("--compat", action="store_true", required=True,
+                       help="Enable versioned FA2 library symbols and architecture conditions")
+    flash.add_argument("--version", choices=["2.7.2"], required=True,
+                       help="Supported integrated FA2 profile version")
+    add_common_repo_args(flash)
+    flash.set_defaults(func=run_flash_attention_compat)
+    return parser
+
+
+def main_with_compat() -> int:
+    """Dispatch only new commands; all legacy invocations use main() unchanged."""
+    argv = sys.argv[1:]
+    options = argv[1:]
+    if "--" in options:
+        options = options[:options.index("--")]
+    if argv and (argv[0] == "flex-flash-attention"
+                 or (argv[0] in ("actlize", "flash-attention") and "--compat" in options)):
+        args = build_compat_parser().parse_args(argv)
+        return args.func(args)
+    return main()
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main_with_compat())

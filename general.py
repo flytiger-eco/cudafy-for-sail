@@ -329,3 +329,194 @@ def rename_path(target: str, dry_run: bool = False, verbose: bool = False):
     for extra in _extra_roots(target):
         renames.extend(_plan_renames(extra))
     return _apply_renames(renames, dry_run=dry_run, verbose=verbose)
+
+
+def _walk_tree(root, exclude_roots=()):
+    """Strict traversal reserved for opt-in compatibility plans."""
+    def onerror(exc):
+        raise exc
+    for base, dirnames, filenames in os.walk(root, onerror=onerror):
+        dirnames[:] = sorted(
+            d for d in dirnames
+            if d not in SKIP_DIRS and not d.endswith(SKIP_DIR_SUFFIXES)
+            and not any(_within(os.path.join(base, d), skip) for skip in exclude_roots)
+        )
+        for name in dirnames:
+            path = os.path.join(base, name)
+            if os.path.islink(path):
+                raise ValueError(f"Conversion directory contains a symlink: {path}")
+        yield base, dirnames, filenames
+
+
+def _iter_plan_files(root, exclude_roots=()):
+    for base, _, filenames in _walk_tree(root, exclude_roots):
+        for name in sorted(filenames):
+            path = os.path.join(base, name)
+            if _is_target(path):
+                yield path
+
+
+def _plan_strict_renames(root, exclude_roots=()):
+    renames = []
+    for base, dirnames, filenames in _walk_tree(root, exclude_roots):
+        for name in filenames:
+            path = os.path.join(base, name)
+            converted = _convert_name(name)
+            if _is_target(path) and converted != name:
+                renames.append((path, os.path.join(base, converted)))
+        for name in dirnames:
+            converted = _convert_name(name)
+            if converted != name:
+                renames.append((os.path.join(base, name), os.path.join(base, converted)))
+    return renames
+
+
+def _validate_rename_destinations(renames):
+    """Reject destinations reserved by distinct sources before any writes."""
+    destinations = {}
+    for old, new in renames:
+        old, new = os.path.abspath(old), os.path.abspath(new)
+        previous = destinations.setdefault(new, old)
+        if previous != old:
+            raise ValueError(f"Duplicate rename destination: {previous}, {old} -> {new}")
+
+
+class ConversionPlan:
+    """Shared SDK/library virtual tree; planning never writes to disk."""
+
+    def __init__(self):
+        self.files = {}
+        self.sources = {}
+        self.originals = {}
+        self.renames = []
+        self.diagnostics = []
+        self.scanned = 0
+
+    def merge(self, other):
+        renames = self.renames + [pair for pair in other.renames if pair not in self.renames]
+        _validate_rename_destinations(renames)
+        for path, text in other.files.items():
+            if path in self.files and (self.files[path] != text
+                                       or self.sources[path] != other.sources[path]):
+                raise ValueError(f"Conversion plan path conflict: {path}")
+            self.files[path] = text
+            self.sources[path] = other.sources[path]
+        self.originals.update(other.originals)
+        self.renames = renames
+        self.scanned = len(self.originals)
+        self.diagnostics.extend(other.diagnostics)
+        return self
+
+    def _physical_path(self, path):
+        # Check physical occupancy before a containing directory is renamed.
+        for old, new in sorted(self.renames, key=lambda pair: pair[0].count(os.sep)):
+            if os.path.isdir(old) and _within(path, new):
+                path = os.path.join(old, os.path.relpath(path, new))
+        return path
+
+    def _check_generated_path(self, path):
+        physical = self._physical_path(path)
+        if os.path.realpath(physical) != physical:
+            raise ValueError(f"Generated path contains a symlink: {path}")
+        if os.path.lexists(physical):
+            raise ValueError(f"Generated path is occupied by a file or directory: {path}")
+        parent = os.path.dirname(physical)
+        while not os.path.lexists(parent):
+            parent = os.path.dirname(parent)
+        if not os.path.isdir(parent):
+            raise ValueError(f"Generated path parent is not a directory: {path}")
+
+    def add_file(self, path, text):
+        path = os.path.abspath(path)
+        if path in self.files:
+            if self.files[path] != text:
+                raise ValueError(f"Generated rule path conflict: {path}")
+            return
+        self._check_generated_path(path)
+        if any(_within(path, existing) or _within(existing, path) for existing in self.files):
+            raise ValueError(f"Generated path conflicts with the virtual file hierarchy: {path}")
+        self.files[path] = text
+        self.sources[path] = None
+
+    def changed_paths(self):
+        return [path for path, text in self.files.items()
+                if self.sources[path] is None
+                or text != self.originals[self.sources[path]]]
+
+    def apply(self, dry_run=False, verbose=False):
+        _validate_rename_destinations(self.renames)
+        changed = self.changed_paths()
+        if verbose or dry_run:
+            for path in changed:
+                print(f"  [plan] {'generate' if self.sources[path] is None else 'modify'}: {path}")
+            for old, new in self.renames:
+                print(f"  [plan] rename: {old} -> {new}")
+        for note in self.diagnostics:
+            print(f"  [compat] {note}")
+        if dry_run:
+            return self.scanned, len(changed), len(self.renames), changed
+        # Verify source files have not changed before the first write.
+        for source, original in self.originals.items():
+            if os.path.realpath(source) != source:
+                raise ValueError(f"Conversion file contains a symlink: {source}")
+            if _read(source) != original:
+                raise ValueError(f"Source file changed after planning: {source}")
+        for old, new in self.renames:
+            if os.path.lexists(new):
+                raise ValueError(f"Rename target conflict: {old} -> {new}")
+        for path in changed:
+            if self.sources[path] is None:
+                self._check_generated_path(path)
+        for path in changed:
+            source = self.sources[path]
+            if source is not None:
+                _write(source, self.files[path])
+        for old, new in sorted(self.renames, key=lambda pair: -pair[0].count(os.sep)):
+            os.rename(old, new)
+        for path in changed:
+            if self.sources[path] is None:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                _write(path, self.files[path])
+        return self.scanned, len(changed), len(self.renames), changed
+
+
+def _within(path, root):
+    return os.path.commonpath([os.path.abspath(path), os.path.abspath(root)]) == os.path.abspath(root)
+
+
+def plan_path(target, exclude_roots=()):
+    """Build a strict, read-only SDK plan for opt-in library processing."""
+    target = os.path.abspath(target)
+    if not os.path.exists(target):
+        raise ValueError(f"Conversion target does not exist: {target}")
+    excluded = [os.path.abspath(root) for root in exclude_roots]
+    plan = ConversionPlan()
+    roots = [target] + (_extra_roots(target) if os.path.isdir(target) else [])
+    for root in roots:
+        if os.path.realpath(root) != root:
+            raise ValueError(f"Conversion root contains a symlink: {root}")
+        paths = [root] if os.path.isfile(root) else _iter_plan_files(root, excluded)
+        for source in paths:
+            if any(_within(source, skip) for skip in excluded):
+                continue
+            if os.path.realpath(source) != source:
+                raise ValueError(f"Conversion file contains a symlink: {source}")
+            relative = os.path.relpath(source, root)
+            final = source if os.path.isfile(root) else os.path.join(
+                root, *[_convert_name(part) for part in relative.split(os.sep)])
+            if final in plan.files:
+                raise ValueError(f"Multiple source files map to the same path: {final}")
+            original = _read(source)
+            plan.files[final] = convert_text(original)
+            plan.sources[final] = source
+            plan.originals[source] = original
+        if os.path.isdir(root):
+            for old, new in _plan_strict_renames(root, excluded):
+                if any(_within(old, skip) for skip in excluded):
+                    continue
+                if os.path.lexists(new):
+                    raise ValueError(f"Rename target already exists: {old} -> {new}")
+                plan.renames.append((old, new))
+    _validate_rename_destinations(plan.renames)
+    plan.scanned = len(plan.originals)
+    return plan
