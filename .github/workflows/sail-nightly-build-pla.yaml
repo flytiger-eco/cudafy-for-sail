@@ -1,6 +1,6 @@
 name: sail nightly build pla
 
-# Convert with cudafy, build the wheel, then publish it to a temporary directory.
+# Convert with cudafy, build the wheel, then publish it to the nightly directory.
 # Build only: no tests are run.
 # PLA source defaults to the latest master; target_ref selects a PR URL,
 # a branch name, a release tag (x.y.z+va.b.c) or a commit id instead.
@@ -8,6 +8,9 @@ name: sail nightly build pla
 on:
   schedule:
     - cron: '0 13 * * *'  # Daily at 21:00 Asia/Shanghai (UTC+8)
+  push:
+    branches:
+      - fangjie-fj-patch-1
   workflow_call:
     inputs:
       matrix:
@@ -25,6 +28,11 @@ on:
         required: false
         type: string
         default: ''
+      upload_repository:
+        description: Artifactory upload path repository in owner/repository format.
+        required: false
+        type: string
+        default: flytiger-eco/pla
     secrets:
       RELEASE_USERNAME:
         required: true
@@ -49,17 +57,23 @@ on:
         required: false
         type: string
         default: ''
+      upload_repository:
+        description: Artifactory upload path repository in owner/repository format.
+        required: false
+        type: string
+        default: flytiger-eco/pla
 
 permissions:
   contents: read
+  actions: write
 
 # Runs for different targets must not cancel each other.
 concurrency:
-  group: cudafy-pla-upload-tmp-${{ inputs.target_ref || 'master' }}-${{ github.event.pull_request.number || github.ref }}
+  group: cudafy-pla-upload-${{ inputs.target_ref || 'master' }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
-  # Schedule runs carry no inputs, so the pinned default below still applies.
+  # Schedule and push runs carry no inputs, so the pinned defaults below still apply.
   SAIL_IMAGE: ${{ inputs.sail_image || 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-eic-20261010' }}
 
 jobs:
@@ -77,7 +91,7 @@ jobs:
         runner: ${{ fromJson(inputs.matrix || '["ZW-M890P"]') }}
     # Cancel per leg; the workflow-level group cannot distinguish matrix legs.
     concurrency:
-      group: cudafy-pla-upload-tmp-${{ matrix.runner }}-${{ inputs.target_ref || 'master' }}-${{ github.event.pull_request.number || github.ref }}
+      group: cudafy-pla-upload-${{ matrix.runner }}-${{ inputs.target_ref || 'master' }}-${{ github.event.pull_request.number || github.ref }}
       cancel-in-progress: true
     steps:
       - name: Checkout cudafy
@@ -307,36 +321,35 @@ jobs:
           compression-level: 0
           delete-merged: false
 
-  push:
-    name: Call temporary wheel upload template
+  publish:
+    name: Publish wheel artifacts
     needs: merge
-    uses: flytiger-eco/shared-workflows/.github/workflows/push-tmp-wheel.yml@main
+    uses: flytiger-eco/shared-workflows/.github/workflows/upload-artifact-properties.yml@main
     with:
-      # run_attempt moves when only the publishing job is rerun.
       artifact_name: ${{ needs.merge.outputs.artifact_name }}
-      repo: ${{ needs.merge.outputs.repo }}
-      commit: ${{ needs.merge.outputs.commit }}
-      branch: ${{ needs.merge.outputs.branch }}
-      tag: ${{ needs.merge.outputs.tag }}
-      extra_info: ${{ needs.merge.outputs.extra_info }}
+      package_type: wheel
+      package_name: pla
+      package_version: nightly
+      version: ${{ needs.merge.outputs.commit }}
+      upload_repository: ${{ inputs.upload_repository || 'flytiger-eco/pla' }}
+      extra_info: ${{ needs.merge.outputs.extra_info }};source_repo=${{ needs.merge.outputs.repo }};source_commit=${{ needs.merge.outputs.commit }};source_branch=${{ needs.merge.outputs.branch }};source_tag=${{ needs.merge.outputs.tag }}
       template_repository: flytiger-eco/shared-workflows
       template_ref: main
     secrets:
       release_username: ${{ secrets.RELEASE_USERNAME }}
       release_token: ${{ secrets.RELEASE_TOKEN }}
-      # Read-only token; also enable cross-repo access in the template repo.
       template_token: ${{ secrets.TEMPLATE_TOKEN }}
 
   result:
-    name: Show batch directory URL
-    needs: push
+    name: Show upload directory URL
+    needs: publish
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Write to logs and job summary
+      - name: Write upload directory URL to logs and job summary
         shell: bash
         env:
-          UPLOAD_URL: ${{ needs.push.outputs.upload_url }}
+          UPLOAD_URL: ${{ needs.publish.outputs.batch_url }}
         run: |
           set -euo pipefail
-          printf 'Batch directory: %s\n' "$UPLOAD_URL" | tee -a "$GITHUB_STEP_SUMMARY"
+          printf 'Upload directory: %s\n' "$UPLOAD_URL" | tee -a "$GITHUB_STEP_SUMMARY"
