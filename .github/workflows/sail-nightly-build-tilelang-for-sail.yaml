@@ -1,0 +1,209 @@
+name: sail nightly build tilelang-for-sail
+
+on:
+  push:
+    branches:
+      - 'ci/add_deep_gemm_nightly'
+  schedule:
+    # Daily at 12:00 UTC (20:00 Beijing time).
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+    inputs:
+      package_name:
+        description: 'Name of the package to build and upload'
+        required: false
+        type: string
+        default: tilelang
+      framework:
+        description: 'Name of the dependent framework'
+        required: false
+        type: string
+        default: torch
+      python_versions:
+        description: 'JSON array; allowed values: 38, 310, 312'
+        required: false
+        type: string
+        default: '["312"]'
+      os_versions:
+        description: 'JSON array; allowed values: ubuntu2004, ubuntu2204, ubuntu2404, alios7u2'
+        required: false
+        type: string
+        default: '["ubuntu2404"]'
+      runtime_versions:
+        description: 'JSON array; allowed CUDA versions: 12.6.0, 12.8.0, 12.9.0, 13.0.0, 13.2.0'
+        required: false
+        type: string
+        default: '["13.0.0"]'
+      torch_versions:
+        description: 'JSON array; allowed values: 2.6.0, 2.7.0, 2.8.0, 2.9.0, 2.10.0, 2.11.0, 2.13.0'
+        required: false
+        type: string
+        default: '["2.13.0"]'
+      sdk_versions:
+        description: 'JSON array; allowed values: 2.1.1, 2.2.0, 2.2.1'
+        required: false
+        type: string
+        default: '["2.2.0"]'
+      branch:
+        description: 'cudafy repository branch, tag, or full commit SHA; leave empty to use the commit that triggered the workflow'
+        required: false
+        type: string
+        default: ''
+      target_ref:
+        description: 'tilelang-for-sail PR URL, branch, release tag, or commit; leave empty to use the latest main'
+        required: false
+        type: string
+        default: ' v0.1.12'
+      package_version:
+        description: 'Artifactory package version and automatic upload directory prefix; does not override the wheel version generated from source'
+        required: false
+        type: string
+        default: '0.1.12'
+      package_edition:
+        description: 'Artifactory package edition'
+        required: false
+        type: string
+        default: oe
+      package_type:
+        description: 'Artifactory package type'
+        required: false
+        type: string
+        default: pypi
+      runs_on:
+        description: 'CPU runner for all jobs; accepts a single label or a JSON array of labels'
+        required: false
+        type: string
+        default: x86-ubuntu2404-8-32
+      build_command:
+        description: 'Custom Bash build command; leave empty to use the default; only trusted configuration is accepted; TILELANG_FOR_SAIL_COMMIT is the resolved source SHA'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: nightly-build-tilelang-for-sail-${{ inputs.branch || github.ref }}-${{ inputs.target_ref || 'v0.1.12' }}
+  cancel-in-progress: true
+
+jobs:
+  source:
+    name: Resolve tilelang-for-sail source
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on || 'x86-ubuntu2404-8-32' }}
+    timeout-minutes: 15
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      source_properties: ${{ steps.source.outputs.source_properties }}
+    steps:
+      - name: Resolve tilelang-for-sail target
+        id: target
+        shell: bash
+        env:
+          # Pass raw input through the environment instead of interpolating it into Bash.
+          TARGET_REF_INPUT: ${{ inputs.target_ref }}
+        run: |
+          set -euo pipefail
+          raw="${TARGET_REF_INPUT//[[:space:]]/}"
+          raw="${raw%%[?#]*}"
+          ref=refs/heads/main
+          if [[ -n "$raw" ]]; then
+            if [[ "$raw" =~ ^https://github\.com/t-head/tilelang-for-sail/pull/([0-9]+)(/.*)?$ ]]; then
+              ref="refs/pull/${BASH_REMATCH[1]}/head"
+            elif [[ "$raw" =~ ^[A-Za-z0-9][A-Za-z0-9._/@:+-]*$ ]] && [[ "$raw" != *'/pull/'* ]]; then
+              if [[ "$raw" =~ ^[0-9]+$ ]] && [[ ${#raw} -ne 40 ]]; then
+                echo '::error::Bare PR numbers are not supported; use a tilelang-for-sail PR URL, branch, tag, or commit'
+                exit 1
+              fi
+              ref="$raw"
+            else
+              echo '::error::target_ref must be a tilelang-for-sail PR URL, branch, tag, or commit'
+              exit 1
+            fi
+          fi
+          printf 'ref=%s\n' "$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout tilelang-for-sail source
+        uses: actions/checkout@v4
+        with:
+          repository: t-head/tilelang-for-sail
+          ref: ${{ steps.target.outputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record tilelang-for-sail source properties
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit="$(git rev-parse --verify 'HEAD^{commit}')"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          # Detached PR/tag/commit checkouts have no branch; leave the branch property empty.
+          branch="$(git symbolic-ref --quiet --short HEAD || true)"
+          tag="$(git tag --points-at HEAD | paste -sd ',' -)"
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+          export TILELANG_FOR_SAIL_SOURCE_BRANCH="$branch"
+          export TILELANG_FOR_SAIL_SOURCE_COMMIT="$commit"
+          export TILELANG_FOR_SAIL_SOURCE_TAG="$tag"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+
+          properties = {
+              key: os.environ[f"TILELANG_FOR_SAIL_SOURCE_{key.upper()}"]
+              for key in ("branch", "commit", "tag")
+          }
+          print("source_properties=" + json.dumps(properties, separators=(",", ":")))
+          PY
+          printf 'TILELANG_FOR_SAIL branch: %s\nTILELANG_FOR_SAIL commit: %s\nTILELANG_FOR_SAIL tag: %s\n' \
+            "$branch" "$commit" "$tag" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build and upload tilelang-for-sail wheel
+    needs: source
+    uses: flytiger-eco/shared-workflows/.github/workflows/nightly-build.yml@main
+    secrets:
+      template_token: ${{ secrets.TEMPLATE_TOKEN }}
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+    with:
+      # Scheduled and push runs have no inputs; use the same defaults as manual runs.
+      package_name: ${{ inputs.package_name || 'tilelang' }}
+      framework: ${{ inputs.framework || 'torch' }}
+      template_repository: flytiger-eco/shared-workflows
+      template_ref: main
+      upload_repository: flytiger-eco/tilelang-for-sail
+      source_properties: ${{ needs.source.outputs.source_properties }}
+      runs_on: ${{ inputs.runs_on || 'x86-ubuntu2404-8-32' }}
+      python_versions: ${{ inputs.python_versions || '["312"]' }}
+      os_versions: ${{ inputs.os_versions || '["ubuntu2404"]' }}
+      runtime_versions: ${{ inputs.runtime_versions || '["13.0.0"]' }}
+      torch_versions: ${{ inputs.torch_versions || '["2.13.0"]' }}
+      sdk_versions: ${{ inputs.sdk_versions || '["2.2.0"]' }}
+      branch: ${{ inputs.branch || '' }}
+      package_version: ${{ inputs.package_version || '0.1.12' }}
+      package_edition: ${{ inputs.package_edition || 'oe' }}
+      package_type: ${{ inputs.package_type || 'pypi' }}
+      build_command: |
+        export TILELANG_FOR_SAIL_COMMIT='${{ needs.source.outputs.commit }}'
+        ${{ inputs.build_command || 'set -ex
+        apt update
+        apt install lld -y
+        unset PIP_INDEX_URL
+        CUDAFY_ROOT="$PWD"
+        TARGET_ROOT="$CUDAFY_ROOT/tilelang-for-sail-source"
+        git clone https://github.com/t-head/tilelang-for-sail.git "$TARGET_ROOT"
+        cd "$TARGET_ROOT"
+        if ! git cat-file -e "${TILELANG_FOR_SAIL_COMMIT}^{commit}"; then
+          git fetch --no-tags origin "$TILELANG_FOR_SAIL_COMMIT"
+        fi
+        git checkout --detach "$TILELANG_FOR_SAIL_COMMIT"
+        git submodule sync --recursive
+        git submodule update --init --recursive
+
+        source /usr/local/PPU_SDK/envsetup.sh || true
+        pip install wheel build setuptools cython packaging setuptools==68.1.2
+        export NO_VERSION_LABEL=OFF
+        python -m build --wheel
+        ls -lh ./dist/*.whl' }}
