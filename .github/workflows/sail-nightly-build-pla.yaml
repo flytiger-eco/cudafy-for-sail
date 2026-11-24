@@ -4,121 +4,138 @@ name: sail nightly build pla
 # Build only: no tests are run.
 # PLA source defaults to the latest master; target_ref selects a PR URL,
 # a branch name, a release tag (x.y.z+va.b.c) or a commit id instead.
-# Requires RELEASE_USERNAME / RELEASE_TOKEN secrets (TEMPLATE_TOKEN for private templates).
 on:
-  schedule:
-    - cron: '0 13 * * *'  # Daily at 21:00 Asia/Shanghai (UTC+8)
   push:
     branches:
-      - fangjie-fj-patch-1
-  workflow_call:
-    inputs:
-      matrix:
-        description: Board matrix as a JSON array
-        required: false
-        type: string
-        default: '["ZW-M890P"]'
-      target_ref:
-        description: PLA PR URL, branch name, release tag (x.y.z+va.b.c) or commit id. Empty uses the latest master.
-        required: false
-        type: string
-        default: ''
-      sail_image:
-        description: Container image for the build pod. Empty uses the default image pinned in env.
-        required: false
-        type: string
-        default: ''
-      upload_repository:
-        description: Artifactory upload path repository in owner/repository format.
-        required: false
-        type: string
-        default: flytiger-eco/pla
-    secrets:
-      RELEASE_USERNAME:
-        required: true
-      RELEASE_TOKEN:
-        required: true
-      TEMPLATE_TOKEN:
-        required: false
+      - 'fangjie-fj-patch-1'
+  schedule:
+    # Daily at 12:00 UTC (20:00 Beijing time).
+    - cron: '0 12 * * *'
   workflow_dispatch:
     inputs:
-      matrix:
-        description: Board matrix as a JSON array
+      package_name:
+        description: 'Name of the package to build and upload'
         required: false
         type: string
-        default: '["ZW-M890P"]'
+        default: pla
+      framework:
+        description: 'Name of the dependent framework'
+        required: false
+        type: string
+        default: torch
+      python_versions:
+        description: 'JSON array; allowed values: 38, 310, 312'
+        required: false
+        type: string
+        default: '["312"]'
+      os_versions:
+        description: 'JSON array; allowed values: ubuntu2004, ubuntu2204, ubuntu2404, alios7u2'
+        required: false
+        type: string
+        default: '["ubuntu2404"]'
+      runtime_versions:
+        description: 'JSON array; allowed CUDA versions: 12.6.0, 12.8.0, 12.9.0, 13.0.0, 13.2.0'
+        required: false
+        type: string
+        default: '["13.0.0"]'
+      torch_versions:
+        description: 'JSON array; allowed values: 2.6.0, 2.7.0, 2.8.0, 2.9.0, 2.10.0, 2.11.0, 2.13.0'
+        required: false
+        type: string
+        default: '["2.13.0"]'
+      sdk_versions:
+        description: 'JSON array; allowed values: 2.1.1, 2.2.0, 2.2.1'
+        required: false
+        type: string
+        default: '["2.2.0"]'
+      branch:
+        description: 'cudafy repository branch, tag, or full commit SHA; leave empty to use the commit that triggered the workflow'
+        required: false
+        type: string
+        default: ''
       target_ref:
-        description: PLA PR URL, branch name, release tag (x.y.z+va.b.c) or commit id. Empty uses the latest master.
+        description: 'pla source branch to clone and build; defaults to master'
         required: false
         type: string
-        default: ''
-      sail_image:
-        description: Container image for the build pod. Empty uses the default image pinned in env.
+        default: master
+      package_version:
+        description: 'Artifactory package version and automatic upload directory prefix; does not override the wheel version generated from source'
         required: false
         type: string
-        default: ''
+        default: 'nightly'
+      package_edition:
+        description: 'Artifactory package edition'
+        required: false
+        type: string
+        default: oe
+      package_type:
+        description: 'Artifactory package type'
+        required: false
+        type: string
+        default: pypi
       upload_repository:
-        description: Artifactory upload path repository in owner/repository format.
+        description: 'Artifactory upload path repository in owner/repository format'
         required: false
         type: string
-        default: flytiger-eco/pla
+        default: t-head/pla
+      runs_on:
+        description: 'CPU runner for all jobs; accepts a single label or a JSON array of labels'
+        required: false
+        type: string
+        default: x86-ubuntu2404-8-32
+      build_command:
+        description: 'Custom Bash build command; leave empty to use the default; only trusted configuration is accepted; BUILD_TARGET_BRANCH is the clone branch'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
   actions: write
 
-# Runs for different targets must not cancel each other.
 concurrency:
-  group: cudafy-pla-upload-${{ inputs.target_ref || 'master' }}-${{ github.event.pull_request.number || github.ref }}
+  group: nightly-build-pla-${{ inputs.branch || github.ref }}-${{ inputs.build_target_branch || 'master' }}-${{ inputs.target_ref || '' }}
   cancel-in-progress: true
 
-env:
-  # Schedule and push runs carry no inputs, so the pinned defaults below still apply.
-  SAIL_IMAGE: ${{ inputs.sail_image || 'pkg.flytiger-eco.com/docker_release/pytorch:sdk2.2.0-2.13.0-ubuntu24.04-cuda13.0-py312-eic-20261010' }}
-
 jobs:
-  build:
-    name: build (${{ matrix.runner }})
-    runs-on: k8s-runner-group-cpu-flytiger
-    container:
-      image: ghcr.io/actions/actions-runner:latest
-    timeout-minutes: 360
+  source:
+    name: Resolve PLA source
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on || 'x86-ubuntu2404-8-32' }}
+    timeout-minutes: 15
     outputs:
-      source_artifact_name: pla-source-${{ github.run_id }}-${{ github.run_attempt }}
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: ${{ fromJson(inputs.matrix || '["ZW-M890P"]') }}
-    # Cancel per leg; the workflow-level group cannot distinguish matrix legs.
-    concurrency:
-      group: cudafy-pla-upload-${{ matrix.runner }}-${{ inputs.target_ref || 'master' }}-${{ github.event.pull_request.number || github.ref }}
-      cancel-in-progress: true
+      kind: ${{ steps.target.outputs.kind }}
+      ref: ${{ steps.target.outputs.ref }}
+      checkout_ref: ${{ steps.target.outputs.checkout_ref }}
+      commit: ${{ steps.source.outputs.commit }}
+      build_target_branch: ${{ steps.target.outputs.build_target_branch }}
+      source_properties: ${{ steps.source.outputs.source_properties }}
     steps:
-      - name: Checkout cudafy
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
       - name: Resolve PLA target
         id: target
         shell: bash
         env:
           # Passed through env so the raw input never lands in the script text.
           TARGET_REF_INPUT: ${{ inputs.target_ref }}
+          BUILD_TARGET_BRANCH_INPUT: ${{ inputs.build_target_branch || 'master' }}
         run: |
           set -euo pipefail
+          build_target_branch="$BUILD_TARGET_BRANCH_INPUT"
+          if [[ ! "$build_target_branch" =~ ^[A-Za-z0-9][A-Za-z0-9._/@+-]*$ ]] || ! git check-ref-format --branch "$build_target_branch" > /dev/null; then
+            echo '::error::build_target_branch must be a valid branch name using letters, digits, dots, underscores, slashes, @, +, or -'
+            exit 1
+          fi
           # Accepted forms: PR URL / branch name / release tag / commit id. Bare
           # PR numbers are rejected because they read like commit ids.
           raw="${TARGET_REF_INPUT//[[:space:]]/}"
           kind=default
           # PLA's default branch is master, not main.
-          ref=master
+          ref="$build_target_branch"
+          checkout_ref="refs/heads/$build_target_branch"
           if [[ -n "$raw" ]]; then
             # Drop a pasted ?query/#fragment before validating.
             raw="${raw%%[?#]*}"
             # Reject anything that is not a plausible ref (also guards the later
-            # interpolation of these outputs into the pod command).
+            # interpolation of these outputs into the build command).
             if [[ ! "$raw" =~ ^[A-Za-z0-9][A-Za-z0-9._/@:+-]*$ ]]; then
               echo "::error::Unsupported target_ref '$TARGET_REF_INPUT': expected a PR URL, branch name, release tag or commit id"
               exit 1
@@ -131,25 +148,28 @@ jobs:
                 [[ "$num" =~ ^[0-9]+$ ]] || { echo "::error::Cannot read a PR number from '$raw'"; exit 1; }
                 kind=pr
                 ref="$num"
+                checkout_ref="refs/pull/${num}/head"
                 ;;
               *)
                 if [[ "$raw" =~ ^[0-9]+\.[0-9]+\.[0-9]+\+v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
                   # Release tag such as 2.8.2+v2.1.0: never a branch or a commit id.
                   kind=tag
                   ref="$raw"
+                  checkout_ref="$raw"
                 elif [[ "$raw" =~ ^[0-9]+$ ]] && [[ ${#raw} -ne 40 ]]; then
                   echo "::error::Bare PR numbers are not supported: pass the PR URL, a branch name, a release tag or a commit id (got '$raw')"
                   exit 1
                 else
-                  # Branch name or commit id: decided later against the cloned repo.
+                  # Branch name or commit id: decided by git when checking out.
                   kind=ref
                   ref="$raw"
+                  checkout_ref="$raw"
                 fi
                 ;;
             esac
           fi
           case "$kind" in
-            default) display='master (latest)' ;;
+            default) display="$build_target_branch (latest)" ;;
             pr) display="PR #$ref" ;;
             tag) display="tag $ref" ;;
             *) display="$ref" ;;
@@ -157,199 +177,136 @@ jobs:
           {
             echo "kind=$kind"
             echo "ref=$ref"
-            echo "display=$display"
+            echo "checkout_ref=$checkout_ref"
+            echo "build_target_branch=$build_target_branch"
           } >> "$GITHUB_OUTPUT"
           echo "PLA target: $display" | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Convert and build PLA
-        id: ppu-build
-        uses: flytiger-eco/shared-workflows/cluster-task@main
+      - name: Checkout PLA source
+        uses: actions/checkout@v4
         with:
-          image: ${{ env.SAIL_IMAGE }}
-          nnodes: 0
-          nproc_per_node: 1
-          node_selector: board-type=${{ matrix.runner }}
-          namespace: ppu-sched
-          timeout_minutes: 360
-          command: |
-            set -ex
-            unset PIP_INDEX_URL PYTHONPATH PLA_BUILD_NAMESPACE PPU_ACTLIZE_DIR
-            # The image rewrites github.com to an unreachable gerrit mirror.
-            for key in $(git config --global --name-only --get-regexp '^url\.'); do
-              git config --global --unset-all "$key"
-            done
-            git config --global --add safe.directory '*'
+          repository: t-head/pla
+          ref: ${{ steps.target.outputs.checkout_ref }}
+          fetch-depth: 0
+          persist-credentials: false
 
-            CUDAFY_ROOT=/workspace/source
-            TARGET_ROOT=/workspace/target
-            # --recurse-submodules pulls 3rdparty/actlize: setup.py builds against
-            # the pinned submodule and aborts if the headers are missing.
-            git clone --recurse-submodules -b master  https://github.com/t-head/pla.git "$TARGET_ROOT"
-            # Default target is the latest master (just cloned). Any other target is
-            # checked out on top of it, before the conversion runs.
-            TARGET_KIND='${{ steps.target.outputs.kind }}'
-            TARGET_REF='${{ steps.target.outputs.ref }}'
-            if [[ "$TARGET_KIND" != default ]]; then
-              cd "$TARGET_ROOT"
-              if [[ "$TARGET_KIND" == pr ]]; then
-                # PR head from any fork, matching what the PR's own checks build.
-                git fetch --no-tags origin \
-                  "+refs/pull/${TARGET_REF}/head:refs/remotes/origin/pr/${TARGET_REF}"
-                TARGET_COMMIT="$(git rev-parse --verify "refs/remotes/origin/pr/${TARGET_REF}^{commit}")"
-              elif [[ "$TARGET_KIND" == tag ]]; then
-                # Tags come with the clone; fetch the ref explicitly when missing.
-                TARGET_COMMIT="$(git rev-parse --verify --quiet "refs/tags/${TARGET_REF}^{commit}")" || {
-                  git fetch --no-tags origin "refs/tags/${TARGET_REF}:refs/tags/${TARGET_REF}" || {
-                    echo "::error::Tag ${TARGET_REF} not found in pla repository"
-                    exit 1
-                  }
-                  TARGET_COMMIT="$(git rev-parse --verify "refs/tags/${TARGET_REF}^{commit}")"
-                }
-              elif git rev-parse --verify --quiet "refs/remotes/origin/${TARGET_REF}^{commit}" > /dev/null; then
-                TARGET_COMMIT="$(git rev-parse --verify "refs/remotes/origin/${TARGET_REF}^{commit}")"
-              else
-                # Not a branch tip: treat it as a commit id, from the clone or fetched directly.
-                TARGET_COMMIT="$(git rev-parse --verify --quiet "${TARGET_REF}^{commit}")" || {
-                  git fetch --no-tags origin "$TARGET_REF"
-                  TARGET_COMMIT="$(git rev-parse --verify "FETCH_HEAD^{commit}")"
-                }
-              fi
-              git checkout --detach "$TARGET_COMMIT"
-              # Submodules must follow the checked-out tree, not master.
-              git submodule sync --recursive
-              git submodule update --init --recursive
-              echo "PLA target resolved: ${TARGET_KIND} ${TARGET_REF} -> ${TARGET_COMMIT}"
-            fi
-
-            # Record the actual source before conversion, using the matrix leg that uploads the wheel.
-            SOURCE_COMMIT="$(git -C "$TARGET_ROOT" rev-parse HEAD)"
-            SOURCE_BRANCH="$(git -C "$TARGET_ROOT" symbolic-ref --quiet --short HEAD || true)"
-            if [[ "$TARGET_KIND" == ref ]] && [[ "$(git -C "$TARGET_ROOT" rev-parse --verify --quiet "refs/remotes/origin/${TARGET_REF}^{commit}" || true)" == "$SOURCE_COMMIT" ]]; then
-              SOURCE_BRANCH="$TARGET_REF"
-            fi
-            SOURCE_METADATA_DIR="/mnt/wl_nas/devops/cudafy-ci/pla/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
-            mkdir -p "$SOURCE_METADATA_DIR"
-            {
-              printf 'repo=t-head/pla\n'
-              printf 'commit=%s\n' "$SOURCE_COMMIT"
-              printf 'branch=%s\n' "$SOURCE_BRANCH"
-              printf 'tag=%s\n' "$(git -C "$TARGET_ROOT" tag --points-at HEAD | paste -sd ',' -)"
-              printf 'extra_info=cudafy=%s@%s;image=%s;build_tool=setup.py\n' \
-                '${{ github.repository }}' "$(git -C "$CUDAFY_ROOT" rev-parse HEAD)" "$SAIL_IMAGE"
-            } > "$SOURCE_METADATA_DIR/source-metadata.txt"
-
-            python3 "$CUDAFY_ROOT/cudafy.py" general "$TARGET_ROOT"
-            cd "$TARGET_ROOT"
-
-            source /usr/local/PPU_SDK/envsetup.sh
-            export PPU_SDK_DIR=/usr/local/PPU_SDK
-            "$PPU_SDK_DIR/bin/hgcc" --version
-            python -m pip install setuptools==69.5.1 setuptools-scm==9.2.2 \
-              packaging==24.2 wheel==0.45.1 pybind11==2.13.6 ninja==1.11.1.4 \
-              numpy==1.26.4 pandas==2.2.3 einops==0.8.1
-            export TORCH_CUDA_ARCH_LIST='8.0'
-            export MAX_JOBS=16
-            export NVCC_THREADS=2
-            python setup.py bdist_wheel
-
-            NAS_RESULT_DIR="/mnt/wl_nas/devops/cudafy-ci/pla/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}"
-            mkdir -p "$NAS_RESULT_DIR/wheels"
-            cp dist/*.whl "$NAS_RESULT_DIR/wheels/"
-          cleanup_policy: on_success
-
-      - name: Upload build source metadata
-        if: ${{ strategy.job-index == 0 }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: pla-source-${{ github.run_id }}-${{ github.run_attempt }}
-          path: /wl_nas/devops/cudafy-ci/pla/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/source-metadata.txt
-          if-no-files-found: error
-          overwrite: true
-
-      - name: Upload wheel artifact (${{ matrix.runner }})
-        # Only the first leg uploads: wheels are board independent. !cancelled()
-        # keeps the artifact available even when the build failed.
-        if: ${{ !cancelled() && strategy.job-index == 0 }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: pla-wheel-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.runner }}
-          path: /wl_nas/devops/cudafy-ci/pla/${{ github.run_id }}/${{ github.run_attempt }}/${{ matrix.runner }}/wheels/*.whl
-          if-no-files-found: error
-          compression-level: 0
-          overwrite: true
-
-  merge:
-    name: Merge board wheel artifacts
-    # Every board must build successfully.
-    needs: build
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    outputs:
-      artifact_name: ${{ steps.artifact-name.outputs.artifact_name }}
-      repo: ${{ steps.source.outputs.repo }}
-      commit: ${{ steps.source.outputs.commit }}
-      branch: ${{ steps.source.outputs.branch }}
-      tag: ${{ steps.source.outputs.tag }}
-      extra_info: ${{ steps.source.outputs.extra_info }}
-    steps:
-      - name: Download build source metadata
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ needs.build.outputs.source_artifact_name }}
-          path: ${{ runner.temp }}/wheel-source
-
-      - name: Export build source parameters
+      - name: Record PLA source properties
         id: source
         shell: bash
-        env:
-          SOURCE_METADATA: ${{ runner.temp }}/wheel-source/source-metadata.txt
         run: |
           set -euo pipefail
-          grep -Eq '^commit=[0-9a-f]{40}$' "$SOURCE_METADATA"
-          cat "$SOURCE_METADATA" >> "$GITHUB_OUTPUT"
+          commit="$(git rev-parse --verify 'HEAD^{commit}')"
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          # Detached PR/tag/commit checkouts have no branch; do not report the clone branch.
+          branch="$(git symbolic-ref --quiet --short HEAD || true)"
+          tag="$(git tag --points-at HEAD | paste -sd ',' -)"
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+          export PLA_SOURCE_BRANCH="$branch"
+          export PLA_SOURCE_COMMIT="$commit"
+          export PLA_SOURCE_TAG="$tag"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
 
-      - name: Set merged artifact name
-        id: artifact-name
-        shell: bash
-        run: echo 'artifact_name=pla-wheels-${{ github.run_id }}-${{ github.run_attempt }}' >> "$GITHUB_OUTPUT"
+          properties = {
+              key: os.environ[f"PLA_SOURCE_{key.upper()}"]
+              for key in ("branch", "commit", "tag")
+          }
+          print("source_properties=" + json.dumps(properties, separators=(",", ":")))
+          PY
+          printf 'PLA branch: %s\nPLA commit: %s\nPLA tag: %s\n' \
+            "$branch" "$commit" "$tag" | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Merge wheel artifacts
-        uses: actions/upload-artifact/merge@v4
-        with:
-          name: ${{ steps.artifact-name.outputs.artifact_name }}
-          pattern: pla-wheel-${{ github.run_id }}-${{ github.run_attempt }}-*
-          compression-level: 0
-          delete-merged: false
-
-  publish:
-    name: Publish wheel artifacts
-    needs: merge
-    uses: flytiger-eco/shared-workflows/.github/workflows/upload-artifact-properties.yml@main
-    with:
-      artifact_name: ${{ needs.merge.outputs.artifact_name }}
-      package_type: wheel
-      package_name: pla
-      package_version: nightly
-      version: ${{ needs.merge.outputs.commit }}
-      upload_repository: ${{ inputs.upload_repository || 'flytiger-eco/pla' }}
-      extra_info: ${{ needs.merge.outputs.extra_info }};source_repo=${{ needs.merge.outputs.repo }};source_commit=${{ needs.merge.outputs.commit }};source_branch=${{ needs.merge.outputs.branch }};source_tag=${{ needs.merge.outputs.tag }}
-      template_repository: flytiger-eco/shared-workflows
-      template_ref: main
+  build:
+    name: Build and upload PLA wheel
+    needs: source
+    uses: flytiger-eco/shared-workflows/.github/workflows/nightly-build.yml@main
     secrets:
+      template_token: ${{ secrets.TEMPLATE_TOKEN }}
       release_username: ${{ secrets.RELEASE_USERNAME }}
       release_token: ${{ secrets.RELEASE_TOKEN }}
-      template_token: ${{ secrets.TEMPLATE_TOKEN }}
+    with:
+      # Scheduled and push runs have no inputs; use the same defaults as manual runs.
+      package_name: ${{ inputs.package_name || 'pla' }}
+      framework: ${{ inputs.framework || 'torch' }}
+      template_repository: flytiger-eco/shared-workflows
+      template_ref: main
+      upload_repository: flytiger-eco/pla
+      source_properties: ${{ needs.source.outputs.source_properties }}
+      runs_on: ${{ inputs.runs_on || 'x86-ubuntu2404-8-32' }}
+      python_versions: ${{ inputs.python_versions || '["312"]' }}
+      os_versions: ${{ inputs.os_versions || '["ubuntu2404"]' }}
+      runtime_versions: ${{ inputs.runtime_versions || '["13.0.0"]' }}
+      torch_versions: ${{ inputs.torch_versions || '["2.13.0"]' }}
+      sdk_versions: ${{ inputs.sdk_versions || '["2.2.0"]' }}
+      branch: ${{ inputs.branch || '' }}
+      package_version: ${{ inputs.package_version || 'nightly' }}
+      package_edition: ${{ inputs.package_edition || 'oe' }}
+      package_type: ${{ inputs.package_type || 'pypi' }}
+      build_command: |
+        export BUILD_TARGET_BRANCH='${{ needs.source.outputs.build_target_branch }}'
+        export PLA_TARGET_KIND='${{ needs.source.outputs.kind }}'
+        export PLA_TARGET_REF='${{ needs.source.outputs.ref }}'
+        ${{ inputs.build_command || 'set -ex
+        unset PIP_INDEX_URL PYTHONPATH PLA_BUILD_NAMESPACE PPU_ACTLIZE_DIR
+        # The image rewrites github.com to an unreachable gerrit mirror.
+        for key in $(git config --global --name-only --get-regexp "^url[.]"); do
+          git config --global --unset-all "$key"
+        done
+        git config --global --add safe.directory "*"
 
-  result:
-    name: Show upload directory URL
-    needs: publish
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Write upload directory URL to logs and job summary
-        shell: bash
-        env:
-          UPLOAD_URL: ${{ needs.publish.outputs.batch_url }}
-        run: |
-          set -euo pipefail
-          printf 'Upload directory: %s\n' "$UPLOAD_URL" | tee -a "$GITHUB_STEP_SUMMARY"
+        # The template checks out the calling repository here; clone PLA beside it.
+        CUDAFY_ROOT="$PWD"
+        TARGET_ROOT="$CUDAFY_ROOT/pla-source"
+        # --recurse-submodules pulls 3rdparty/actlize: setup.py builds against
+        # the pinned submodule and aborts if the headers are missing.
+        git clone --recurse-submodules -b "$BUILD_TARGET_BRANCH" https://github.com/t-head/pla.git "$TARGET_ROOT"
+        # Default target is the latest clone. Any other target is checked out on
+        # top of it, before the conversion runs.
+        TARGET_KIND="$PLA_TARGET_KIND"
+        TARGET_REF="$PLA_TARGET_REF"
+        if [[ "$TARGET_KIND" != default ]]; then
+          cd "$TARGET_ROOT"
+          if [[ "$TARGET_KIND" == pr ]]; then
+            # PR head from any fork, matching what the PR checks build.
+            git fetch --no-tags origin \
+              "+refs/pull/${TARGET_REF}/head:refs/remotes/origin/pr/${TARGET_REF}"
+            TARGET_COMMIT="$(git rev-parse --verify "refs/remotes/origin/pr/${TARGET_REF}^{commit}")"
+          elif [[ "$TARGET_KIND" == tag ]]; then
+            # Tags come with the clone; fetch the ref explicitly when missing.
+            TARGET_COMMIT="$(git rev-parse --verify --quiet "refs/tags/${TARGET_REF}^{commit}")" || {
+              git fetch --no-tags origin "refs/tags/${TARGET_REF}:refs/tags/${TARGET_REF}" || {
+                echo "::error::Tag ${TARGET_REF} not found in pla repository"
+                exit 1
+              }
+              TARGET_COMMIT="$(git rev-parse --verify "refs/tags/${TARGET_REF}^{commit}")"
+            }
+          elif git rev-parse --verify --quiet "refs/remotes/origin/${TARGET_REF}^{commit}" > /dev/null; then
+            TARGET_COMMIT="$(git rev-parse --verify "refs/remotes/origin/${TARGET_REF}^{commit}")"
+          else
+            # Not a branch tip: treat it as a commit id, from the clone or fetched directly.
+            TARGET_COMMIT="$(git rev-parse --verify --quiet "${TARGET_REF}^{commit}")" || {
+              git fetch --no-tags origin "$TARGET_REF"
+              TARGET_COMMIT="$(git rev-parse --verify "FETCH_HEAD^{commit}")"
+            }
+          fi
+          git checkout --detach "$TARGET_COMMIT"
+          # Submodules must follow the checked-out tree, not master.
+          git submodule sync --recursive
+          git submodule update --init --recursive
+          echo "PLA target resolved: ${TARGET_KIND} ${TARGET_REF} -> ${TARGET_COMMIT}"
+        fi
+
+        python3 "$CUDAFY_ROOT/cudafy.py" general "$TARGET_ROOT"
+        cd "$TARGET_ROOT"
+
+        source /usr/local/PPU_SDK/envsetup.sh
+        export PPU_SDK_DIR=/usr/local/PPU_SDK
+        "$PPU_SDK_DIR/bin/hgcc" --version
+        python -m pip install setuptools==69.5.1 setuptools-scm==9.2.2 \
+          packaging==24.2 wheel==0.45.1 pybind11==2.13.6 ninja==1.11.1.4 \
+          numpy==1.26.4 pandas==2.2.3 einops==0.8.1
+        export TORCH_CUDA_ARCH_LIST="8.0"
+        export MAX_JOBS=16
+        export NVCC_THREADS=2
+        python setup.py bdist_wheel' }}
