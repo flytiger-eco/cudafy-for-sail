@@ -1,0 +1,246 @@
+name: sail nightly build vllm
+
+# Build with the upstream SAIL tooling and publish only the pinned vLLM wheel.
+# No cudafy conversion or device tests are run.
+on:
+  schedule:
+    # Daily at 12:00 UTC (20:00 Beijing time).
+    - cron: '0 12 * * *'
+  workflow_dispatch:
+    inputs:
+      python_versions:
+        description: 'Python version JSON array; allowed values: 310, 312'
+        required: false
+        type: string
+        default: '["312"]'
+      os_versions:
+        description: 'OS version JSON array; allowed values: ubuntu2004, ubuntu2204, ubuntu2404, alios7u2'
+        required: false
+        type: string
+        default: '["ubuntu2404"]'
+      runtime_versions:
+        description: 'CUDA version JSON array; allowed values: 12.6.0, 12.8.0, 12.9.0, 13.0.0, 13.2.0'
+        required: false
+        type: string
+        default: '["13.0.0"]'
+      torch_versions:
+        description: 'SAIL PyTorch version JSON array; default: 2.13.0'
+        required: false
+        type: string
+        default: '["2.13.0"]'
+      sdk_versions:
+        description: 'SDK version JSON array; allowed values: 2.1.1, 2.2.0'
+        required: false
+        type: string
+        default: '["2.2.0"]'
+      branch:
+        description: 'cudafy repository branch, tag, or full SHA; leave empty to use the triggering commit'
+        required: false
+        type: string
+        default: ''
+      target_ref:
+        description: 'vllm-sail ref that pins vLLM: PR URL, refs/pull/<number>/head, branch, tag, or commit; default: main'
+        required: false
+        type: string
+        default: main
+      package_version:
+        description: 'Artifactory package version and upload directory prefix; does not override the source wheel version'
+        required: false
+        type: string
+        default: "main"
+      runs_on:
+        description: 'CPU runner label or JSON array of labels'
+        required: false
+        type: string
+        default: x86-ubuntu2404-64-256
+      build_command:
+        description: 'Trusted Bash build command; leave empty for the default; put the single vLLM wheel in the calling repository dist directory'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: nightly-build-vllm-${{ inputs.branch || github.ref }}-${{ inputs.target_ref || 'main' }}
+  cancel-in-progress: true
+
+jobs:
+  source:
+    name: Resolve vLLM commit pinned by vLLM SAIL
+    runs-on: ${{ startsWith(inputs.runs_on, '[') && fromJSON(inputs.runs_on) || inputs.runs_on || 'x86-ubuntu2404-64-256' }}
+    timeout-minutes: 15
+    outputs:
+      commit: ${{ steps.source.outputs.commit }}
+      vllm_commit: ${{ steps.source.outputs.vllm_commit }}
+      source_properties: ${{ steps.source.outputs.source_properties }}
+      extra_info: ${{ steps.source.outputs.extra_info }}
+    steps:
+      - name: Resolve vLLM SAIL target
+        id: target
+        shell: bash
+        env:
+          # Pass raw input through the environment instead of interpolating it into Bash.
+          TARGET_REF_INPUT: ${{ inputs.target_ref }}
+        run: |
+          set -euo pipefail
+          raw="${TARGET_REF_INPUT//[[:space:]]/}"
+          raw="${raw%%[?#]*}"
+          ref=refs/heads/main
+          if [[ -n "$raw" ]]; then
+            if [[ "$raw" =~ ^https://github\.com/vllm-project/vllm-sail/pull/([0-9]+)(/.*)?$ ]]; then
+              ref="refs/pull/${BASH_REMATCH[1]}/head"
+            elif [[ "$raw" =~ ^refs/pull/[0-9]+/head$ ]]; then
+              ref="$raw"
+            elif [[ "$raw" =~ ^[A-Za-z0-9][A-Za-z0-9._/@:+-]*$ ]] && [[ "$raw" != *'/pull/'* ]]; then
+              if [[ "$raw" =~ ^[0-9]+$ ]] && [[ ${#raw} -ne 40 ]]; then
+                echo '::error::Bare PR numbers are not supported; use a vllm-sail PR URL, branch, tag, or commit'
+                exit 1
+              fi
+              ref="$raw"
+            else
+              echo '::error::target_ref must be a vllm-sail PR URL, refs/pull/<number>/head, branch, tag, or commit'
+              exit 1
+            fi
+          fi
+          printf 'ref=%s\n' "$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout vLLM SAIL source for the verified pin
+        uses: actions/checkout@v4
+        with:
+          repository: vllm-project/vllm-sail
+          ref: ${{ steps.target.outputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record pinned upstream vLLM source properties
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          def git(*args, check=True):
+              return subprocess.run(
+                  ["git", *args], check=check, capture_output=True, text=True
+              ).stdout.strip()
+
+          commit = git("rev-parse", "--verify", "HEAD^{commit}")
+          vllm_commit = "".join(Path(".github/vllm-main-verified.commit").read_text().split())
+          if not all(re.fullmatch(r"[0-9a-f]{40}", sha) for sha in (commit, vllm_commit)):
+              raise SystemExit("::error::Both source commits must be full 40-character SHAs")
+          # Upstream is built from a pinned SHA; do not guess its branch or tags.
+          properties = {"branch": "", "commit": vllm_commit, "tag": ""}
+          extra_info = {
+              "build_tool": "vllm-sail/scripts/build_wheels.sh",
+              "vllm_sail_commit": commit,
+              "vllm_commit": vllm_commit,
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"commit={commit}\nvllm_commit={vllm_commit}\n")
+              for key, value in (
+                  ("source_properties", properties),
+                  ("extra_info", extra_info),
+              ):
+                  output.write(key + "=" + json.dumps(value, separators=(",", ":")) + "\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(f"vllm-sail commit: `{commit}`\n\nvllm commit: `{vllm_commit}`\n")
+          PY
+
+  build:
+    name: Build and upload pinned vLLM nightly wheel
+    needs: source
+    uses: flytiger-eco/shared-workflows/.github/workflows/nightly-build.yml@main
+    secrets:
+      template_token: ${{ secrets.TEMPLATE_TOKEN }}
+      release_username: ${{ secrets.RELEASE_USERNAME }}
+      release_token: ${{ secrets.RELEASE_TOKEN }}
+    with:
+      # Scheduled runs have no inputs; use the same defaults as manual runs.
+      package_name: vllm
+      framework: torch
+      template_repository: flytiger-eco/shared-workflows
+      template_ref: main
+      upload_repository: flytiger-eco/vllm
+      source_properties: ${{ needs.source.outputs.source_properties }}
+      extra_info: ${{ needs.source.outputs.extra_info }}
+      runs_on: ${{ inputs.runs_on || 'x86-ubuntu2404-64-256' }}
+      python_versions: ${{ inputs.python_versions || '["312"]' }}
+      os_versions: ${{ inputs.os_versions || '["ubuntu2404"]' }}
+      runtime_versions: ${{ inputs.runtime_versions || '["13.0.0"]' }}
+      torch_versions: ${{ inputs.torch_versions || '["2.13.0"]' }}
+      sdk_versions: ${{ inputs.sdk_versions || '["2.2.0"]' }}
+      branch: ${{ inputs.branch || '' }}
+      package_version: ${{ inputs.package_version || 'main' }}
+      package_edition: oe
+      package_type: pypi
+      build_command: |
+        export VLLM_SAIL_COMMIT='${{ needs.source.outputs.commit }}'
+        export EXPECTED_VLLM_COMMIT='${{ needs.source.outputs.vllm_commit }}'
+        export NIGHTLY_PACKAGE=vllm
+        ${{ inputs.build_command || 'set -euo pipefail
+        # Remove image-provided GitHub rewrites to the internal mirror.
+        for scope in system global; do
+          while IFS= read -r key; do
+            [[ -n "$key" ]] || continue
+            git config --"$scope" --unset-all "$key"
+          done < <(git config --"$scope" --name-only --get-regexp "^url[.].*[.]insteadof$" || true)
+        done
+        git config --global --add safe.directory "*"
+
+        CALLER_ROOT="$PWD"
+        # Keep the source and paired outputs outside the repository so the template finds only the selected wheel.
+        TARGET_ROOT="$(mktemp -d "$RUNNER_TEMP/vllm-source.XXXXXX")"
+        BUILD_OUTPUT="$(mktemp -d "$RUNNER_TEMP/vllm-build.XXXXXX")"
+        write_summary() {
+          status=$?
+          trap - EXIT
+          if [[ -f "$BUILD_OUTPUT/build-manifest.txt" ]]; then
+            {
+              printf "### %s build manifest\n\n" "$NIGHTLY_PACKAGE"
+              printf "\x60\x60\x60text\n"
+              cat "$BUILD_OUTPUT/build-manifest.txt"
+              printf "\x60\x60\x60\n"
+            } >> "$GITHUB_STEP_SUMMARY" || true
+          fi
+          exit "$status"
+        }
+        trap write_summary EXIT
+
+        git clone https://github.com/vllm-project/vllm-sail.git "$TARGET_ROOT"
+        cd "$TARGET_ROOT"
+        if ! git cat-file -e "${VLLM_SAIL_COMMIT}^{commit}"; then
+          git fetch --no-tags origin "$VLLM_SAIL_COMMIT"
+        fi
+        git checkout --detach "$VLLM_SAIL_COMMIT"
+        git submodule sync --recursive
+        git submodule update --init --recursive
+        actual_vllm_commit="$(tr -d "[:space:]" < .github/vllm-main-verified.commit)"
+        [[ "$actual_vllm_commit" == "$EXPECTED_VLLM_COMMIT" ]]
+
+        source /usr/local/PPU_SDK/envsetup.sh
+        export PPU_SDK=/usr/local/PPU_SDK
+        export PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+        export PIP_EXTRA_INDEX_URL=""
+        unset PYTHONPATH VLLM_SAIL_SKIP_EXT VLLM_SAIL_PREBUILT_EXT_DIR
+        export BUILD_JOBS=16
+        export PYTORCH_SAIL_ARCH="ppu_10;ppu_15"
+        export VLLM_SAIL_BUILD_IMAGE="$CONTAINER_IMAGE"
+        export VLLM_REPOSITORY=https://github.com/vllm-project/vllm.git
+        # The upstream entry point builds pinned vLLM and SAIL together; publish only vLLM here.
+        bash scripts/build_wheels.sh --output-dir "$BUILD_OUTPUT"
+        python scripts/ci/ppu_wheel_manifest.py verify "$BUILD_OUTPUT/wheels"
+
+        wheel_dir="$BUILD_OUTPUT/wheels/vllm"
+        shopt -s nullglob
+        wheels=("$wheel_dir"/*.whl)
+        [[ ${#wheels[@]} -eq 1 ]]
+        mkdir -p "$CALLER_ROOT/dist"
+        cp "${wheels[0]}" "$CALLER_ROOT/dist/"' }}
