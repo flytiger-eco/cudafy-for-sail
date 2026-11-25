@@ -42,7 +42,7 @@ on:
         description: 'JSON array; allowed values: 2.1.1, 2.2.0, 2.2.1'
         required: false
         type: string
-        default: '["2.2.0"]'
+        default: '["2.2.1"]'
       branch:
         description: 'cudafy repository branch, tag, or full commit SHA; leave empty to use the commit that triggered the workflow'
         required: false
@@ -179,7 +179,7 @@ jobs:
       os_versions: ${{ inputs.os_versions || '["ubuntu2404"]' }}
       runtime_versions: ${{ inputs.runtime_versions || '["13.0.0"]' }}
       torch_versions: ${{ inputs.torch_versions || '["2.13.0"]' }}
-      sdk_versions: ${{ inputs.sdk_versions || '["2.2.0"]' }}
+      sdk_versions: ${{ inputs.sdk_versions || '["2.2.1"]' }}
       branch: ${{ inputs.branch || '' }}
       package_version: ${{ inputs.package_version || 'master' }}
       package_edition: ${{ inputs.package_edition || 'oe' }}

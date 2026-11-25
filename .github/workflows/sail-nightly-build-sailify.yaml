@@ -42,7 +42,7 @@ on:
         description: 'JSON array; allowed values: 2.1.1, 2.2.0, 2.2.1'
         required: false
         type: string
-        default: '["2.2.0"]'
+        default: '["2.2.1"]'
       branch:
         description: 'cudafy repository branch, tag, or full commit SHA; leave empty to use the commit that triggered the workflow'
         required: false
@@ -185,7 +185,7 @@ jobs:
       runtime_versions: ${{ inputs.runtime_versions || '["13.0.0"]' }}
       # An empty torch version is the template's way of skipping the torch install.
       torch_versions: ${{ inputs.torch_versions || '[""]' }}
-      sdk_versions: ${{ inputs.sdk_versions || '["2.2.0"]' }}
+      sdk_versions: ${{ inputs.sdk_versions || '["2.2.1"]' }}
       branch: ${{ inputs.branch || '' }}
       package_version: ${{ inputs.package_version || '1.0.1' }}
       package_edition: ${{ inputs.package_edition || 'oe' }}
