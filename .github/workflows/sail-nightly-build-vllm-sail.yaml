@@ -29,7 +29,7 @@ on:
         type: string
         default: '["2.13.0"]'
       sdk_versions:
-        description: 'SDK version JSON array; allowed values: 2.1.1, 2.2.0'
+        description: 'SDK version JSON array; allowed values: 2.1.1, 2.2.0, 2.2.1'
         required: false
         type: string
         default: '["2.2.1"]'
