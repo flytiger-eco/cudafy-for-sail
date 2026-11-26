@@ -7,7 +7,8 @@ on:
         description: Board matrix as a JSON array
         required: false
         type: string
-        default: '["ZW-M890P", "OAM-810E"]'
+        # default: '["ZW-M890P", "OAM-810E"]' # skip 890P for now, NEED FIX
+        default: '["OAM-810E"]'
   workflow_dispatch:
 
 permissions:
