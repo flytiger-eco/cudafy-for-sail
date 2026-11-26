@@ -80,14 +80,20 @@ _PREFIX_OPEN += sorted(
 # mmatiestrictly`). The marker is digits + NUL only, which no pass touches.
 _PRAGMA_LINE_RE = re.compile(r"(?m)^\s*#\s*pragma\s+hggc\b[^\n]*$")
 
-# PPU-toolchain option values that must keep their original spelling: they
-# are consumed by the PPU-side nvcc wrapper, whose accepted option names are
-# hggc-spelled ('-no-hggc-embed-bc' is recognized, '-no-cuda-embed-bc' is
-# not).
+# Toolchain option values, archive names and environment variables that keep
+# their spelling. The PPU-side nvcc wrapper recognizes '-no-hggc-embed-bc',
+# not '-no-cuda-embed-bc'.
 _PROTECTED_STRINGS = [
     "--no-hggc-embed-bc",
     "-no-hggc-embed-bc",
+    "sailSHMEM_hggcrt",
+    "DEEPEP_DISABLE_HGTX",
 ]
+
+_PCCL_INSTALL_RE = re.compile(
+    r"(?:(?<=-I)|(?<=-L)|(?<![\w./-]))/usr/local/pccl/"
+    r"(?:include(?=$|[^\w.-])|lib(?=/libnccl\.so(?:$|[^\w-])))"
+)
 
 
 def _protect_pragma_lines(content: str):
@@ -123,6 +129,9 @@ def _restore_strings(content: str, stash) -> str:
 
 def _identifier_sub(match):
     token = match.group(0)
+    # PCCL extensions (pcclx/PCCLX) keep their names in the NCCL wrapper.
+    if token.startswith('pccl') and len(token) > 4 and token[4].isupper():
+        return 'nccl' + token[4:]
     sub = SDK_TOKEN_MAP.get(token)
     if sub is not None:
         return sub
@@ -144,6 +153,7 @@ def convert_text(content: str) -> str:
     content, pragma_stash = _protect_pragma_lines(content)
     content, string_stash = _protect_strings(content)
     content = apply_compile_chain(content)
+    content = re.sub(r'(?<![\w-])-lpccl(?![\w-])', '-lnccl', content)
     if _STRING_PATTERN.pattern:
         content = _STRING_PATTERN.sub(
             lambda m: _STRING_KEYS[m.group(0)], content
@@ -152,6 +162,8 @@ def convert_text(content: str) -> str:
     for old, new in _PREFIX_OPEN:
         if old in content:
             content = content.replace(old, new)
+    content = _PCCL_INSTALL_RE.sub(
+        lambda m: m.group(0).replace('/pccl/', '/pccl/nccl_wrapper/', 1), content)
     content = _restore_strings(content, string_stash)
     return _restore_pragma_lines(content, pragma_stash)
 
@@ -164,7 +176,7 @@ TEXT_EXTENSIONS = {
     ".h", ".hpp", ".cuh", ".cu", ".c", ".cpp", ".cc", ".cxx", ".inl", ".inc",
     ".py", ".sh", ".cmake", ".md", ".jinja",
 }
-TEXT_FILENAMES = {"CMakeLists.txt", "Makefile"}
+TEXT_FILENAMES = {"CMakeLists.txt", "Makefile", "tmake.build"}
 
 SKIP_DIRS = {".git", "__pycache__", "build", "dist", ".eggs", "node_modules"}
 SKIP_DIR_SUFFIXES = (".egg-info", ".dist-info")
@@ -177,15 +189,24 @@ def _is_target(filepath: str) -> bool:
     return os.path.splitext(name)[1] in TEXT_EXTENSIONS
 
 
-def _iter_files(root: str):
+def _excluded(path: str, root: str, exclude) -> bool:
+    relative = os.path.relpath(path, root)
+    return any(relative == item or relative.startswith(item.rstrip(os.sep) + os.sep)
+               for item in exclude)
+
+
+def _iter_files(root: str, exclude=()):
     for base, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(
             d for d in dirnames
             if d not in SKIP_DIRS and not d.endswith(SKIP_DIR_SUFFIXES)
+            and not _excluded(os.path.join(base, d), root, exclude)
+            and not os.path.islink(os.path.join(base, d))
         )
         for fname in sorted(filenames):
             filepath = os.path.join(base, fname)
-            if _is_target(filepath):
+            if (_is_target(filepath) and not _excluded(filepath, root, exclude)
+                    and not os.path.islink(filepath)):
                 yield filepath
 
 
@@ -202,22 +223,31 @@ def _write(filepath: str, content: str) -> None:
         f.write(content)
 
 
-def convert_file(filepath: str, dry_run: bool = False) -> bool:
+def convert_file(filepath: str, dry_run: bool = False,
+                 file_converter=None, relative=None) -> bool:
     """Convert one file; returns True only after a successful write."""
     try:
         original = _read(filepath)
     except OSError as exc:
         print(f"  [general] WARNING: cannot read {filepath}: {exc}")
-        return False
-    converted = convert_text(original)
+        raise
+    converted = (file_converter(relative, original) if file_converter is not None
+                 else convert_text(original))
     if converted == original:
         return False
+    if filepath.endswith('.py'):
+        try:
+            compile(original, filepath, 'exec')
+        except SyntaxError:
+            pass
+        else:
+            compile(converted, filepath, 'exec')
     if not dry_run:
         try:
             _write(filepath, converted)
         except OSError as exc:
             print(f"  [general] WARNING: cannot write {filepath}: {exc}")
-            return False
+            raise
     return True
 
 
@@ -238,7 +268,8 @@ def _extra_roots(root: str):
     return extras
 
 
-def convert_path(target: str, dry_run: bool = False, verbose: bool = False):
+def convert_path(target: str, dry_run: bool = False, verbose: bool = False,
+                 exclude=(), file_converter=None):
     """Convert a file or a whole directory tree.
 
     Content conversion runs first; afterwards, files and directories whose
@@ -246,21 +277,22 @@ def convert_path(target: str, dry_run: bool = False, verbose: bool = False):
     resolving. Returns (scanned, changed, renamed, changed_paths).
     """
     if os.path.isfile(target):
-        changed = convert_file(target, dry_run)
+        changed = convert_file(target, dry_run, file_converter, os.path.basename(target))
         return 1, (1 if changed else 0), 0, ([target] if changed else [])
 
     roots = [os.path.abspath(target)] + _extra_roots(target)
     scanned = 0
     changed_paths = []
     for root in roots:
-        for filepath in _iter_files(root):
+        for filepath in _iter_files(root, exclude):
             scanned += 1
-            if convert_file(filepath, dry_run):
+            relative = os.path.relpath(filepath, target).replace(os.sep, '/')
+            if convert_file(filepath, dry_run, file_converter, relative):
                 changed_paths.append(filepath)
                 if verbose:
                     print(f"  [general] {os.path.relpath(filepath, target)}")
 
-    renames = rename_path(target, dry_run=dry_run, verbose=verbose)
+    renames = rename_path(target, dry_run=dry_run, verbose=verbose, exclude=exclude)
     return scanned, len(changed_paths), len(renames), changed_paths
 
 
@@ -273,17 +305,18 @@ def _convert_name(name: str) -> str:
     return convert_text(name)
 
 
-def _plan_renames(root: str):
+def _plan_renames(root: str, exclude=()):
     """Collect (old, new) rename pairs for convertible files and directories."""
     renames = []
     for base, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(
             d for d in dirnames
             if d not in SKIP_DIRS and not d.endswith(SKIP_DIR_SUFFIXES)
+            and not _excluded(os.path.join(base, d), root, exclude)
         )
         for fname in filenames:
             filepath = os.path.join(base, fname)
-            if not _is_target(filepath):
+            if not _is_target(filepath) or _excluded(filepath, root, exclude):
                 continue
             new_name = _convert_name(fname)
             if new_name != fname:
@@ -299,10 +332,8 @@ def _apply_renames(renames, dry_run: bool = False, verbose: bool = False):
     """Apply planned renames deepest-first so parents move children along."""
     done = []
     for old, new in sorted(renames, key=lambda pair: -pair[0].count(os.sep)):
-        if os.path.exists(new):
-            print(f"  [general] WARNING: rename target already exists, skipped: "
-                  f"{old} -> {new}")
-            continue
+        if os.path.lexists(new):
+            raise FileExistsError(f"Rename target already exists: {old} -> {new}")
         if dry_run:
             print(f"  [general] would rename: {old} -> {new}")
             done.append((old, new))
@@ -311,21 +342,22 @@ def _apply_renames(renames, dry_run: bool = False, verbose: bool = False):
             os.rename(old, new)
         except OSError as exc:
             print(f"  [general] WARNING: cannot rename {old} -> {new}: {exc}")
-            continue
+            raise
         if verbose:
             print(f"  [general] renamed: {old} -> {new}")
         done.append((old, new))
     return done
 
 
-def rename_path(target: str, dry_run: bool = False, verbose: bool = False):
+def rename_path(target: str, dry_run: bool = False, verbose: bool = False,
+                exclude=()):
     """Rename convertible files/directories under target.
 
     Returns the list of applied (or, on dry-run, planned) renames.
     """
     if not os.path.isdir(target):
         return []
-    renames = _plan_renames(os.path.abspath(target))
+    renames = _plan_renames(os.path.abspath(target), exclude)
     for extra in _extra_roots(target):
-        renames.extend(_plan_renames(extra))
+        renames.extend(_plan_renames(extra, exclude))
     return _apply_renames(renames, dry_run=dry_run, verbose=verbose)

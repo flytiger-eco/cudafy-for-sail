@@ -181,6 +181,7 @@ DIAGNOSTIC_TEXT = [
 # compat build exposes 800/890 there, while leaving COMPATIBLE_ARCH undefined
 # under nvcc would turn guarded autogen kernels into empty functions.
 SAILIFY_TOKENS = [
+    ("from torch.utils.cpp_extension import PPU_HOME", "from torch.utils.cpp_extension import CUDA_HOME"),
     ("COMPATIBLE_ARCH", "__CUDA_ARCH__"),
     ("__COMPATIBLECC_VER_MAJOR__", "__CUDACC_VER_MAJOR__"),
     ("__COMPATIBLECC_VER_MINOR__", "__CUDACC_VER_MINOR__"),
@@ -202,6 +203,7 @@ SAILIFY_TOKEN_MAP = dict(SAILIFY_TOKENS)
 # continuation allowed, no word boundary needed). Mirrors the deliberately
 # prefix-only entries of the historical per-repo scripts.
 CURATED_PREFIX_OPEN = [
+    ("PCCL_", "NCCL_"),
     ("acrand", "curand"),
     ("HGBIN", "CUBIN"),
     ("hgbin", "cubin"),
@@ -250,6 +252,17 @@ EXCLUDED_TOKEN_PREFIXES = ("hgrand", "HGRAND")
 # as plain data -- the generator does NOT parse any cuda_compat script.
 # '__HGGC__' is deliberately absent (see NEVER_MAP).
 HISTORICAL_TOKENS = [
+    ('libpccl.so', 'libnccl.so'),
+    ('libsailshmem_host.so', 'libnvshmem_host.so'),
+    ('libsailshmem_device.a', 'libnvshmem_device.a'),
+    ('libsailshmem*.so*', 'libnvshmem*.so*'),
+    ('-lsailshmem_device', '-lnvshmem_device'),
+    ('pccl.h', 'nccl.h'),
+    ('pccl_device', 'nccl_device'),
+    ('SAILSHMEM_DIR', 'NVSHMEM_DIR'),
+    ('SAILSHMEM_HOME', 'NVSHMEM_HOME'),
+    ('hg_wrapper', 'cuda'),
+    ('hggc_wrapper', 'cudart'),
     ("ACBLAS_ERROR", "CUBLAS_ERROR"),
     ("acBLAS", "cuBLAS"),
     ("BF16_HGRTC", "BF16_NVRTC"),
@@ -287,6 +300,14 @@ HISTORICAL_TOKENS = [
     ("to_ppu_bfloat16", "to_nv_bfloat16"),
     ("use_hgtx_", "use_nvtx_"),
     ("is_acComplex", "is_cuComplex"),
+    ('-Xhgfatbin', '-Xfatbin'),
+    ('-lhg_wrapper', '-lcuda'),
+    ('-lhggc_wrapper', '-lcudart'),
+    ('-lhgml', '-lnvidia-ml'),
+    ('__HGGCCC_RDC__', '__CUDACC_RDC__'),
+    ('__HGGC_NO_BFLOAT162_OPERATORS__', '__CUDA_NO_BFLOAT162_OPERATORS__'),
+    ('libhg_wrapper.so', 'libcuda.so.1'),
+    ('libhgml.so', 'libnvidia-ml.so.1'),
 ]
 
 def strip_comments(text: str) -> str:
