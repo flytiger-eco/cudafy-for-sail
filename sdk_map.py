@@ -20775,13 +20775,12 @@ NON_SDK_TOKEN_MAP = {
     'acBLAS': 'cuBLAS',
 }
 
-# Category 10 -- SAILify platform naming (COMPATIBLE_ARCH family).
+# Category 10 -- SAILify compiler version names; preserve architecture macros.
 NON_SDK_SAILIFY_MAP = {
     '__COMPATIBLECC_VER_MAJOR__': '__CUDACC_VER_MAJOR__',
     '__COMPATIBLECC_VER_MINOR__': '__CUDACC_VER_MINOR__',
     '__COMPATIBLECC_VER_BUILD__': '__CUDACC_VER_BUILD__',
     'COMPATIBLE_VERSION': 'CUDA_VERSION',
-    'COMPATIBLE_ARCH': '__CUDA_ARCH__',
 }
 
 # Category 11 -- prefix-open, SDK-confirmed (camelCase continuation allowed).

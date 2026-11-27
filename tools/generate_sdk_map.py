@@ -175,13 +175,9 @@ DIAGNOSTIC_TEXT = [
     ("CUDA-Free", "CUDA-Compat"),
 ]
 
-# SAILify platform naming: the COMPATIBLE_ARCH / __COMPATIBLECC_* family is
-# introduced by the SAIL porting layer (not by the PPU SDK) and is shared by
-# the SAIL-ified repositories. COMPATIBLE_ARCH must map to __CUDA_ARCH__: the
-# compat build exposes 800/890 there, while leaving COMPATIBLE_ARCH undefined
-# under nvcc would turn guarded autogen kernels into empty functions.
+# The porting layer supplies SAILify compiler version names. Callers handle
+# architecture conditions directly without rewriting PPU macros or values.
 SAILIFY_TOKENS = [
-    ("COMPATIBLE_ARCH", "__CUDA_ARCH__"),
     ("__COMPATIBLECC_VER_MAJOR__", "__CUDACC_VER_MAJOR__"),
     ("__COMPATIBLECC_VER_MINOR__", "__CUDACC_VER_MINOR__"),
     ("__COMPATIBLECC_VER_BUILD__", "__CUDACC_VER_BUILD__"),
@@ -225,6 +221,8 @@ CURATED_PREFIX_OPEN = [
 #                    __CUDA__, so the rename would silently disable every
 #                    `#if defined(__HGGC__)` region in device code.
 NEVER_MAP = {
+    "COMPATIBLE_ARCH",
+    "__CUDA_ARCH__",
     "__HGGC_ARCH__",
     "__hggc_arch__",
     "__HGGC__",
@@ -610,7 +608,7 @@ def main() -> int:
     emit_dict("NON_SDK_TOKEN_MAP", non_sdk_maps["NON_SDK_TOKEN_MAP"],
               "Category 9 -- repo-local identifiers (e.g. DG_JIT_USE_HGRTC).")
     emit_dict("NON_SDK_SAILIFY_MAP", non_sdk_maps["NON_SDK_SAILIFY_MAP"],
-              "Category 10 -- SAILify platform naming (COMPATIBLE_ARCH family).")
+              "Category 10 -- SAILify compiler version names; preserve architecture macros.")
     emit_dict("SDK_PREFIX_OPEN", sdk_prefix_open,
               "Category 11 -- prefix-open, SDK-confirmed (camelCase continuation allowed).")
     emit_dict("NON_SDK_PREFIX_OPEN", non_sdk_prefix_open,
